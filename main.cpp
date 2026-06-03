@@ -126,10 +126,12 @@ struct Dataset {
     SpMatF   X;                           // (m, total_cells), each col = sample
 };
 
+// Load a single .1pz file as a sparse float matrix. Check that the number of
+// rows matches `expected_m` if it's nonzero, for consistency across files.
 static SpMatF load_one(const std::string& path, uint32_t expected_m) {
     auto result = singlet::pz::read_1pz(path);
     std::cout << "  loaded " << path << "  (" << result.m << " x " << result.n
-              << ", nnz=" << result.nnz << ")\n";
+              << ", nnz=" << result.nnz << ')' << std::endl;
     if (expected_m != 0 && result.m != expected_m) {
         std::ostringstream oss;
         oss << "feature-count mismatch in " << path
@@ -145,6 +147,11 @@ static SpMatF load_one(const std::string& path, uint32_t expected_m) {
     return u32.cast<float>();
 }
 
+// Load and concatenate multiple .1pz files. Each file is a sparse matrix with
+// the same number of rows (features) but possibly different numbers of columns
+// (cells). The result is a single sparse matrix with all columns concatenated,
+// and the total number of rows/features. The `Dataset` struct also stores the
+// number of rows/features `m` for convenience.
 static Dataset load_dataset(const std::vector<std::string>& paths) {
     Dataset ds;
     std::vector<SpMatF> mats;
@@ -185,14 +192,15 @@ static Dataset load_dataset(const std::vector<std::string>& paths) {
 // CLI
 // ---------------------------------------------------------------------------
 struct Options {
-    int   epochs     = 5;
-    int   batch_size = 64;
+    int   epochs     = 10;
+    int   batch_size = 512;
     float lr         = 1e-3f;
     std::vector<int> hidden = {512, 128, 32};
     unsigned seed    = 42;
     std::vector<std::string> files;
 };
 
+// Parse a comma-separated list of integers, e.g. "512,128,32".
 static std::vector<int> parse_csv_ints(const std::string& s) {
     std::vector<int> out;
     std::stringstream ss(s);
@@ -252,8 +260,9 @@ int main(int argc, char** argv) {
     try {
         Options opt = parse_args(argc, argv);
 
-        std::cout << "Loading " << opt.files.size() << " file(s)...\n";
+        std::cout << "Loading " << opt.files.size() << " file(s)..." << std::endl;
         Dataset ds = load_dataset(opt.files);
+        std::cout << "Files loaded" << std::endl;
         const int m = static_cast<int>(ds.X.rows());
         const int n = static_cast<int>(ds.X.cols());
         if (n == 0) throw std::runtime_error("dataset is empty (0 cells)");
@@ -283,7 +292,7 @@ int main(int argc, char** argv) {
                   << "  batch size      : " << opt.batch_size << '\n'
                   << "  epochs          : " << opt.epochs << '\n'
                   << "  learning rate   : " << opt.lr << '\n'
-                  << "  seed            : " << opt.seed << "\n\n";
+                  << "  seed            : " << opt.seed << '\n' << std::endl;
 
         // Reusable minibatch buffer. The final partial batch (size < B) is
         // SKIPPED to keep the buffer shape and all per-layer activation
@@ -316,10 +325,10 @@ int main(int argc, char** argv) {
                                      ? loss_sum / num_batches : 0.0;
             std::cout << "epoch " << epoch << "/" << opt.epochs
                       << "  batches=" << num_batches
-                      << "  mean_recon_loss=" << mean_loss << '\n';
+                      << "  mean_recon_loss=" << mean_loss << std::endl;
         }
 
-        std::cout << "\nDone.\n";
+        std::cout << "\nDone." << std::endl;
         return 0;
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;
