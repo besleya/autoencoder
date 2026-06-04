@@ -39,7 +39,7 @@ struct Autoencoder {
     std::vector<Eigen::MatrixXf> dW;
     std::vector<Eigen::VectorXf> db;
     std::vector<Eigen::MatrixXf> dz;  // gradient wrt pre-activation
-    // std::vector<Eigen::MatrixXf> da;  // gradient wrt activation
+    std::vector<Eigen::MatrixXf> da;  // gradient wrt activation
 
     int num_layers() const { return static_cast<int>(W.size()); }
     int last_layer() const { return num_layers() - 1; }
@@ -66,7 +66,7 @@ struct Autoencoder {
         dW.resize(L);
         db.resize(L);
         dz.resize(L);
-        // da.resize(L + 1);
+        da.resize(L + 1);
     }
 
     // Forward pass. Input `x` has shape (dims[0], B). After the call, a[L] is
@@ -93,8 +93,7 @@ struct Autoencoder {
         const float B = static_cast<float>(x.cols());
 
         // dL/da_L = (a_L - x) / B  (MSE; factor of 2 absorbed into lr)
-        // da[L] = (a[L] - x) / B;
-        dz[L - 1] = (a[L] - x) / B;
+        da[L] = (a[L] - x) / B;
 
         // Compute scalar loss for reporting (mean over all entries).
         const float loss = (a[L] - x).squaredNorm() /
@@ -102,17 +101,15 @@ struct Autoencoder {
 
         for (int l = L - 1; l >= 0; --l) {
             if (l == L - 1) {
-                // dz[l] = da[l + 1];                                  // linear
+                dz[l] = da[l + 1];                                  // linear
             } else {
-                dz[l] = dz[l].cwiseMax(0.0f);
-                // dz[l] = da[l + 1].array() *
-                //         (z[l].array() > 0.0f).cast<float>();        // ReLU'
+                dz[l] = da[l + 1].array() *
+                        (z[l].array() > 0.0f).cast<float>();        // ReLU'
             }
             dW[l].noalias() = dz[l] * a[l].transpose();
             db[l]            = dz[l].rowwise().sum();
             if (l > 0) {
-                dz[l - 1].noalias() = W[l].transpose() * dz[l];
-                // da[l].noalias() = W[l].transpose() * dz[l];
+                da[l].noalias() = W[l].transpose() * dz[l];
             }
             W[l].noalias() -= lr * dW[l];
             b[l]            -= lr * db[l];
