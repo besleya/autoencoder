@@ -19,7 +19,7 @@ NVCCFLAGS ?= -O3 -std=c++17 -x cu -dc --gpu-architecture=sm_90
 OBJS = main.o autoencoder.o data.o
 TARGET = main_ae
 
-.PHONY: all clean test alt_obj
+.PHONY: all clean test alt_obj version
 
 # Default target: build test only (main_ae is broken pending downstream
 # Dataset refactor to DeviceCSC)
@@ -52,6 +52,23 @@ data-alt.o: data-alt.cpp data.h
 
 alt_obj: data-alt.o
 
+version: version.o
+	$(CXX) $(LDFLAGS) version.o -o $@ $(LDLIBS)
+
+version.o: version.cpp
+	$(CXX) $(CXXFLAGS) $(SINGLET_INCLUDE) -c version.cpp -o $@
+
+# Test loader: load pileup files to GPU memory
+test_loader: load_pz.o test_loader.o
+	$(NVCC) -dlink -o test_loader.dlink.o load_pz.o test_loader.o --gpu-architecture=sm_90
+	$(CXX) $(LDFLAGS) load_pz.o test_loader.o test_loader.dlink.o -o test_loader -Wl,--allow-multiple-definition $(CUDA_LIBS) -lzstd
+
+load_pz.o: load_pz.cpp load_pz.h
+	$(NVCC) -O3 -std=c++17 -x cu -rdc=true --gpu-architecture=sm_90 $(CUDA_INCLUDE) $(SINGLET_INCLUDE) -c load_pz.cpp -o $@
+
+test_loader.o: test_loader.cpp load_pz.h
+	$(NVCC) -O3 -std=c++17 -x cu --gpu-architecture=sm_90 $(CUDA_INCLUDE) $(SINGLET_INCLUDE) -c test_loader.cpp -o $@
+
 clean:
-	rm -f $(OBJS) $(TARGET) test.o test data-alt.o
+	rm -f $(OBJS) $(TARGET) test.o test data-alt.o load_pz.o test_loader.o test_loader
 
