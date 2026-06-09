@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: MIT
 
-// STRATEGY A (device-side concat with per-file streams):
+// STRATEGY B (alternative: host-side concat then single H2D):
 //
-// Approach A overlaps CPU zstd decompression with PCIe H2D copies (per-file
-// streams), then concatenates entirely on-GPU via cheap HBM3→HBM3 D2D copies
-// (~3 TB/s vs ~64 GB/s PCIe Gen5). The unified col_ptr is built on host
-// because it requires per-entry offset addition and is tiny (≤ a few MB).
-// Per-file stream policy chosen for maximum producer overlap; cost of stream
-// creation (microseconds) is negligible vs decompression.
+// This is an alternative implementation of load_dataset, kept for comparison.
+// See data.cpp for Strategy A (device-side concat with per-file streams).
+//
+// Approach B loads all files with keep_host_pinned=true, so after each
+// per-file stream syncs, host_indptr/host_indices/host_values are populated.
+// Then the entire concat happens on host via OpenMP-parallel copy with offset
+// addition. Finally, one bulk H2D to GPU with a single stream.
+// Expected total PCIe bytes through GPU same as Strategy A, but no D2D step,
+// and serial H2D after CPU concat instead of overlapped with decompression.
 
 #include "data.h"
 
@@ -57,16 +60,14 @@ Dataset load_dataset(const std::vector<std::string>& paths) {
     std::mutex err_mu;
     std::mutex log_mu;
 
-    // ---- Step 1: OpenMP-parallel load with per-file streams ----
+    // ---- Step 1: OpenMP-parallel load with keep_host_pinned=true ----
     #pragma omp parallel for schedule(dynamic)
     for (int i = 0; i < F; ++i) {
         try {
-            // load_pz with stream=nullptr creates a high-priority stream
-            // and stores it in file_matrices[i].producer_stream.
-            // We keep the pinned host buffers (pinned_indptr, etc).
-            file_matrices[i] =
-                singlet::gpu::io::load_pz(paths[i], /*stream=*/nullptr,
-                                          /*keep_host_pinned=*/false);
+            // load_pz with keep_host_pinned=true populates host_indptr,
+            // host_indices, host_values after stream sync.
+            file_matrices[i] = singlet::gpu::io::load_pz(
+                paths[i], /*stream=*/nullptr, /*keep_host_pinned=*/true);
 
             std::lock_guard<std::mutex> lk(log_mu);
             std::cout << "  loaded " << paths[i]
@@ -116,76 +117,86 @@ Dataset load_dataset(const std::vector<std::string>& paths) {
     ds.n = static_cast<int>(total_cols);
     ds.nnz = static_cast<int64_t>(total_nnz);
 
-    // ---- Step 3: allocate unified DeviceCSC ----
-    ds.X = singlet::gpu::core::DeviceCSC(ds.m, ds.n,
-                                         static_cast<int>(total_nnz));
-
-    // ---- Step 4: build unified col_ptr on host from per-file pinned
-    // indptr ----
-
-    // Allocate a single PinnedBuffer to stage the unified col_ptr.
-    size_t col_ptr_bytes = (ds.n + 1) * sizeof(int);
-    singlet::gpu::core::PinnedBuffer staging_col_ptr =
-        singlet::gpu::core::PinnedPool::acquire(col_ptr_bytes);
-    int* col_ptr_host = staging_col_ptr.as<int>();
-
-    // Build the col_ptr from per-file pinned indptr buffers.
-    col_ptr_host[0] = 0;
+    // ---- Step 3: sync per-file streams to ensure host buffers are ready ----
     for (int i = 0; i < F; ++i) {
-        const int* file_indptr =
-            file_matrices[i].pinned_indptr.as<int>();
+        CUDA_CHECK(cudaStreamSynchronize(file_matrices[i].producer_stream));
+    }
+
+    // ---- Step 4: allocate three PinnedBuffer for host-side concat ----
+    size_t col_ptr_bytes = (ds.n + 1) * sizeof(int);
+    size_t indices_bytes = ds.nnz * sizeof(int);
+    size_t values_bytes = ds.nnz * sizeof(float);
+
+    singlet::gpu::core::PinnedBuffer pinned_col_ptr =
+        singlet::gpu::core::PinnedPool::acquire(col_ptr_bytes);
+    singlet::gpu::core::PinnedBuffer pinned_indices =
+        singlet::gpu::core::PinnedPool::acquire(indices_bytes);
+    singlet::gpu::core::PinnedBuffer pinned_values =
+        singlet::gpu::core::PinnedPool::acquire(values_bytes);
+
+    int* col_ptr_host = pinned_col_ptr.as<int>();
+    int* indices_host = pinned_indices.as<int>();
+    float* values_host = pinned_values.as<float>();
+
+    // ---- Step 5: OpenMP-parallel concat from per-file host buffers ----
+    col_ptr_host[0] = 0;
+
+    #pragma omp parallel for schedule(dynamic)
+    for (int i = 0; i < F; ++i) {
+        const int* file_col_ptr = file_matrices[i].pinned_indptr.as<int>();
+        const int* file_indices = file_matrices[i].pinned_indices.as<int>();
+        const float* file_values =
+            file_matrices[i].pinned_values.as<float>();
+
         const int file_n = file_matrices[i].n_cells;
+        const int file_nnz = file_matrices[i].mat.nnz;
+        const int col_o = col_off[i];
         const int64_t nnz_o = nnz_off[i];
 
-        // col_ptr_host[col_off[i] + 1 .. col_off[i] + file_n] =
-        //   file_indptr[1..file_n] + nnz_o
+        // col_ptr: copy with offset added
         for (int c = 0; c < file_n; ++c) {
-            col_ptr_host[col_off[i] + c + 1] =
-                static_cast<int>(file_indptr[c + 1] + nnz_o);
+            col_ptr_host[col_o + c + 1] =
+                static_cast<int>(file_col_ptr[c + 1] + nnz_o);
+        }
+
+        // indices and values: direct copy
+        for (int k = 0; k < file_nnz; ++k) {
+            indices_host[nnz_o + k] = file_indices[k];
+            values_host[nnz_o + k] = file_values[k];
         }
     }
 
-    // One H2D copy of the unified col_ptr.
-    cudaStream_t concat_stream;
-    CUDA_CHECK(cudaStreamCreateWithPriority(
-        &concat_stream, cudaStreamNonBlocking, -1));
+    // ---- Step 6: allocate DeviceCSC and transfer host → device ----
+    ds.X = singlet::gpu::core::DeviceCSC(ds.m, ds.n,
+                                         static_cast<int>(total_nnz));
 
+    cudaStream_t transfer_stream;
+    CUDA_CHECK(
+        cudaStreamCreateWithPriority(&transfer_stream, cudaStreamNonBlocking,
+                                     -1));
+
+    // Three H2D copies
     CUDA_CHECK(cudaMemcpyAsync(ds.X.col_ptr.get(), col_ptr_host,
                                col_ptr_bytes, cudaMemcpyHostToDevice,
-                               concat_stream));
+                               transfer_stream));
 
-    // ---- Step 5: sync per-file streams, then D2D copies on concat stream
-    // ----
+    CUDA_CHECK(cudaMemcpyAsync(ds.X.row_indices.get(), indices_host,
+                               indices_bytes, cudaMemcpyHostToDevice,
+                               transfer_stream));
 
-    for (int i = 0; i < F; ++i) {
-        CUDA_CHECK(cudaStreamSynchronize(file_matrices[i].producer_stream));
+    CUDA_CHECK(cudaMemcpyAsync(ds.X.values.get(), values_host, values_bytes,
+                               cudaMemcpyHostToDevice, transfer_stream));
 
-        const int64_t nnz_o = nnz_off[i];
-        const int nnz_i = file_matrices[i].mat.nnz;
+    // Sync transfer
+    CUDA_CHECK(cudaStreamSynchronize(transfer_stream));
 
-        // D2D: row_indices and values
-        CUDA_CHECK(cudaMemcpyAsync(
-            ds.X.row_indices.get() + nnz_o,
-            file_matrices[i].mat.row_indices.get(),
-            nnz_i * sizeof(int), cudaMemcpyDeviceToDevice, concat_stream));
-
-        CUDA_CHECK(cudaMemcpyAsync(
-            ds.X.values.get() + nnz_o, file_matrices[i].mat.values.get(),
-            nnz_i * sizeof(float), cudaMemcpyDeviceToDevice, concat_stream));
-    }
-
-    // Sync the concat stream to ensure all D2D copies are done.
-    CUDA_CHECK(cudaStreamSynchronize(concat_stream));
-
-    // ---- Step 6: cleanup streams ----
+    // ---- Step 7: cleanup ----
+    CUDA_CHECK(cudaStreamDestroy(transfer_stream));
 
     for (int i = 0; i < F; ++i) {
         CUDA_CHECK(cudaStreamDestroy(file_matrices[i].producer_stream));
     }
-    CUDA_CHECK(cudaStreamDestroy(concat_stream));
 
-    // ---- Step 7: release per-file matrices (they go out of scope here,
-    // freeing their device buffers) ----
     file_matrices.clear();
 
     return ds;

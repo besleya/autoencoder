@@ -1,21 +1,20 @@
 // SPDX-License-Identifier: MIT
 #pragma once
 
-#include <Eigen/Sparse>
+#include <singlet/gpu/core/types.h>   // for core::DeviceCSC
 #include <cstdint>
 #include <string>
 #include <vector>
 
-using SpMatF = Eigen::SparseMatrix<float, Eigen::ColMajor>;
-
-// All cells (columns) from the input files concatenated into one CSC matrix.
+// Concatenated CSC of all input files, owned on device.
+// rows = features (genes), cols = total cells across all files, nnz = sum.
 struct Dataset {
-    uint32_t m = 0;     // features (rows); checked consistent across files
-    SpMatF   X;         // (m, total_cells), each column = one cell
+    int m = 0;                              // rows (features)
+    int n = 0;                              // cols (total cells)
+    int64_t nnz = 0;                        // total nonzeros
+    singlet::gpu::core::DeviceCSC X;        // device CSC (move-only)
 };
 
-// Load and concatenate multiple .1pz files. File reads run in parallel via
-// OpenMP; the resulting CSC arrays are then stitched together in a single
-// bulk pass (no per-element inserts, no intermediate uint32 → int32 copy,
-// no .eval() round-trip).
+// Load multiple .1pz files and return a single concatenated DeviceCSC on the GPU.
+// Throws std::runtime_error on any file failure or feature-count mismatch.
 Dataset load_dataset(const std::vector<std::string>& paths);
