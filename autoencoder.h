@@ -34,7 +34,6 @@ struct Autoencoder {
     std::vector<Eigen::MatrixXf> dW;  // dL/dW[l]
     std::vector<Eigen::VectorXf> db;  // dL/db[l]
     std::vector<Eigen::MatrixXf> dz;  // dL/dz[l]
-    std::vector<Eigen::MatrixXf> da;  // dL/da[l]
 
     int num_layers() const { return static_cast<int>(W.size()); }
 

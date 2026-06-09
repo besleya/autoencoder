@@ -41,7 +41,6 @@ void Autoencoder::init(const std::vector<int>& layer_dims, std::mt19937& rng) {
     dW.resize(L);
     db.resize(L);
     dz.resize(L);
-    da.resize(L + 1);
 
     t = 0;
 }
@@ -64,9 +63,6 @@ float Autoencoder::backward_and_step(const Eigen::MatrixXf& x, float lr) {
     const int   L = num_layers();
     const float B = static_cast<float>(x.cols());
 
-    // dL/da_L = (a_L - x) / B  (MSE; factor of 2 absorbed into lr)
-    da[L] = (a[L] - x) / B;
-
     // Scalar loss for reporting (mean over all entries).
     const float loss = (a[L] - x).squaredNorm() /
                        (static_cast<float>(x.rows()) * B);
@@ -74,15 +70,18 @@ float Autoencoder::backward_and_step(const Eigen::MatrixXf& x, float lr) {
     // ---- backward pass: gradients are ASSIGNED (overwritten), not accumulated ----
     for (int l = L - 1; l >= 0; --l) {
         if (l == L - 1) {
-            dz[l] = da[l + 1];                                  // linear
+            // Output layer (linear): dz[l] = (a[L] - x) / B
+            dz[l] = (a[L] - x) / B;
         } else {
-            dz[l] = da[l + 1].array() *
-                    (z[l].array() > 0.0f).cast<float>();        // ReLU'
+            // Hidden layer (ReLU): dz[l] currently holds da[l+1] from the previous
+            // iteration's tail. Apply ReLU mask in place.
+            dz[l].array() *= (z[l].array() > 0.0f).cast<float>();
         }
         dW[l].noalias() = dz[l] * a[l].transpose();             // overwrite
         db[l]            = dz[l].rowwise().sum();               // overwrite
+        // Propagate gradient to previous layer by writing into dz[l-1]
         if (l > 0) {
-            da[l].noalias() = W[l].transpose() * dz[l];
+            dz[l - 1].noalias() = W[l].transpose() * dz[l];
         }
     }
 
