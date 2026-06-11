@@ -2,3 +2,6 @@ main
 main2
 main_ae
 *.o
+output_*.txt
+main_gpu
+version

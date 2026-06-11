@@ -10,12 +10,15 @@
 // creation (microseconds) is negligible vs decompression.
 
 #include "data.h"
+#include "load_pz.h"
 
 #include <singlet/singlet.h>
 #include <singlet/gpu/io/pz_device_loader.h>
 #include <singlet/gpu/core/types.h>
 
 #include <cuda_runtime.h>
+#include <cstring>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <mutex>
@@ -44,6 +47,78 @@
 
 // ============================================================================
 
+PZHeader validate_1pz(const std::string& path) {
+    // Open the file in binary mode
+    std::ifstream file(path, std::ios::binary);
+    if (!file.is_open()) {
+        throw std::runtime_error("validate_1pz: cannot open " + path);
+    }
+
+    // Seek to end and get file size
+    file.seekg(0, std::ios::end);
+    std::streamsize file_size = file.tellg();
+    file.seekg(0, std::ios::beg);
+
+    if (file_size < static_cast<std::streamsize>(sizeof(PZHeader) + sizeof(PZFooter))) {
+        std::ostringstream oss;
+        oss << "validate_1pz: file " << path << " too small (" << file_size
+            << " bytes, need at least " << (sizeof(PZHeader) + sizeof(PZFooter))
+            << " bytes)";
+        throw std::runtime_error(oss.str());
+    }
+
+    // Read header
+    PZHeader hdr;
+    file.read(reinterpret_cast<char*>(&hdr), sizeof(PZHeader));
+    if (!file.good()) {
+        throw std::runtime_error("validate_1pz: failed to read header from " + path);
+    }
+
+    // Check magic
+    if (hdr.magic != TP1_MAGIC_LOCAL) {
+        std::ostringstream oss;
+        oss << "validate_1pz: bad magic in " << path << " (got 0x" << std::hex
+            << hdr.magic << ", expected 0x" << TP1_MAGIC_LOCAL << ")";
+        throw std::runtime_error(oss.str());
+    }
+
+    // Check version
+    if (hdr.version != 1 && hdr.version != 3 && hdr.version != 4) {
+        std::ostringstream oss;
+        oss << "validate_1pz: unsupported version in " << path << " (got "
+            << hdr.version << ", expected 1, 3, or 4)";
+        throw std::runtime_error(oss.str());
+    }
+
+    // Seek to footer and read it
+    file.seekg(file_size - static_cast<std::streamsize>(sizeof(PZFooter)), std::ios::beg);
+    PZFooter ftr;
+    file.read(reinterpret_cast<char*>(&ftr), sizeof(PZFooter));
+    if (!file.good()) {
+        throw std::runtime_error("validate_1pz: failed to read footer from " + path);
+    }
+
+    // Check footer magic
+    if (ftr.magic != TP1_MAGIC_LOCAL) {
+        throw std::runtime_error("validate_1pz: bad footer magic in " + path);
+    }
+
+    // Check footer num_chunks matches header
+    if (ftr.num_chunks != hdr.num_chunks) {
+        std::ostringstream oss;
+        oss << "validate_1pz: footer num_chunks (" << ftr.num_chunks
+            << ") does not match header (" << hdr.num_chunks << ") in " << path;
+        throw std::runtime_error(oss.str());
+    }
+
+    // Note: CRC32 is intentionally NOT validated because we read only the
+    // header and footer (no slurp of the entire file).
+
+    return hdr;
+}
+
+// ============================================================================
+
 Dataset load_dataset(const std::vector<std::string>& paths) {
     using PzDeviceMatrix = singlet::gpu::io::PzDeviceMatrix;
 
@@ -65,7 +140,7 @@ Dataset load_dataset(const std::vector<std::string>& paths) {
             // and stores it in file_matrices[i].producer_stream.
             // We keep the pinned host buffers (pinned_indptr, etc).
             file_matrices[i] =
-                singlet::gpu::io::load_pz(paths[i], /*stream=*/nullptr,
+                singlet::gpu::io::load_pz_v3(paths[i], /*stream=*/nullptr,
                                           /*keep_host_pinned=*/false);
 
             std::lock_guard<std::mutex> lk(log_mu);
