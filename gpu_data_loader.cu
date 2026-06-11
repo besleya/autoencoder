@@ -1,0 +1,307 @@
+// SPDX-License-Identifier: MIT
+// gpu_data_loader.cu — implementation of sparse minibatch GPU DataLoader
+
+#include "gpu_data_loader.h"
+#include "data.h"
+
+#include <algorithm>
+#include <numeric>
+#include <stdexcept>
+#include <sstream>
+
+#define CUDA_CHECK(expr)                                                      \
+  do {                                                                        \
+    cudaError_t err = (expr);                                                \
+    if (err != cudaSuccess) {                                                \
+      std::ostringstream oss;                                                \
+      oss << "CUDA error at " << __FILE__ << ":" << __LINE__ << ": "         \
+          << cudaGetErrorString(err);                                        \
+      throw std::runtime_error(oss.str());                                   \
+    }                                                                         \
+  } while (0)
+
+GpuDataLoader::GpuDataLoader(const std::vector<std::string>& paths, int chunk_size,
+                             int batch_size, std::mt19937& rng)
+    : file_paths_(paths),
+      chunk_size_(chunk_size),
+      batch_size_(batch_size),
+      rng_(rng),
+      m_(0),
+      current_chunk_idx_(0),
+      current_batch_idx_(0),
+      chunk_n_(0),
+      chunk_nnz_(0),
+      d_chunk_row_idx_(nullptr),
+      d_chunk_values_(nullptr),
+      d_chunk_capacity_(0),
+      d_batch_col_ptr_(nullptr),
+      d_batch_row_idx_(nullptr),
+      d_batch_values_(nullptr),
+      d_batch_capacity_(0),
+      h_batch_col_ptr_(nullptr),
+      stream_(nullptr) {
+    if (file_paths_.empty()) {
+        throw std::runtime_error("GpuDataLoader: no files provided");
+    }
+    if (chunk_size <= 0) {
+        throw std::runtime_error("GpuDataLoader: chunk_size must be > 0");
+    }
+    if (batch_size <= 0) {
+        throw std::runtime_error("GpuDataLoader: batch_size must be > 0");
+    }
+
+    // Create CUDA stream
+    CUDA_CHECK(cudaStreamCreateWithPriority(&stream_, cudaStreamNonBlocking, -1));
+
+    // Allocate pinned host buffer for batch col_ptr (B+1 int32)
+    size_t col_ptr_bytes = (batch_size + 1) * sizeof(int32_t);
+    CUDA_CHECK(cudaMallocHost(&h_batch_col_ptr_, col_ptr_bytes));
+}
+
+GpuDataLoader::~GpuDataLoader() {
+    if (h_batch_col_ptr_) {
+        CUDA_CHECK(cudaFreeHost(h_batch_col_ptr_));
+    }
+    if (d_chunk_row_idx_) {
+        CUDA_CHECK(cudaFree(d_chunk_row_idx_));
+    }
+    if (d_chunk_values_) {
+        CUDA_CHECK(cudaFree(d_chunk_values_));
+    }
+    if (d_batch_col_ptr_) {
+        CUDA_CHECK(cudaFree(d_batch_col_ptr_));
+    }
+    if (d_batch_row_idx_) {
+        CUDA_CHECK(cudaFree(d_batch_row_idx_));
+    }
+    if (d_batch_values_) {
+        CUDA_CHECK(cudaFree(d_batch_values_));
+    }
+    if (stream_) {
+        CUDA_CHECK(cudaStreamDestroy(stream_));
+    }
+}
+
+int GpuDataLoader::m() const { return m_; }
+
+void GpuDataLoader::begin_epoch() {
+    // Shuffle file paths if more than one file.
+    // For single file, std::shuffle is a no-op and doesn't consume RNG state.
+    if (file_paths_.size() > 1) {
+        std::shuffle(file_paths_.begin(), file_paths_.end(), rng_);
+    }
+
+    current_chunk_idx_ = 0;
+    current_batch_idx_ = 0;
+
+    // Load the first chunk
+    load_next_chunk_();
+}
+
+void GpuDataLoader::load_next_chunk_() {
+    // Check if there are more chunks to load
+    if (current_chunk_idx_ >= static_cast<int>(file_paths_.size())) {
+        chunk_n_ = 0;
+        chunk_nnz_ = 0;
+        chunk_order_.clear();
+        host_col_ptr_.clear();
+        return;
+    }
+
+    // Collect up to chunk_size_ files
+    std::vector<std::string> chunk_paths;
+    int end_idx = std::min(current_chunk_idx_ + chunk_size_,
+                           static_cast<int>(file_paths_.size()));
+    for (int i = current_chunk_idx_; i < end_idx; ++i) {
+        chunk_paths.push_back(file_paths_[i]);
+    }
+    current_chunk_idx_ = end_idx;
+
+    // Load the chunk
+    Dataset chunk_data = load_dataset(chunk_paths);
+
+    m_ = chunk_data.m;
+    chunk_n_ = chunk_data.n;
+    chunk_nnz_ = static_cast<int>(chunk_data.nnz);
+
+    // Copy col_ptr to host
+    host_col_ptr_.resize(chunk_n_ + 1);
+    CUDA_CHECK(cudaMemcpy(host_col_ptr_.data(), chunk_data.X.col_ptr.get(),
+                          (chunk_n_ + 1) * sizeof(int32_t),
+                          cudaMemcpyDeviceToHost));
+
+    // Allocate/reallocate chunk buffers if needed
+    if (static_cast<size_t>(chunk_nnz_) > d_chunk_capacity_) {
+        if (d_chunk_row_idx_) {
+            CUDA_CHECK(cudaFree(d_chunk_row_idx_));
+        }
+        if (d_chunk_values_) {
+            CUDA_CHECK(cudaFree(d_chunk_values_));
+        }
+        size_t new_capacity = chunk_nnz_;
+        CUDA_CHECK(cudaMalloc(&d_chunk_row_idx_, new_capacity * sizeof(int32_t)));
+        CUDA_CHECK(cudaMalloc(&d_chunk_values_, new_capacity * sizeof(float)));
+        d_chunk_capacity_ = new_capacity;
+    }
+
+    // Copy row indices and values from the chunk into our persistent buffers
+    CUDA_CHECK(cudaMemcpyAsync(d_chunk_row_idx_, chunk_data.X.row_indices.get(),
+                               chunk_nnz_ * sizeof(int32_t),
+                               cudaMemcpyDeviceToDevice, stream_));
+    CUDA_CHECK(cudaMemcpyAsync(d_chunk_values_, chunk_data.X.values.get(),
+                               chunk_nnz_ * sizeof(float),
+                               cudaMemcpyDeviceToDevice, stream_));
+
+    // Synchronize to ensure the copies are done before Dataset is destroyed
+    CUDA_CHECK(cudaStreamSynchronize(stream_));
+
+    // chunk_data now goes out of scope and frees its device buffers.
+    // Our chunk buffers remain.
+
+    // Compute max batch nnz across all batches in this chunk
+    const int num_batches = chunk_n_ / batch_size_;
+    int max_batch_nnz = 0;
+    for (int bi = 0; bi < num_batches; ++bi) {
+        int batch_nnz = 0;
+        for (int j = 0; j < batch_size_; ++j) {
+            int col = bi * batch_size_ + j;
+            batch_nnz += host_col_ptr_[col + 1] - host_col_ptr_[col];
+        }
+        max_batch_nnz = std::max(max_batch_nnz, batch_nnz);
+    }
+
+    // Allocate/reallocate batch buffers if needed
+    // Use conservative estimate: max_col_nnz * batch_size
+    int max_col_nnz = 0;
+    for (int c = 0; c < chunk_n_; ++c) {
+        int col_nnz = host_col_ptr_[c + 1] - host_col_ptr_[c];
+        max_col_nnz = std::max(max_col_nnz, col_nnz);
+    }
+    size_t batch_buffer_capacity = static_cast<size_t>(max_col_nnz) * batch_size_;
+
+    if (batch_buffer_capacity > d_batch_capacity_) {
+        if (d_batch_row_idx_) {
+            CUDA_CHECK(cudaFree(d_batch_row_idx_));
+        }
+        if (d_batch_values_) {
+            CUDA_CHECK(cudaFree(d_batch_values_));
+        }
+        CUDA_CHECK(cudaMalloc(&d_batch_row_idx_,
+                              batch_buffer_capacity * sizeof(int32_t)));
+        CUDA_CHECK(cudaMalloc(&d_batch_values_, batch_buffer_capacity * sizeof(float)));
+        d_batch_capacity_ = batch_buffer_capacity;
+    }
+
+    // Create and shuffle the column order for this chunk
+    chunk_order_.resize(chunk_n_);
+    std::iota(chunk_order_.begin(), chunk_order_.end(), 0);
+    std::shuffle(chunk_order_.begin(), chunk_order_.end(), rng_);
+
+    // Reset batch index for new chunk
+    current_batch_idx_ = 0;
+}
+
+int GpuDataLoader::compute_batch_nnz_(const std::vector<int>& cols) {
+    int total_nnz = 0;
+    for (int col : cols) {
+        total_nnz +=
+            host_col_ptr_[col + 1] - host_col_ptr_[col];
+    }
+    return total_nnz;
+}
+
+bool GpuDataLoader::next_batch(SparseBatch* out) {
+    if (!out) {
+        throw std::runtime_error("next_batch: out pointer is null");
+    }
+
+    // Synchronize stream to ensure prior batch is consumed
+    CUDA_CHECK(cudaStreamSynchronize(stream_));
+
+    // Check if we need to load a new chunk
+    const int num_full_batches = chunk_n_ / batch_size_;
+    if (current_batch_idx_ >= num_full_batches) {
+        // Try to load the next chunk
+        load_next_chunk_();
+        // After load_next_chunk_, current_batch_idx_ is 0 and chunk_n_ is updated
+
+        if (chunk_n_ == 0) {
+            // No more chunks; epoch exhausted
+            return false;
+        }
+    }
+
+    // Extract the column indices for this batch from the chunk
+    int start_col = current_batch_idx_ * batch_size_;
+    std::vector<int> batch_cols;
+    for (int j = 0; j < batch_size_; ++j) {
+        batch_cols.push_back(chunk_order_[start_col + j]);
+    }
+
+    // Compute total nnz in this batch
+    int batch_nnz = compute_batch_nnz_(batch_cols);
+
+    // Allocate device col_ptr buffer if not already done
+    if (!d_batch_col_ptr_) {
+        CUDA_CHECK(cudaMalloc(&d_batch_col_ptr_,
+                              (batch_size_ + 1) * sizeof(int32_t)));
+    }
+
+    // Build batch col_ptr on host (pinned buffer)
+    h_batch_col_ptr_[0] = 0;
+    int offset = 0;
+    for (int j = 0; j < batch_size_; ++j) {
+        int col = batch_cols[j];
+        int col_nnz = host_col_ptr_[col + 1] - host_col_ptr_[col];
+        offset += col_nnz;
+        h_batch_col_ptr_[j + 1] = offset;
+    }
+
+    // Copy col_ptr to device
+    CUDA_CHECK(cudaMemcpyAsync(d_batch_col_ptr_, h_batch_col_ptr_,
+                               (batch_size_ + 1) * sizeof(int32_t),
+                               cudaMemcpyHostToDevice, stream_));
+
+    // Issue D2D copies for row indices and values from chunk buffers to batch
+    // buffers. Copy each column's data from the chunk buffer to contiguous
+    // positions in the batch buffer.
+    int batch_offset = 0;
+    for (int j = 0; j < batch_size_; ++j) {
+        int col = batch_cols[j];
+        int col_start = host_col_ptr_[col];
+        int col_end = host_col_ptr_[col + 1];
+        int col_nnz = col_end - col_start;
+
+        if (col_nnz > 0) {
+            // Copy row indices from chunk buffer to batch buffer
+            CUDA_CHECK(cudaMemcpyAsync(
+                d_batch_row_idx_ + batch_offset,
+                d_chunk_row_idx_ + col_start,
+                col_nnz * sizeof(int32_t),
+                cudaMemcpyDeviceToDevice,
+                stream_));
+
+            // Copy values from chunk buffer to batch buffer
+            CUDA_CHECK(cudaMemcpyAsync(
+                d_batch_values_ + batch_offset,
+                d_chunk_values_ + col_start,
+                col_nnz * sizeof(float),
+                cudaMemcpyDeviceToDevice,
+                stream_));
+
+            batch_offset += col_nnz;
+        }
+    }
+
+    // Fill SparseBatch
+    out->m = m_;
+    out->B = batch_size_;
+    out->nnz = batch_nnz;
+    out->d_col_ptr = d_batch_col_ptr_;
+    out->d_row_idx = d_batch_row_idx_;
+    out->d_values = d_batch_values_;
+    out->stream = stream_;
+
+    current_batch_idx_++;
+    return true;
+}
