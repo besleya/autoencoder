@@ -8,6 +8,7 @@
 #include <numeric>
 #include <stdexcept>
 #include <sstream>
+#include <cmath>
 
 #define CUDA_CHECK(expr)                                                      \
   do {                                                                        \
@@ -19,6 +20,50 @@
       throw std::runtime_error(oss.str());                                   \
     }                                                                         \
   } while (0)
+
+// Non-throwing version for use in destructors and other noexcept contexts
+#define CUDA_CHECK_SILENT(expr)                                               \
+  do {                                                                        \
+    cudaError_t err = (expr);                                                \
+    if (err != cudaSuccess) {                                                \
+      std::fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__,  \
+                   cudaGetErrorString(err));                                 \
+    }                                                                         \
+  } while (0)
+
+// Scaler used by per-column log-normalization: ln(1 + S * x / sum_col)
+static constexpr float kSparseLogNormScaler = 10000.0f;
+
+__global__ void log_normalize_columns_kernel(int n_cols,
+                                             float scaler,
+                                             const int32_t* __restrict__ col_ptr,
+                                             float* __restrict__ values) {
+    int col = blockIdx.x;
+    if (col >= n_cols) return;
+
+    int start = col_ptr[col];
+    int end   = col_ptr[col + 1];
+
+    __shared__ float s_sum;
+    if (threadIdx.x == 0) s_sum = 0.0f;
+    __syncthreads();
+
+    // Phase 1: column sum via block-shared atomicAdd
+    float thread_sum = 0.0f;
+    for (int k = start + threadIdx.x; k < end; k += blockDim.x) {
+        thread_sum += values[k];
+    }
+    if (thread_sum != 0.0f) atomicAdd(&s_sum, thread_sum);
+    __syncthreads();
+
+    float sum = s_sum;
+    if (sum > 0.0f) {
+        float inv = scaler / sum;
+        for (int k = start + threadIdx.x; k < end; k += blockDim.x) {
+            values[k] = log1pf(values[k] * inv);
+        }
+    }
+}
 
 GpuDataLoader::GpuDataLoader(const std::vector<std::string>& paths, int chunk_size,
                              int batch_size, std::mt19937& rng)
@@ -60,25 +105,25 @@ GpuDataLoader::GpuDataLoader(const std::vector<std::string>& paths, int chunk_si
 
 GpuDataLoader::~GpuDataLoader() {
     if (h_batch_col_ptr_) {
-        CUDA_CHECK(cudaFreeHost(h_batch_col_ptr_));
+        CUDA_CHECK_SILENT(cudaFreeHost(h_batch_col_ptr_));
     }
     if (d_chunk_row_idx_) {
-        CUDA_CHECK(cudaFree(d_chunk_row_idx_));
+        CUDA_CHECK_SILENT(cudaFree(d_chunk_row_idx_));
     }
     if (d_chunk_values_) {
-        CUDA_CHECK(cudaFree(d_chunk_values_));
+        CUDA_CHECK_SILENT(cudaFree(d_chunk_values_));
     }
     if (d_batch_col_ptr_) {
-        CUDA_CHECK(cudaFree(d_batch_col_ptr_));
+        CUDA_CHECK_SILENT(cudaFree(d_batch_col_ptr_));
     }
     if (d_batch_row_idx_) {
-        CUDA_CHECK(cudaFree(d_batch_row_idx_));
+        CUDA_CHECK_SILENT(cudaFree(d_batch_row_idx_));
     }
     if (d_batch_values_) {
-        CUDA_CHECK(cudaFree(d_batch_values_));
+        CUDA_CHECK_SILENT(cudaFree(d_batch_values_));
     }
     if (stream_) {
-        CUDA_CHECK(cudaStreamDestroy(stream_));
+        CUDA_CHECK_SILENT(cudaStreamDestroy(stream_));
     }
 }
 
@@ -152,7 +197,23 @@ void GpuDataLoader::load_next_chunk_() {
                                chunk_nnz_ * sizeof(float),
                                cudaMemcpyDeviceToDevice, stream_));
 
-    // Synchronize to ensure the copies are done before Dataset is destroyed
+    // GPU log-normalization in place on d_chunk_values_:
+    //   x_ij  ->  ln(1 + kSparseLogNormScaler * x_ij / sum_col_j)
+    // Columns with zero sum are left unchanged.
+    // We read col_ptr directly from chunk_data (still alive); same-stream
+    // ordering ensures the D2D copies above complete before the kernel runs.
+    if (chunk_n_ > 0) {
+        dim3 block(256);
+        dim3 grid(chunk_n_);
+        log_normalize_columns_kernel<<<grid, block, 0, stream_>>>(
+            chunk_n_, kSparseLogNormScaler,
+            chunk_data.X.col_ptr.get(),
+            d_chunk_values_);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    // Synchronize so the kernel finishes reading chunk_data.X.col_ptr before
+    // chunk_data goes out of scope and frees its device buffers.
     CUDA_CHECK(cudaStreamSynchronize(stream_));
 
     // chunk_data now goes out of scope and frees its device buffers.
