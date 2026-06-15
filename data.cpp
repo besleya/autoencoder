@@ -144,11 +144,11 @@ Dataset load_dataset(const std::vector<std::string>& paths) {
                                           /*keep_host_pinned=*/false);
 
             std::lock_guard<std::mutex> lk(log_mu);
-            std::cout << "  loaded " << paths[i]
-                      << "  (" << file_matrices[i].n_genes << " x "
-                      << file_matrices[i].n_cells
-                      << ", nnz=" << file_matrices[i].mat.nnz << ')'
-                      << std::endl;
+            // std::cout << "  loaded " << paths[i]
+            //           << "  (" << file_matrices[i].n_genes << " x "
+            //           << file_matrices[i].n_cells
+            //           << ", nnz=" << file_matrices[i].mat.nnz << ')'
+            //           << std::endl;
         } catch (const std::exception& e) {
             std::lock_guard<std::mutex> lk(err_mu);
             std::ostringstream oss;

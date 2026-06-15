@@ -70,21 +70,24 @@ test_loader.o: test_loader.cpp load_pz.h
 	$(NVCC) -O3 -std=c++17 -x cu --gpu-architecture=sm_90 $(CUDA_INCLUDE) $(SINGLET_INCLUDE) -c test_loader.cpp -o $@
 
 # GPU autoencoder driver: mirrors main.cpp but uses GPU modules
-main_gpu: main_gpu.o gpu_autoencoder.o gpu_data_loader.o data.o main_gpu.dlink.o load_pz.o
-	$(CXX) $(LDFLAGS) main_gpu.o gpu_autoencoder.o gpu_data_loader.o data.o main_gpu.dlink.o load_pz.o -o $@ -Wl,--allow-multiple-definition $(CUDA_LIBS) -lcublas -lcusparse -lzstd
+main_gpu: main_gpu.o gpu_autoencoder.o gpu_data_loader.o data.o main_gpu.dlink.o load_pz.o layer.o
+	$(CXX) $(LDFLAGS) main_gpu.o gpu_autoencoder.o gpu_data_loader.o data.o main_gpu.dlink.o load_pz.o layer.o -o $@ -Wl,--allow-multiple-definition $(CUDA_LIBS) -lcublas -lcusparse -lzstd
 
 main_gpu.o: main_gpu.cpp gpu_autoencoder.h gpu_data_loader.h data.h load_pz.h
 	$(NVCC) -O3 -std=c++17 -x cu -dc --gpu-architecture=sm_90 $(CUDA_INCLUDE) $(SINGLET_INCLUDE) -c main_gpu.cpp -o $@
 
-gpu_autoencoder.o: gpu_autoencoder.cu gpu_autoencoder.h
+gpu_autoencoder.o: gpu_autoencoder.cu gpu_autoencoder.h layer.h
 	$(NVCC) -O3 -std=c++17 -x cu -rdc=true --gpu-architecture=sm_90 $(CUDA_INCLUDE) $(SINGLET_INCLUDE) -c gpu_autoencoder.cu -o $@
 
 gpu_data_loader.o: gpu_data_loader.cu gpu_data_loader.h data.h
 	$(NVCC) -O3 -std=c++17 -x cu -rdc=true --gpu-architecture=sm_90 $(CUDA_INCLUDE) $(SINGLET_INCLUDE) -c gpu_data_loader.cu -o $@
 
-main_gpu.dlink.o: main_gpu.o gpu_autoencoder.o gpu_data_loader.o load_pz.o
-	$(NVCC) -dlink -o main_gpu.dlink.o main_gpu.o gpu_autoencoder.o gpu_data_loader.o load_pz.o --gpu-architecture=sm_90
+layer.o: layer.cu layer.h
+	$(NVCC) -O3 -std=c++17 -x cu -rdc=true --gpu-architecture=sm_90 $(CUDA_INCLUDE) $(SINGLET_INCLUDE) -c layer.cu -o $@
+
+main_gpu.dlink.o: main_gpu.o gpu_autoencoder.o gpu_data_loader.o load_pz.o layer.o
+	$(NVCC) -dlink -o main_gpu.dlink.o main_gpu.o gpu_autoencoder.o gpu_data_loader.o load_pz.o layer.o --gpu-architecture=sm_90
 
 clean:
-	rm -f $(OBJS) $(TARGET) test.o test data-alt.o load_pz.o test_loader.o test_loader main_gpu.o gpu_autoencoder.o gpu_data_loader.o main_gpu.dlink.o main_gpu
+	rm -f $(OBJS) $(TARGET) test.o test data-alt.o load_pz.o test_loader.o test_loader main_gpu.o gpu_autoencoder.o gpu_data_loader.o main_gpu.dlink.o main_gpu layer.o
 

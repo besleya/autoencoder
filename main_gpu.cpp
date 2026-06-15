@@ -139,6 +139,7 @@ int main(int argc, char** argv) {
                   << "  learning rate   : " << opt.lr << '\n'
                   << "  seed            : " << opt.seed << '\n' << std::endl;
 
+        std::vector<float> losses(opt.epochs, 0.0f);
         for (int epoch = 1; epoch <= opt.epochs; ++epoch) {
             loader.begin_epoch();
 
@@ -157,6 +158,14 @@ int main(int argc, char** argv) {
             std::cout << "epoch " << epoch << "/" << opt.epochs
                       << "  batches=" << num_batches
                       << "  mean_recon_loss=" << mean_loss << std::endl;
+            losses[epoch - 1] = mean_loss;
+        }
+        float scaler = 80.0f / losses[0];
+        int col;
+        for (float l : losses) {
+            col = static_cast<int>(std::lround(l * scaler));
+            if (col < 0) col = 0;
+            std::cout << std::string(col, ' ') << "|  " << l << '\n';
         }
 
         std::cout << "\nDone." << std::endl;

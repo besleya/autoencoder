@@ -43,73 +43,19 @@
     } while (0)
 
 // ============================================================================
-// Utility: compute grid/block for 1D kernel
-// ============================================================================
-
-static void get_grid_block(int n, dim3& grid, dim3& block) {
-    block = dim3(256);
-    grid = dim3((n + 255) / 256);
-}
-
-// ============================================================================
 // Custom CUDA kernels
 // ============================================================================
 
-// Bias broadcast: z[i,j] += b[i] for all j (column-major, ld=out)
-__global__ void kernel_add_bias(int out, int B, float* z, const float* b) {
-    int tidx = threadIdx.x;
-    int bidx = blockIdx.x;
-    if (bidx >= B) return;
-
-    for (int i = tidx; i < out; i += blockDim.x) {
-        z[i + (size_t)bidx * out] += b[i];
-    }
-}
-
-// Bias broadcast for row-major: z[bidx, i] += b[i] where z is (B, out) row-major with ld=out
-__global__ void kernel_add_bias_rowmajor(int out, int B, float* z, const float* b) {
-    int tidx = threadIdx.x;
-    int bidx = blockIdx.x;
-    if (bidx >= B) return;
-
-    for (int i = tidx; i < out; i += blockDim.x) {
-        z[bidx * out + i] += b[i];
-    }
-}
-
-// ReLU forward: a[i,j] = max(z[i,j], 0)
-__global__ void kernel_relu_forward(int size, float* a, const float* z) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < size) {
-        a[idx] = fmaxf(z[idx], 0.0f);
-    }
-}
-
-// ReLU backward: dz[i,j] *= (z[i,j] > 0)
-__global__ void kernel_relu_backward(int size, float* dz, const float* z) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < size) {
-        dz[idx] *= (z[idx] > 0.0f) ? 1.0f : 0.0f;
-    }
-}
-
-// Initialize ones vector
-__global__ void kernel_fill_ones(int n, float* v) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) {
-        v[idx] = 1.0f;
-    }
-}
-
-// Compute loss and initialize dz[L-1]:
-//   loss_acc += ||a_L||_F^2
-//   For each sparse (r, j, v): dz[L-1](r,j) = (a_L(r,j) - v) / B
-//                              loss_acc -= 2*a_L(r,j)*v + v^2
+// Compute loss and initialize loss gradient:
+//   loss_acc = ||a_L||_F^2
+//   d_grad_loss = a_L / B (for all entries)
+//   For each sparse (r, j, v): d_grad_loss(r,j) = (a_L(r,j) - v) / B
+//                              loss_acc += v^2 - 2*a_L(r,j)*v
 // Then loss = loss_acc / (d0 * B)
 //
 // This kernel iterates through columns; each thread block handles one column.
-__global__ void kernel_sparse_loss_and_dz_update(
-    int d0, int B, float* dz_L, float* loss_acc, 
+__global__ void kernel_sparse_loss_and_grad(
+    int d0, int B, float* d_grad_loss, float* loss_acc, 
     const float* a_L, const int32_t* col_ptr, const int32_t* row_idx,
     const float* values) {
     
@@ -124,33 +70,12 @@ __global__ void kernel_sparse_loss_and_dz_update(
         float v = values[k];
         float a_val = a_L[r + (size_t)j * d0];
         
-        // dz[L-1](r,j) = (a_L(r,j) - v) / B
-        dz_L[r + (size_t)j * d0] = (a_val - v) / B;
+        // d_grad_loss(r,j) = (a_L(r,j) - v) / B
+        d_grad_loss[r + (size_t)j * d0] = (a_val - v) / B;
         
         // Accumulate loss correction
         float correction = v * v - 2.0f * a_val * v;
         atomicAdd(loss_acc, correction);
-    }
-}
-
-// Adam update for a single parameter:
-//   m = beta1 * m + (1 - beta1) * g
-//   v = beta2 * v + (1 - beta2) * g * g
-//   p = p - lr_t * m / (sqrt(v) + eps)
-__global__ void kernel_adam_update(
-    int size, float* p, float* m, float* v, const float* g,
-    float lr_t, float beta1, float beta2, float eps) {
-    
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < size) {
-        float g_val = g[idx];
-        float m_val = beta1 * m[idx] + (1.0f - beta1) * g_val;
-        float v_val = beta2 * v[idx] + (1.0f - beta2) * g_val * g_val;
-        
-        m[idx] = m_val;
-        v[idx] = v_val;
-        
-        p[idx] -= lr_t * m_val / (sqrtf(v_val) + eps);
     }
 }
 
@@ -159,372 +84,212 @@ __global__ void kernel_adam_update(
 // ============================================================================
 
 GpuAutoencoder::GpuAutoencoder()
-    : num_l(0), batch_size(0), initialized_buffers(false),
-      d_loss(nullptr), d_ones(nullptr), t(0),
-      cublas_handle(nullptr), cusparse_handle(nullptr) {}
+    : num_l_(0), batch_size_(0), initialized_buffers_(false),
+      d_grad_loss_(nullptr), d_loss_(nullptr),
+      cublas_handle_(nullptr), cusparse_handle_(nullptr) {}
 
 GpuAutoencoder::~GpuAutoencoder() {
-    deallocate_buffers();
-    if (cublas_handle) {
-        cublasDestroy((cublasHandle_t)cublas_handle);
+    deallocate_buffers_();
+    if (cublas_handle_) {
+        cublasDestroy(cublas_handle_);
     }
-    if (cusparse_handle) {
-        cusparseDestroy((cusparseHandle_t)cusparse_handle);
+    if (cusparse_handle_) {
+        cusparseDestroy(cusparse_handle_);
     }
 }
 
 void GpuAutoencoder::init(const std::vector<int>& layer_dims,
                           std::mt19937& rng) {
-    dims = layer_dims;
-    num_l = static_cast<int>(dims.size()) - 1;
+    dims_ = layer_dims;
+    num_l_ = static_cast<int>(dims_.size()) - 1;
     
-    if (num_l <= 0) {
+    if (num_l_ <= 0) {
         fprintf(stderr, "Invalid layer dims: must have at least 2 dims\n");
         exit(EXIT_FAILURE);
     }
     
     // Create handles if not yet created
-    if (!cublas_handle) {
-        CUBLAS_CHECK(cublasCreate((cublasHandle_t*)&cublas_handle));
+    if (!cublas_handle_) {
+        CUBLAS_CHECK(cublasCreate(&cublas_handle_));
     }
-    if (!cusparse_handle) {
-        CUSPARSE_CHECK(cusparseCreate((cusparseHandle_t*)&cusparse_handle));
-    }
-    
-    // Resize parameter vectors
-    d_W.resize(num_l);
-    d_b.resize(num_l);
-    d_mW.resize(num_l);
-    d_vW.resize(num_l);
-    d_mb.resize(num_l);
-    d_vb.resize(num_l);
-    d_dW.resize(num_l);
-    d_db.resize(num_l);
-    d_dz.resize(num_l);
-    
-    d_a.resize(num_l + 1);
-    d_z.resize(num_l);
-    
-    // Initialize parameters on host, then copy to device
-    for (int l = 0; l < num_l; ++l) {
-        int in = dims[l];
-        int out = dims[l + 1];
-        
-        float stddev = std::sqrt(2.0f / static_cast<float>(in));
-        std::normal_distribution<float> nd(0.0f, stddev);
-        
-        // Allocate and initialize W[l] on host
-        std::vector<float> W_host(out * in);
-        for (int j = 0; j < in; ++j) {
-            for (int i = 0; i < out; ++i) {
-                W_host[i + (size_t)j * out] = nd(rng);
-            }
-        }
-        
-        // Allocate on device and copy
-        CUDA_CHECK(cudaMalloc(&d_W[l], out * in * sizeof(float)));
-        CUDA_CHECK(cudaMemcpy(d_W[l], W_host.data(), out * in * sizeof(float),
-                              cudaMemcpyHostToDevice));
-        
-        // Allocate and initialize b[l] = zeros
-        CUDA_CHECK(cudaMalloc(&d_b[l], out * sizeof(float)));
-        CUDA_CHECK(cudaMemset(d_b[l], 0, out * sizeof(float)));
-        
-        // Allocate and initialize moment buffers (zeros)
-        CUDA_CHECK(cudaMalloc(&d_mW[l], out * in * sizeof(float)));
-        CUDA_CHECK(cudaMemset(d_mW[l], 0, out * in * sizeof(float)));
-        
-        CUDA_CHECK(cudaMalloc(&d_vW[l], out * in * sizeof(float)));
-        CUDA_CHECK(cudaMemset(d_vW[l], 0, out * in * sizeof(float)));
-        
-        CUDA_CHECK(cudaMalloc(&d_mb[l], out * sizeof(float)));
-        CUDA_CHECK(cudaMemset(d_mb[l], 0, out * sizeof(float)));
-        
-        CUDA_CHECK(cudaMalloc(&d_vb[l], out * sizeof(float)));
-        CUDA_CHECK(cudaMemset(d_vb[l], 0, out * sizeof(float)));
-        
-        // Allocate gradient buffers (will be filled during backward)
-        CUDA_CHECK(cudaMalloc(&d_dW[l], out * in * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&d_db[l], out * sizeof(float)));
-        // d_dz[l] will be allocated in allocate_buffers() once batch_size is known
+    if (!cusparse_handle_) {
+        CUSPARSE_CHECK(cusparseCreate(&cusparse_handle_));
     }
     
-    // Allocate activation buffers (will be resized if batch_size changes)
-    // For now, just set pointers to nullptr; they'll be allocated in allocate_buffers()
+    // Construct all layers. First layer has sparse input, others dense.
+    // Hidden layers (all except last) use ReLU, output layer uses None.
+    layers_.resize(num_l_);
+    for (int l = 0; l < num_l_; ++l) {
+        int in_dim = dims_[l];
+        int out_dim = dims_[l + 1];
+        bool sparse_input = (l == 0);
+        Layer::Activation activation = (l < num_l_ - 1) 
+                                        ? Layer::Activation::ReLU 
+                                        : Layer::Activation::None;
+        
+        // Generate seed from rng to match CPU autoencoder's RNG consumption order
+        unsigned long seed = rng();
+        
+        layers_[l] = construct_layer_(in_dim, out_dim, activation, sparse_input, seed);
+    }
     
     // Allocate loss scalar
-    CUDA_CHECK(cudaMalloc(&d_loss, sizeof(float)));
-    
-    t = 0;
+    CUDA_CHECK(cudaMalloc(&d_loss_, sizeof(float)));
 }
 
-void GpuAutoencoder::allocate_buffers() {
-    if (initialized_buffers) return;
+void GpuAutoencoder::init(const std::vector<int>& layer_dims,
+                          const std::vector<std::shared_ptr<Layer>>& layers_in,
+                          std::mt19937& rng) {
+    dims_ = layer_dims;
+    num_l_ = static_cast<int>(dims_.size()) - 1;
     
-    // Allocate activation buffers based on current batch_size and dims
-    for (int l = 0; l <= num_l; ++l) {
-        int size = dims[l] * batch_size;
-        CUDA_CHECK(cudaMalloc(&d_a[l], size * sizeof(float)));
+    if (num_l_ <= 0) {
+        fprintf(stderr, "Invalid layer dims: must have at least 2 dims\n");
+        exit(EXIT_FAILURE);
     }
     
-    // Allocate pre-activation buffers
-    for (int l = 0; l < num_l; ++l) {
-        int size = dims[l + 1] * batch_size;
-        CUDA_CHECK(cudaMalloc(&d_z[l], size * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&d_dz[l], size * sizeof(float)));
+    if (layers_in.size() != static_cast<size_t>(num_l_)) {
+        fprintf(stderr, "layers_in.size() (%zu) must equal dims.size() - 1 (%d)\n",
+                layers_in.size(), num_l_);
+        exit(EXIT_FAILURE);
     }
     
-    // Allocate ones vector for bias sum
-    CUDA_CHECK(cudaMalloc(&d_ones, batch_size * sizeof(float)));
-    dim3 grid, block;
-    get_grid_block(batch_size, grid, block);
-    kernel_fill_ones<<<grid, block>>>(batch_size, d_ones);
+    // Create handles if not yet created
+    if (!cublas_handle_) {
+        CUBLAS_CHECK(cublasCreate(&cublas_handle_));
+    }
+    if (!cusparse_handle_) {
+        CUSPARSE_CHECK(cusparseCreate(&cusparse_handle_));
+    }
     
-    initialized_buffers = true;
+    // Validate and adopt caller-supplied layers, or construct missing ones
+    layers_.resize(num_l_);
+    for (int l = 0; l < num_l_; ++l) {
+        int in_dim = dims_[l];
+        int out_dim = dims_[l + 1];
+        bool expected_sparse_input = (l == 0);
+        Layer::Activation expected_activation = (l < num_l_ - 1)
+                                                 ? Layer::Activation::ReLU
+                                                 : Layer::Activation::None;
+        
+        if (layers_in[l]) {
+            // Validate the supplied layer
+            auto& layer = layers_in[l];
+            if (layer->in_dim() != in_dim) {
+                fprintf(stderr, "Layer %d: in_dim mismatch: expected %d, got %d\n",
+                        l, in_dim, layer->in_dim());
+                exit(EXIT_FAILURE);
+            }
+            if (layer->out_dim() != out_dim) {
+                fprintf(stderr, "Layer %d: out_dim mismatch: expected %d, got %d\n",
+                        l, out_dim, layer->out_dim());
+                exit(EXIT_FAILURE);
+            }
+            if (layer->sparse_input() != expected_sparse_input) {
+                fprintf(stderr, "Layer %d: sparse_input mismatch: expected %d, got %d\n",
+                        l, expected_sparse_input, layer->sparse_input());
+                exit(EXIT_FAILURE);
+            }
+            layers_[l] = layer;
+        } else {
+            // Construct a new layer
+            unsigned long seed = rng();
+            layers_[l] = construct_layer_(in_dim, out_dim, expected_activation,
+                                          expected_sparse_input, seed);
+        }
+    }
+    
+    // Allocate loss scalar
+    CUDA_CHECK(cudaMalloc(&d_loss_, sizeof(float)));
 }
 
-void GpuAutoencoder::deallocate_buffers() {
-    for (int l = 0; l <= num_l; ++l) {
-        if (d_a[l]) {
-            cudaFree(d_a[l]);
-            d_a[l] = nullptr;
-        }
-    }
+std::shared_ptr<Layer> GpuAutoencoder::construct_layer_(
+    int in_dim, int out_dim, Layer::Activation activation,
+    bool sparse_input, unsigned long seed) {
     
-    for (int l = 0; l < num_l; ++l) {
-        if (d_z[l]) {
-            cudaFree(d_z[l]);
-            d_z[l] = nullptr;
-        }
-        if (d_dz[l]) {
-            cudaFree(d_dz[l]);
-            d_dz[l] = nullptr;
-        }
-        if (d_W[l]) {
-            cudaFree(d_W[l]);
-            d_W[l] = nullptr;
-        }
-        if (d_b[l]) {
-            cudaFree(d_b[l]);
-            d_b[l] = nullptr;
-        }
-        if (d_mW[l]) {
-            cudaFree(d_mW[l]);
-            d_mW[l] = nullptr;
-        }
-        if (d_vW[l]) {
-            cudaFree(d_vW[l]);
-            d_vW[l] = nullptr;
-        }
-        if (d_mb[l]) {
-            cudaFree(d_mb[l]);
-            d_mb[l] = nullptr;
-        }
-        if (d_vb[l]) {
-            cudaFree(d_vb[l]);
-            d_vb[l] = nullptr;
-        }
-        if (d_dW[l]) {
-            cudaFree(d_dW[l]);
-            d_dW[l] = nullptr;
-        }
-        if (d_db[l]) {
-            cudaFree(d_db[l]);
-            d_db[l] = nullptr;
-        }
-    }
+    return std::make_shared<Layer>(in_dim, out_dim, activation, sparse_input,
+                                    seed, cublas_handle_, cusparse_handle_);
+}
+
+void GpuAutoencoder::allocate_buffers_() {
+    if (initialized_buffers_) return;
     
-    if (d_loss) {
-        cudaFree(d_loss);
-        d_loss = nullptr;
-    }
-    if (d_ones) {
-        cudaFree(d_ones);
-        d_ones = nullptr;
-    }
+    // Allocate loss gradient buffer: (dims_[num_l_] × batch_size_) column-major
+    int out_dim = dims_[num_l_];
+    CUDA_CHECK(cudaMalloc(&d_grad_loss_, out_dim * batch_size_ * sizeof(float)));
     
-    initialized_buffers = false;
+    initialized_buffers_ = true;
+}
+
+void GpuAutoencoder::deallocate_buffers_() {
+    if (d_grad_loss_) {
+        CUDA_CHECK(cudaFree(d_grad_loss_));
+        d_grad_loss_ = nullptr;
+    }
+    if (d_loss_) {
+        CUDA_CHECK(cudaFree(d_loss_));
+        d_loss_ = nullptr;
+    }
+    initialized_buffers_ = false;
 }
 
 void GpuAutoencoder::forward(const SparseBatch& x) {
     // Set batch size on first forward
-    if (batch_size == 0) {
-        batch_size = x.B;
-        allocate_buffers();
+    if (batch_size_ == 0) {
+        batch_size_ = x.B;
+        allocate_buffers_();
     }
-    
-    cublasHandle_t blas_h = (cublasHandle_t)cublas_handle;
-    cusparseHandle_t sparse_h = (cusparseHandle_t)cusparse_handle;
-    
-    CUBLAS_CHECK(cublasSetStream(blas_h, x.stream));
-    CUSPARSE_CHECK(cusparseSetStream(sparse_h, x.stream));
-    
-    int d0 = dims[0];
-    int d1 = dims[1];
-    int B = x.B;
     
     // Layer 0: sparse input
-    // z[0] = W[0] * x + b[0]
-    // Use cuSPARSE SpMM: treat x (m × B sparse CSC) as CSR(B × m) with transpose
-    {
-        float one_f = 1.0f, zero_f = 0.0f;
-        
-        // Create sparse descriptor for x as CSC (CSC format data)
-        cusparseSpMatDescr_t matA;
-        CUSPARSE_CHECK(cusparseCreateCsc(
-            &matA, d0, B, x.nnz,
-            (void*)x.d_col_ptr, (void*)x.d_row_idx, (void*)x.d_values,
-            CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I, CUSPARSE_INDEX_BASE_ZERO,
-            CUDA_R_32F));
-        
-        // Create dense descriptor for W[0] (d1 × d0 column-major, ld=d1)
-        // Need to apply TRANSPOSE in SpMM to get (d0, d1) for multiplication
-        cusparseDnMatDescr_t matB;
-        CUSPARSE_CHECK(cusparseCreateDnMat(
-            &matB, d1, d0, d1,
-            d_W[0], CUDA_R_32F, CUSPARSE_ORDER_COL));
-        
-        // Create dense descriptor for z[0]^T (B × out row-major, ld=d1)
-        cusparseDnMatDescr_t matC;
-        CUSPARSE_CHECK(cusparseCreateDnMat(
-            &matC, B, d1, d1,
-            d_z[0], CUDA_R_32F, CUSPARSE_ORDER_ROW));
-        
-        // Forward SpMM: z[0] = W[0] @ x
-        // matA: x as CSC(d0, B), with OpA=TRANSPOSE → (B, d0)
-        // matB: W[0] as (d1, d0, COL), with OpB=TRANSPOSE → (d0, d1)
-        // matC: z[0] result (B, d1)
-        // Computation: (B, d0) @ (d0, d1) = (B, d1) → d_z[0]
-        size_t workspace_size = 0;
-        CUSPARSE_CHECK(cusparseSpMM_bufferSize(
-            sparse_h, CUSPARSE_OPERATION_TRANSPOSE,
-            CUSPARSE_OPERATION_TRANSPOSE, &one_f, matA, matB,
-            &zero_f, matC, CUDA_R_32F, CUSPARSE_SPMM_CSR_ALG1,
-            &workspace_size));
-        
-        void* workspace = nullptr;
-        if (workspace_size > 0) {
-            CUDA_CHECK(cudaMalloc(&workspace, workspace_size));
-        }
-        
-        // SpMM
-        CUSPARSE_CHECK(cusparseSpMM(
-            sparse_h, CUSPARSE_OPERATION_TRANSPOSE,
-            CUSPARSE_OPERATION_TRANSPOSE, &one_f, matA, matB,
-            &zero_f, matC, CUDA_R_32F, CUSPARSE_SPMM_CSR_ALG1, workspace));
-        
-        if (workspace) CUDA_CHECK(cudaFree(workspace));
-        cusparseDestroySpMat(matA);
-        cusparseDestroyDnMat(matB);
-        cusparseDestroyDnMat(matC);
-    }
+    const float* output = layers_[0]->forward(x);
     
-    // Add bias to z[0]: for (B, d1) row-major, z[bidx, i] += b[i]
-    {
-        dim3 grid, block;
-        get_grid_block(B, grid, block);
-        kernel_add_bias_rowmajor<<<grid, block, 0, x.stream>>>(d1, B, d_z[0], d_b[0]);
-    }
-    
-    // Copy z[0] to a[1] (or apply ReLU): for (B, d1) row-major
-    {
-        int size = d1 * B;
-        dim3 grid, block;
-        get_grid_block(size, grid, block);
-        kernel_relu_forward<<<grid, block, 0, x.stream>>>(size, d_a[1], d_z[0]);
-    }
-    
-    // Layers 1..L-1: dense
-    for (int l = 1; l < num_l; ++l) {
-        int in = dims[l];
-        int out = dims[l + 1];
-        
-        // Forward dense layer: z[l] = W[l] @ a[l] + b[l]
-        // W[l]: (out, in) column-major (ld=out)
-        // a[l]: (in, B) column-major (ld=in)
-        // z[l]: (out, B) column-major (ld=out) - result
-        // Computation: (out, in) @ (in, B) = (out, B) → d_z[l]
-        float one_f = 1.0f, zero_f = 0.0f;
-        CUBLAS_CHECK(cublasSgemm(
-            blas_h, CUBLAS_OP_N, CUBLAS_OP_N,
-            out, B, in,
-            &one_f,
-            d_W[l], out,
-            d_a[l], in,
-            &zero_f,
-            d_z[l], out));
-        
-        // Add bias
-        {
-            dim3 grid, block;
-            get_grid_block(B, grid, block);
-            kernel_add_bias<<<grid, block, 0, x.stream>>>(out, B, d_z[l], d_b[l]);
-        }
-        
-        // Apply ReLU if not last layer
-        if (l < num_l - 1) {
-            int size = out * B;
-            dim3 grid, block;
-            get_grid_block(size, grid, block);
-            kernel_relu_forward<<<grid, block, 0, x.stream>>>(size, d_a[l+1], d_z[l]);
-        } else {
-            // Last layer: linear (copy z to a)
-            int size = out * B;
-            CUDA_CHECK(cudaMemcpyAsync(d_a[num_l], d_z[num_l - 1], size * sizeof(float),
-                                       cudaMemcpyDeviceToDevice, x.stream));
-        }
+    // Layers 1..L-1: dense input, using previous layer's output
+    for (int i = 1; i < num_l_; ++i) {
+        output = layers_[i]->forward(output, x.B, x.stream);
     }
 }
 
 float GpuAutoencoder::backward_and_step(const SparseBatch& x, float lr) {
-    cublasHandle_t blas_h = (cublasHandle_t)cublas_handle;
-    cusparseHandle_t sparse_h = (cusparseHandle_t)cusparse_handle;
-    
-    CUBLAS_CHECK(cublasSetStream(blas_h, x.stream));
-    CUSPARSE_CHECK(cusparseSetStream(sparse_h, x.stream));
-    
-    int d0 = dims[0];
-    int dL = dims[num_l];
+    int d0 = dims_[0];
+    int dL = dims_[num_l_];
     int B = x.B;
     
-    // Compute loss: ||a[L] - x||_F^2 / (d0 * B)
-    // Strategy: loss_sum = ||a[L]||_F^2
-    //           then for each sparse (r, j, v): loss_sum += v^2 - 2*a[L](r,j)*v
+    // Get final layer output (reconstruction)
+    const float* a_L = layers_[num_l_ - 1]->output();
+    
+    // Compute loss: ||a_L - x||_F^2 / (d0 * B)
+    // Strategy: loss_sum = ||a_L||_F^2
+    //           then for each sparse (r, j, v): loss_sum += v^2 - 2*a_L(r,j)*v
     float loss_h = 0.0f;
     
-    // Compute ||a[L]||_F^2: dot product a[L] · a[L]
-    // a[L]: (d0, B) = (dL, B) column-major (ld=dL)
-    // Result: scalar norm_sq = sum of squares → d_loss (device) or norm_sq (host)
-    float norm_sq = 0.0f;
-    CUBLAS_CHECK(cublasSdot(blas_h, dL * B, d_a[num_l], 1, d_a[num_l], 1, &norm_sq));
-    loss_h = norm_sq;
+    // Compute ||a_L||_F^2: dot product a_L · a_L
+    CUBLAS_CHECK(cublasSetStream(cublas_handle_, x.stream));
+    CUBLAS_CHECK(cublasSdot(cublas_handle_, dL * B, a_L, 1, a_L, 1, &loss_h));
     
-    // Initialize dz[L-1] = a[L] / B for all entries
+    // Initialize d_grad_loss_ = a_L / B for all entries
     {
         int size = dL * B;
-        CUDA_CHECK(cudaMemcpyAsync(d_dz[num_l - 1], d_a[num_l], size * sizeof(float),
+        CUDA_CHECK(cudaMemcpyAsync(d_grad_loss_, a_L, size * sizeof(float),
                                    cudaMemcpyDeviceToDevice, x.stream));
         
-        // Scale dz[L-1] in-place: multiply each element by 1/B
-        // dz[L-1]: (dL, B) column-major → scaled in-place
+        // Scale in-place: multiply each element by 1/B
         float scale = 1.0f / B;
-        CUBLAS_CHECK(cublasSscal(blas_h, size, &scale, d_dz[num_l - 1], 1));
+        CUBLAS_CHECK(cublasSscal(cublas_handle_, size, &scale, d_grad_loss_, 1));
     }
     
     // Sparse correction kernel: for each sparse (r, j, v):
-    //   dz[L-1](r,j) = (a[L](r,j) - v) / B
-    //   loss_h += v^2 - 2*a[L](r,j)*v
+    //   d_grad_loss_(r,j) = (a_L(r,j) - v) / B
+    //   loss_h += v^2 - 2*a_L(r,j)*v
     {
-        CUDA_CHECK(cudaMemset(d_loss, 0, sizeof(float)));
+        CUDA_CHECK(cudaMemsetAsync(d_loss_, 0, sizeof(float), x.stream));
         
         // Launch one block per column
-        kernel_sparse_loss_and_dz_update<<<B, 256, 0, x.stream>>>(
-            d0, B, d_dz[num_l - 1], d_loss,
-            d_a[num_l],
-            x.d_col_ptr, x.d_row_idx, x.d_values);
+        kernel_sparse_loss_and_grad<<<B, 256, 0, x.stream>>>(
+            d0, B, d_grad_loss_, d_loss_,
+            a_L, x.d_col_ptr, x.d_row_idx, x.d_values);
         
         float loss_correction = 0.0f;
-        CUDA_CHECK(cudaMemcpyAsync(&loss_correction, d_loss, sizeof(float),
+        CUDA_CHECK(cudaMemcpyAsync(&loss_correction, d_loss_, sizeof(float),
                                    cudaMemcpyDeviceToHost, x.stream));
         CUDA_CHECK(cudaStreamSynchronize(x.stream));
         
@@ -534,154 +299,45 @@ float GpuAutoencoder::backward_and_step(const SparseBatch& x, float lr) {
     // Finalize loss: divide by (d0 * B)
     float loss_final = loss_h / (static_cast<float>(d0) * static_cast<float>(B));
     
-    // Backward pass: l = L-1 down to 0
-    for (int l = num_l - 1; l >= 0; --l) {
-        int in = dims[l];
-        int out = dims[l + 1];
+    // Backward pass: layers in reverse order
+    const float* grad = d_grad_loss_;
+    
+    // Layers L-1 down to 1: dense backward
+    for (int i = num_l_ - 1; i >= 1; --i) {
+        // Get the input to this layer (output of previous layer)
+        const float* layer_input = layers_[i - 1]->output();
         
-        // ReLU backward for hidden layers
-        if (l < num_l - 1) {
-            int size = out * B;
-            dim3 grid, block;
-            get_grid_block(size, grid, block);
-            kernel_relu_backward<<<grid, block, 0, x.stream>>>(size, d_dz[l], d_z[l]);
-        }
-        // For l == L-1, dz[l] is already set (output layer)
-        
-        // Compute dW[l] = dz[l] * a[l]^T
-        if (l > 0) {
-            // Dense case: compute gradient dW[l] = dz[l] @ a[l]^T
-            // dz[l]: (out, B) column-major (ld=out)
-            // a[l]: (in, B) column-major (ld=in), transposed to (B, in)
-            // dW[l]: (out, in) column-major (ld=out) - result
-            // Computation: (out, B) @ (B, in) = (out, in) → d_dW[l]
-            float one_f = 1.0f, zero_f = 0.0f;
-            CUBLAS_CHECK(cublasSgemm(
-                blas_h, CUBLAS_OP_N, CUBLAS_OP_T,
-                out, in, B,
-                &one_f,
-                d_dz[l], out,
-                d_a[l], in,
-                &zero_f,
-                d_dW[l], out));
-        } else {
-            // Sparse case (l=0): compute gradient dW[0] = dz[0] @ x^T
-            // x: CSC(d0, B) with OpA=NON_TRANSPOSE → (d0, B)
-            // dz[0]: (out, B) as (B, out) row-major, transposed to (out, B) col-major
-            // dW[0]: (d0, out) result
-            // Computation: (d0, B) @ (B, out) = (d0, out) → d_dW[0]
-            
-            float one_f = 1.0f, zero_f = 0.0f;
-            
-            cusparseSpMatDescr_t matA;
-            CUSPARSE_CHECK(cusparseCreateCsc(
-                &matA, d0, B, x.nnz,
-                (void*)x.d_col_ptr, (void*)x.d_row_idx, (void*)x.d_values,
-                CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I, CUSPARSE_INDEX_BASE_ZERO,
-                CUDA_R_32F));
-            
-            cusparseDnMatDescr_t matB;
-            CUSPARSE_CHECK(cusparseCreateDnMat(
-                &matB, B, out, out,
-                d_dz[0], CUDA_R_32F, CUSPARSE_ORDER_ROW));
-            
-            cusparseDnMatDescr_t matC;
-            CUSPARSE_CHECK(cusparseCreateDnMat(
-                &matC, d0, out, out,
-                d_dW[0], CUDA_R_32F, CUSPARSE_ORDER_ROW));
-            
-            size_t workspace_size = 0;
-            CUSPARSE_CHECK(cusparseSpMM_bufferSize(
-                sparse_h, CUSPARSE_OPERATION_NON_TRANSPOSE,
-                CUSPARSE_OPERATION_NON_TRANSPOSE, &one_f, matA, matB,
-                &zero_f, matC, CUDA_R_32F, CUSPARSE_SPMM_CSR_ALG1,
-                &workspace_size));
-            
-            void* workspace = nullptr;
-            if (workspace_size > 0) {
-                CUDA_CHECK(cudaMalloc(&workspace, workspace_size));
-            }
-            
-            CUSPARSE_CHECK(cusparseSpMM(
-                sparse_h, CUSPARSE_OPERATION_NON_TRANSPOSE,
-                CUSPARSE_OPERATION_NON_TRANSPOSE, &one_f, matA, matB,
-                &zero_f, matC, CUDA_R_32F, CUSPARSE_SPMM_CSR_ALG1, workspace));
-            
-            if (workspace) CUDA_CHECK(cudaFree(workspace));
-            cusparseDestroySpMat(matA);
-            cusparseDestroyDnMat(matB);
-            cusparseDestroyDnMat(matC);
-        }
-        
-        // db[l] = rowwise sum of dz[l] (dz[l] @ ones_B)
-        // dz[l]: (out, B) column-major (ld=out)
-        // ones_B: (B, 1) vector of ones
-        // db[l]: (out, 1) result - gradient for bias
-        // Computation: (out, B) @ (B, 1) = (out, 1) → d_db[l]
-        {
-            float one_f = 1.0f, zero_f = 0.0f;
-            CUBLAS_CHECK(cublasSgemv(
-                blas_h, CUBLAS_OP_N,
-                out, B,
-                &one_f,
-                d_dz[l], out,
-                d_ones, 1,
-                &zero_f,
-                d_db[l], 1));
-        }
-        
-        // Propagate to previous layer: dz[l-1] = W[l]^T * dz[l]
-        // W[l]: (out, in) column-major (ld=out), transposed to (in, out)
-        // dz[l]: (out, B) column-major (ld=out)
-        // dz[l-1]: (in, B) column-major (ld=in) - result
-        // Computation: (in, out) @ (out, B) = (in, B) → d_dz[l-1]
-        if (l > 0) {
-            float one_f = 1.0f, zero_f = 0.0f;
-            CUBLAS_CHECK(cublasSgemm(
-                blas_h, CUBLAS_OP_T, CUBLAS_OP_N,
-                in, B, out,
-                &one_f,
-                d_W[l], out,
-                d_dz[l], out,
-                &zero_f,
-                d_dz[l - 1], in));
-        }
+        // Compute gradient with respect to input (needed for previous layer)
+        bool compute_grad_input = true;
+        grad = layers_[i]->backward(layer_input, grad, compute_grad_input, x.stream);
     }
     
-    // Adam update
-    ++t;
-    float bc1 = 1.0f - std::pow(beta1, static_cast<float>(t));
-    float bc2 = 1.0f - std::pow(beta2, static_cast<float>(t));
-    float lr_t = lr * std::sqrt(bc2) / bc1;
+    // Layer 0: sparse backward (no grad_input needed/returned)
+    layers_[0]->backward(x, grad);
     
-    for (int l = 0; l < num_l; ++l) {
-        int in = dims[l];
-        int out = dims[l + 1];
-        
-        // Update W[l]
-        {
-            int size = out * in;
-            dim3 grid, block;
-            get_grid_block(size, grid, block);
-            kernel_adam_update<<<grid, block, 0, x.stream>>>(
-                size, d_W[l], d_mW[l], d_vW[l], d_dW[l],
-                lr_t, beta1, beta2, eps);
-        }
-        
-        // Update b[l]
-        {
-            int size = out;
-            dim3 grid, block;
-            get_grid_block(size, grid, block);
-            kernel_adam_update<<<grid, block, 0, x.stream>>>(
-                size, d_b[l], d_mb[l], d_vb[l], d_db[l],
-                lr_t, beta1, beta2, eps);
-        }
+    // Adam update on all layers
+    for (auto& layer : layers_) {
+        layer->update(lr, x.stream);
     }
     
     return loss_final;
 }
 
-int GpuAutoencoder::num_layers() const {
-    return num_l;
+// --- Public accessors ---
+
+int GpuAutoencoder::num_layers() const noexcept {
+    return num_l_;
 }
+
+std::shared_ptr<Layer> GpuAutoencoder::layer(int i) const {
+    if (i < 0 || i >= num_l_) {
+        fprintf(stderr, "layer(%d): index out of range [0, %d)\n", i, num_l_);
+        exit(EXIT_FAILURE);
+    }
+    return layers_[i];
+}
+
+const std::vector<std::shared_ptr<Layer>>& GpuAutoencoder::layers() const noexcept {
+    return layers_;
+}
+
