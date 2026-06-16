@@ -3,9 +3,11 @@
 
 #include "gpu_autoencoder.h"
 #include "gpu_data_loader.h"
+#include "gpu_timer.h"
 #include "data.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
@@ -16,6 +18,8 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#include <nvtx3/nvToolsExt.h>
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -88,17 +92,35 @@ static Options parse_args(int argc, char** argv) {
 }
 
 // ---------------------------------------------------------------------------
+// Timing helpers
+// ---------------------------------------------------------------------------
+
+namespace {
+    static double ms_since(std::chrono::steady_clock::time_point t0) {
+        auto t1 = std::chrono::steady_clock::now();
+        return std::chrono::duration<double, std::milli>(t1 - t0).count();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 int main(int argc, char** argv) {
     try {
+        auto t_start = std::chrono::steady_clock::now();
         Options opt = parse_args(argc, argv);
+        std::cout << "Argument parsing: " << ms_since(t_start) << " ms" << std::endl;
 
         // Peek the feature count by loading the first file directly.
         // This is done before constructing the RNG to avoid consuming RNG state
         // out of order.
+        nvtxRangePushA("main:load_validate");
+        auto t_validate = std::chrono::steady_clock::now();
         std::cout << "Peeking feature count from " << opt.files[0] << "..." << std::endl;
         PZHeader hdr = validate_1pz(opt.files[0]);
+        std::cout << "validate_1pz: " << ms_since(t_validate) << " ms" << std::endl;
+        nvtxRangePop();
+        
         const int m = static_cast<int>(hdr.m);
         if (m <= 0) {
             throw std::runtime_error("first file has no features");
@@ -116,14 +138,20 @@ int main(int argc, char** argv) {
 
         // Construct RNG and initialize the autoencoder BEFORE the first epoch.
         // This ensures RNG is consumed in the same order as the CPU main.cpp.
+        nvtxRangePushA("main:init");
+        auto t_init = std::chrono::steady_clock::now();
         std::mt19937 rng(opt.seed);
         GpuAutoencoder net;
         net.init(layer_dims, rng);
+        std::cout << "Model initialization: " << ms_since(t_init) << " ms" << std::endl;
+        nvtxRangePop();
 
         // Create the data loader. RNG is passed by reference; from now on,
         // begin_epoch() and next_batch() will consume RNG state.
+        auto t_loader = std::chrono::steady_clock::now();
         std::cout << "Constructing GPU data loader..." << std::endl;
         GpuDataLoader loader(opt.files, opt.chunk_size, opt.batch_size, rng);
+        std::cout << "Data loader construction: " << ms_since(t_loader) << " ms" << std::endl;
 
         std::cout << "\n=== Training summary ===\n"
                   << "  files           : " << opt.files.size() << '\n'
@@ -140,26 +168,84 @@ int main(int argc, char** argv) {
                   << "  seed            : " << opt.seed << '\n' << std::endl;
 
         std::vector<float> losses(opt.epochs, 0.0f);
+        
+        nvtxRangePushA("main:train_loop");
+        auto t_train_total = std::chrono::steady_clock::now();
+        
         for (int epoch = 1; epoch <= opt.epochs; ++epoch) {
+            char epoch_name[64];
+            snprintf(epoch_name, sizeof(epoch_name), "epoch:%d", epoch);
+            nvtxRangePushA(epoch_name);
+            
+            auto t_epoch = std::chrono::steady_clock::now();
             loader.begin_epoch();
+            net.reset_epoch_loss();
 
-            float loss_sum = 0.0f;
             int num_batches = 0;
             SparseBatch batch;
 
-            while (loader.next_batch(&batch)) {
+            // Accumulate timing per-epoch
+            double time_next_batch = 0.0;
+            double time_forward = 0.0;
+            double time_backward = 0.0;
+
+            while (true) {
+                nvtxRangePushA("next_batch");
+                auto t_batch_load = std::chrono::steady_clock::now();
+                bool has_batch = loader.next_batch(&batch);
+                time_next_batch += ms_since(t_batch_load);
+                nvtxRangePop();
+                
+                if (!has_batch) break;
+
+                nvtxRangePushA("forward");
+                auto t_fwd = std::chrono::steady_clock::now();
                 net.forward(batch);
-                loss_sum += net.backward_and_step(batch, opt.lr);
+                time_forward += ms_since(t_fwd);
+                nvtxRangePop();
+
+                nvtxRangePushA("backward_and_step");
+                auto t_bwd = std::chrono::steady_clock::now();
+                net.backward_and_step(batch, opt.lr);
+                time_backward += ms_since(t_bwd);
+                nvtxRangePop();
+                
                 ++num_batches;
             }
 
-            float mean_loss = (num_batches > 0)
-                            ? loss_sum / static_cast<float>(num_batches) : 0.0f;
+            float mean_loss = net.read_epoch_loss(num_batches);
+            double epoch_ms = ms_since(t_epoch);
+            
+            // Flush GPU timers and report
+            gpu_timers().flush_and_accumulate();
+            
             std::cout << "epoch " << epoch << "/" << opt.epochs
                       << "  batches=" << num_batches
-                      << "  mean_recon_loss=" << mean_loss << std::endl;
+                      << "  mean_recon_loss=" << mean_loss
+                      << "  cpu_launch_total=" << epoch_ms << " ms"
+                      << "  [cpu_launch_next_batch=" << time_next_batch << " ms"
+                      << ", cpu_launch_forward=" << time_forward << " ms"
+                      << ", cpu_launch_backward=" << time_backward << " ms]"
+                      << std::endl;
+            
+            gpu_timers().report(std::cout, std::string("epoch ") + std::to_string(epoch));
+            gpu_timers().reset_epoch();  // Reset per-epoch accumulators
             losses[epoch - 1] = mean_loss;
+            
+            nvtxRangePop();
         }
+        
+        double train_total_ms = ms_since(t_train_total);
+        std::cout << "Total training loop: " << train_total_ms << " ms" << std::endl;
+        nvtxRangePop();
+        
+        // Print grand total timings across all epochs
+        gpu_timers().report(std::cout, "All Epochs Grand Total", true);
+        
+        // Print a final summary of grand totals across all epochs
+        // (Requires maintaining cumulative totals; for now, just note training is complete)
+        std::cout << "\n=== Training Complete ===\n" << std::endl;
+        
         float scaler = 80.0f / losses[0];
         int col;
         for (float l : losses) {

@@ -63,12 +63,22 @@ public:
     // On return, the reconstruction is available via the last layer's output().
     void forward(const SparseBatch& x);
 
-    // Backprop MSE loss against target `x` (sparse), run one Adam step, and
-    // return the mean-squared-error (averaged over batch and features) for
-    // monitoring. Mirrors the original autoencoder's semantics including the
-    // intentional asymmetry between loss (divided by d0*B) and loss gradient
+    // Backprop MSE loss against target `x` (sparse), run one Adam step.
+    // Per-batch loss is accumulated into a device-side epoch sum and read via
+    // read_epoch_loss(). Mirrors the original autoencoder's semantics including
+    // the intentional asymmetry between loss (divided by d0*B) and loss gradient
     // (divided by B only).
-    float backward_and_step(const SparseBatch& x, float lr);
+    void backward_and_step(const SparseBatch& x, float lr);
+
+    // Reset the device-side epoch loss accumulator to 0. Call once at the
+    // start of each epoch, BEFORE the batch loop. Synchronous on the default
+    // stream (cheap; called once per epoch).
+    void reset_epoch_loss();
+
+    // Read back the accumulated epoch loss from device, divide by num_batches,
+    // and return the per-epoch mean reconstruction loss. Synchronizes the
+    // default stream. Call ONCE per epoch after the batch loop.
+    float read_epoch_loss(int num_batches);
 
     // --- Public accessors ---
     int num_layers() const noexcept;
@@ -88,6 +98,8 @@ private:
     // Autoencoder-level device buffers (owned)
     float* d_grad_loss_;  // Loss gradient, (dims_[L] × batch_size_) col-major
     float* d_loss_;       // Scalar loss accumulator on device
+    float* d_dot_;              // Scalar device buffer for cublasSdot result (||a_L||^2)
+    float* d_epoch_loss_sum_;   // Device scalar: sum over batches of per-batch mean loss
 
     // cuBLAS / cuSPARSE handles (owned)
     cublasHandle_t cublas_handle_;

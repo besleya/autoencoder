@@ -4,6 +4,8 @@
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <cusparse.h>
+#include <nvtx3/nvToolsExt.h>
+#include "gpu_timer.h"
 #include <cmath>
 #include <cstdio>
 #include <random>
@@ -260,6 +262,9 @@ const float* Layer::backward(const float* d_in,
 // --- Optimization ---
 
 void Layer::update(float lr, cudaStream_t stream) {
+    nvtxRangePushA("Layer::update");
+    GpuScopedTimer timer_total("layer.update.total", stream);
+    
     ++t_;
     float bc1 = 1.0f - std::pow(0.9f, static_cast<float>(t_));
     float bc2 = 1.0f - std::pow(0.999f, static_cast<float>(t_));
@@ -270,6 +275,7 @@ void Layer::update(float lr, cudaStream_t stream) {
 
     // Update W
     {
+        GpuScopedTimer timer_w("layer.update.W", stream);
         dim3 grid, block;
         get_grid_block(size_w, grid, block);
         kernel_adam_update<<<grid, block, 0, stream>>>(
@@ -279,12 +285,15 @@ void Layer::update(float lr, cudaStream_t stream) {
 
     // Update b
     {
+        GpuScopedTimer timer_b("layer.update.b", stream);
         dim3 grid, block;
         get_grid_block(size_b, grid, block);
         kernel_adam_update<<<grid, block, 0, stream>>>(
             size_b, d_b_, d_mb_, d_vb_, d_db_,
             lr_t, 0.9f, 0.999f, 1e-8f);
     }
+    
+    nvtxRangePop();
 }
 
 // --- Accessors ---
@@ -336,6 +345,9 @@ void Layer::_ensure_batch_buffers(int batch_size, bool need_grad_input) {
 }
 
 void Layer::_sp_forward(const SparseBatch& x) {
+    nvtxRangePushA("Layer::_sp_forward");
+    GpuScopedTimer timer_total("layer.sp_fwd.total", x.stream);
+    
     cublasHandle_t blas_h = cublas_handle_;
     cusparseHandle_t sparse_h = cusparse_handle_;
 
@@ -369,34 +381,52 @@ void Layer::_sp_forward(const SparseBatch& x) {
     // matB is (out, in) with OpB=TRANSPOSE → (in, out)
     // matC = (B, out)
     size_t workspace_size = 0;
-    CUSPARSE_CHECK(cusparseSpMM_bufferSize(
-        sparse_h, CUSPARSE_OPERATION_TRANSPOSE,
-        CUSPARSE_OPERATION_TRANSPOSE, &one_f, matA, matB,
-        &zero_f, matC, CUDA_R_32F, CUSPARSE_SPMM_CSR_ALG1,
-        &workspace_size));
-
     void* workspace = nullptr;
-    if (workspace_size > 0) {
-        CUDA_CHECK(cudaMalloc(&workspace, workspace_size));
+    {
+        GpuScopedTimer timer_ws("layer.sp_fwd.workspace_alloc", x.stream);
+        CUSPARSE_CHECK(cusparseSpMM_bufferSize(
+            sparse_h, CUSPARSE_OPERATION_TRANSPOSE,
+            CUSPARSE_OPERATION_TRANSPOSE, &one_f, matA, matB,
+            &zero_f, matC, CUDA_R_32F, CUSPARSE_SPMM_CSR_ALG1,
+            &workspace_size));
+
+        if (workspace_size > 0) {
+            CUDA_CHECK(cudaMalloc(&workspace, workspace_size));
+        }
     }
 
-    CUSPARSE_CHECK(cusparseSpMM(
-        sparse_h, CUSPARSE_OPERATION_TRANSPOSE,
-        CUSPARSE_OPERATION_TRANSPOSE, &one_f, matA, matB,
-        &zero_f, matC, CUDA_R_32F, CUSPARSE_SPMM_CSR_ALG1, workspace));
+    {
+        GpuScopedTimer timer_spmm("layer.sp_fwd.spmm", x.stream);
+        CUSPARSE_CHECK(cusparseSpMM(
+            sparse_h, CUSPARSE_OPERATION_TRANSPOSE,
+            CUSPARSE_OPERATION_TRANSPOSE, &one_f, matA, matB,
+            &zero_f, matC, CUDA_R_32F, CUSPARSE_SPMM_CSR_ALG1, workspace));
+    }
 
-    if (workspace) CUDA_CHECK(cudaFree(workspace));
+    if (workspace) {
+        GpuScopedTimer timer_free("layer.sp_fwd.workspace_free", x.stream);
+        CUDA_CHECK(cudaFree(workspace));
+    }
+    
     cusparseDestroySpMat(matA);
     cusparseDestroyDnMat(matB);
     cusparseDestroyDnMat(matC);
 
     // Add bias
-    dim3 grid, block;
-    get_grid_block(x.B, grid, block);
-    kernel_add_bias<<<grid, block, 0, x.stream>>>(out_dim_, x.B, d_z_, d_b_);
+    {
+        GpuScopedTimer timer_bias("layer.sp_fwd.bias", x.stream);
+        dim3 grid, block;
+        get_grid_block(x.B, grid, block);
+        kernel_add_bias<<<grid, block, 0, x.stream>>>(out_dim_, x.B, d_z_, d_b_);
+    }
+    
+    nvtxRangePop();
 }
 
 void Layer::_dn_forward(const float* d_in, int batch_size, cudaStream_t stream) {
+    nvtxRangePushA("Layer::_dn_forward");
+    GpuScopedTimer timer_total("layer.dn_fwd.total", stream);
+    
     cublasHandle_t blas_h = cublas_handle_;
     CUBLAS_CHECK(cublasSetStream(blas_h, stream));
 
@@ -405,22 +435,33 @@ void Layer::_dn_forward(const float* d_in, int batch_size, cudaStream_t stream) 
     // in: (in, batch_size) col-major
     // z: (out, batch_size) col-major
     float one_f = 1.0f, zero_f = 0.0f;
-    CUBLAS_CHECK(cublasSgemm(
-        blas_h, CUBLAS_OP_N, CUBLAS_OP_N,
-        out_dim_, batch_size, in_dim_,
-        &one_f,
-        d_W_, out_dim_,
-        d_in, in_dim_,
-        &zero_f,
-        d_z_, out_dim_));
+    {
+        GpuScopedTimer timer_gemm("layer.dn_fwd.gemm", stream);
+        CUBLAS_CHECK(cublasSgemm(
+            blas_h, CUBLAS_OP_N, CUBLAS_OP_N,
+            out_dim_, batch_size, in_dim_,
+            &one_f,
+            d_W_, out_dim_,
+            d_in, in_dim_,
+            &zero_f,
+            d_z_, out_dim_));
+    }
 
     // Add bias
-    dim3 grid, block;
-    get_grid_block(batch_size, grid, block);
-    kernel_add_bias<<<grid, block, 0, stream>>>(out_dim_, batch_size, d_z_, d_b_);
+    {
+        GpuScopedTimer timer_bias("layer.dn_fwd.bias", stream);
+        dim3 grid, block;
+        get_grid_block(batch_size, grid, block);
+        kernel_add_bias<<<grid, block, 0, stream>>>(out_dim_, batch_size, d_z_, d_b_);
+    }
+    
+    nvtxRangePop();
 }
 
 void Layer::_sp_backward(const SparseBatch& x, const float* d_grad_output) {
+    nvtxRangePushA("Layer::_sp_backward");
+    GpuScopedTimer timer_total("layer.sp_bwd.total", x.stream);
+    
     cublasHandle_t blas_h = cublas_handle_;
     cusparseHandle_t sparse_h = cusparse_handle_;
 
@@ -454,21 +495,27 @@ void Layer::_sp_backward(const SparseBatch& x, const float* d_grad_output) {
         d_dW_, CUDA_R_32F, CUSPARSE_ORDER_ROW));
 
     size_t workspace_size = 0;
-    CUSPARSE_CHECK(cusparseSpMM_bufferSize(
-        sparse_h, CUSPARSE_OPERATION_NON_TRANSPOSE,
-        CUSPARSE_OPERATION_NON_TRANSPOSE, &one_f, matA, matB,
-        &zero_f, matC, CUDA_R_32F, CUSPARSE_SPMM_CSR_ALG1,
-        &workspace_size));
-
     void* workspace = nullptr;
-    if (workspace_size > 0) {
-        CUDA_CHECK(cudaMalloc(&workspace, workspace_size));
+    {
+        GpuScopedTimer timer_ws("layer.sp_bwd.workspace_alloc", x.stream);
+        CUSPARSE_CHECK(cusparseSpMM_bufferSize(
+            sparse_h, CUSPARSE_OPERATION_NON_TRANSPOSE,
+            CUSPARSE_OPERATION_NON_TRANSPOSE, &one_f, matA, matB,
+            &zero_f, matC, CUDA_R_32F, CUSPARSE_SPMM_CSR_ALG1,
+            &workspace_size));
+
+        if (workspace_size > 0) {
+            CUDA_CHECK(cudaMalloc(&workspace, workspace_size));
+        }
     }
 
-    CUSPARSE_CHECK(cusparseSpMM(
-        sparse_h, CUSPARSE_OPERATION_NON_TRANSPOSE,
-        CUSPARSE_OPERATION_NON_TRANSPOSE, &one_f, matA, matB,
-        &zero_f, matC, CUDA_R_32F, CUSPARSE_SPMM_CSR_ALG1, workspace));
+    {
+        GpuScopedTimer timer_spmm("layer.sp_bwd.spmm", x.stream);
+        CUSPARSE_CHECK(cusparseSpMM(
+            sparse_h, CUSPARSE_OPERATION_NON_TRANSPOSE,
+            CUSPARSE_OPERATION_NON_TRANSPOSE, &one_f, matA, matB,
+            &zero_f, matC, CUDA_R_32F, CUSPARSE_SPMM_CSR_ALG1, workspace));
+    }
 
     if (workspace) CUDA_CHECK(cudaFree(workspace));
     cusparseDestroySpMat(matA);
@@ -479,20 +526,28 @@ void Layer::_sp_backward(const SparseBatch& x, const float* d_grad_output) {
     // dz: (B, out_dim) row-major, but we need to transpose it for GEMV
     // Actually, we need to sum over rows, so: db = dz^T @ ones = (out, B) @ (B,) = (out,)
     // But d_dz is stored as (out, B) col-major after activation backward
-    CUBLAS_CHECK(cublasSgemv(
-        blas_h, CUBLAS_OP_N,
-        out_dim_, x.B,
-        &one_f,
-        d_dz_, out_dim_,
-        d_ones_, 1,
-        &zero_f,
-        d_db_, 1));
+    {
+        GpuScopedTimer timer_dgemv("layer.sp_bwd.dgemv_bias", x.stream);
+        CUBLAS_CHECK(cublasSgemv(
+            blas_h, CUBLAS_OP_N,
+            out_dim_, x.B,
+            &one_f,
+            d_dz_, out_dim_,
+            d_ones_, 1,
+            &zero_f,
+            d_db_, 1));
+    }
+    
+    nvtxRangePop();
 }
 
 void Layer::_dn_backward(const float* d_in,
                          const float* d_grad_output,
                          bool compute_grad_input,
                          cudaStream_t stream) {
+    nvtxRangePushA("Layer::_dn_backward");
+    GpuScopedTimer timer_total("layer.dn_bwd.total", stream);
+    
     cublasHandle_t blas_h = cublas_handle_;
     CUBLAS_CHECK(cublasSetStream(blas_h, stream));
 
@@ -507,29 +562,36 @@ void Layer::_dn_backward(const float* d_in,
     // dz: (out, batch_size) col-major
     // in: (in, batch_size) col-major, transposed to (batch_size, in)
     // dW: (out, in) col-major result
-    CUBLAS_CHECK(cublasSgemm(
-        blas_h, CUBLAS_OP_N, CUBLAS_OP_T,
-        out_dim_, in_dim_, batch_size,
-        &one_f,
-        d_dz_, out_dim_,
-        d_in, in_dim_,
-        &zero_f,
-        d_dW_, out_dim_));
+    {
+        GpuScopedTimer timer_dw("layer.dn_bwd.gemm_dW", stream);
+        CUBLAS_CHECK(cublasSgemm(
+            blas_h, CUBLAS_OP_N, CUBLAS_OP_T,
+            out_dim_, in_dim_, batch_size,
+            &one_f,
+            d_dz_, out_dim_,
+            d_in, in_dim_,
+            &zero_f,
+            d_dW_, out_dim_));
+    }
 
     // Compute db = dz @ ones (row-wise sum)
-    CUBLAS_CHECK(cublasSgemv(
-        blas_h, CUBLAS_OP_N,
-        out_dim_, batch_size,
-        &one_f,
-        d_dz_, out_dim_,
-        d_ones_, 1,
-        &zero_f,
-        d_db_, 1));
+    {
+        GpuScopedTimer timer_db("layer.dn_bwd.gemv_db", stream);
+        CUBLAS_CHECK(cublasSgemv(
+            blas_h, CUBLAS_OP_N,
+            out_dim_, batch_size,
+            &one_f,
+            d_dz_, out_dim_,
+            d_ones_, 1,
+            &zero_f,
+            d_db_, 1));
+    }
 
     // Compute grad_input = W^T @ dz
     if (compute_grad_input) {
         // W^T: (in, out), dz: (out, batch_size) col-major
         // grad_input: (in, batch_size) col-major result
+        GpuScopedTimer timer_dinput("layer.dn_bwd.gemm_dInput", stream);
         CUBLAS_CHECK(cublasSgemm(
             blas_h, CUBLAS_OP_T, CUBLAS_OP_N,
             in_dim_, batch_size, out_dim_,
@@ -539,16 +601,20 @@ void Layer::_dn_backward(const float* d_in,
             &zero_f,
             d_grad_input_, in_dim_));
     }
+    
+    nvtxRangePop();
 }
 
 void Layer::_apply_activation_forward(int batch_size, cudaStream_t stream) {
     if (activation_ == Activation::None) {
         // y = z (copy)
+        GpuScopedTimer timer("layer.dn_fwd.activation", stream);
         int size = out_dim_ * batch_size;
         CUDA_CHECK(cudaMemcpyAsync(d_y_, d_z_, size * sizeof(float),
                                    cudaMemcpyDeviceToDevice, stream));
     } else {  // ReLU
         // y = max(z, 0)
+        GpuScopedTimer timer("layer.dn_fwd.activation", stream);
         int size = out_dim_ * batch_size;
         dim3 grid, block;
         get_grid_block(size, grid, block);
@@ -559,11 +625,13 @@ void Layer::_apply_activation_forward(int batch_size, cudaStream_t stream) {
 void Layer::_apply_activation_backward(int batch_size, cudaStream_t stream, const float* d_grad_output) {
     if (activation_ == Activation::None) {
         // dz = d_grad_output (copy)
+        GpuScopedTimer timer("layer.dn_bwd.activation", stream);
         int size = out_dim_ * batch_size;
         CUDA_CHECK(cudaMemcpyAsync(d_dz_, d_grad_output, size * sizeof(float),
                                    cudaMemcpyDeviceToDevice, stream));
     } else {  // ReLU
         // dz = d_grad_output * (z > 0 ? 1 : 0)
+        GpuScopedTimer timer("layer.dn_bwd.activation", stream);
         // First copy
         int size = out_dim_ * batch_size;
         CUDA_CHECK(cudaMemcpyAsync(d_dz_, d_grad_output, size * sizeof(float),

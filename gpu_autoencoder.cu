@@ -4,6 +4,8 @@
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <cusparse.h>
+#include <nvtx3/nvToolsExt.h>
+#include "gpu_timer.h"
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -79,6 +81,19 @@ __global__ void kernel_sparse_loss_and_grad(
     }
 }
 
+// Accumulate per-batch loss into a device-side epoch sum.
+// Computes: *d_epoch_sum += (*d_dot + *d_loss) / (d0 * B)
+// Single-thread kernel (writing one scalar); launched once per batch.
+__global__ void kernel_accumulate_loss(const float* d_dot,
+                                       const float* d_loss,
+                                       float* d_epoch_sum,
+                                       int d0, int B) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        float denom = static_cast<float>(d0) * static_cast<float>(B);
+        *d_epoch_sum += (*d_dot + *d_loss) / denom;
+    }
+}
+
 // ============================================================================
 // GpuAutoencoder implementation
 // ============================================================================
@@ -86,6 +101,7 @@ __global__ void kernel_sparse_loss_and_grad(
 GpuAutoencoder::GpuAutoencoder()
     : num_l_(0), batch_size_(0), initialized_buffers_(false),
       d_grad_loss_(nullptr), d_loss_(nullptr),
+      d_dot_(nullptr), d_epoch_loss_sum_(nullptr),
       cublas_handle_(nullptr), cusparse_handle_(nullptr) {}
 
 GpuAutoencoder::~GpuAutoencoder() {
@@ -133,8 +149,11 @@ void GpuAutoencoder::init(const std::vector<int>& layer_dims,
         layers_[l] = construct_layer_(in_dim, out_dim, activation, sparse_input, seed);
     }
     
-    // Allocate loss scalar
+    // Allocate loss scalars
     CUDA_CHECK(cudaMalloc(&d_loss_, sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_dot_, sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_epoch_loss_sum_, sizeof(float)));
+    CUDA_CHECK(cudaMemset(d_epoch_loss_sum_, 0, sizeof(float)));
 }
 
 void GpuAutoencoder::init(const std::vector<int>& layer_dims,
@@ -199,8 +218,11 @@ void GpuAutoencoder::init(const std::vector<int>& layer_dims,
         }
     }
     
-    // Allocate loss scalar
+    // Allocate loss scalars
     CUDA_CHECK(cudaMalloc(&d_loss_, sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_dot_, sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_epoch_loss_sum_, sizeof(float)));
+    CUDA_CHECK(cudaMemset(d_epoch_loss_sum_, 0, sizeof(float)));
 }
 
 std::shared_ptr<Layer> GpuAutoencoder::construct_layer_(
@@ -230,10 +252,21 @@ void GpuAutoencoder::deallocate_buffers_() {
         CUDA_CHECK(cudaFree(d_loss_));
         d_loss_ = nullptr;
     }
+    if (d_dot_) {
+        CUDA_CHECK(cudaFree(d_dot_));
+        d_dot_ = nullptr;
+    }
+    if (d_epoch_loss_sum_) {
+        CUDA_CHECK(cudaFree(d_epoch_loss_sum_));
+        d_epoch_loss_sum_ = nullptr;
+    }
     initialized_buffers_ = false;
 }
 
 void GpuAutoencoder::forward(const SparseBatch& x) {
+    nvtxRangePushA("GpuAutoencoder::forward");
+    GpuScopedTimer timer_total("ae.forward.total", x.stream);
+    
     // Set batch size on first forward
     if (batch_size_ == 0) {
         batch_size_ = x.B;
@@ -241,15 +274,30 @@ void GpuAutoencoder::forward(const SparseBatch& x) {
     }
     
     // Layer 0: sparse input
-    const float* output = layers_[0]->forward(x);
+    {
+        char layer_name[64];
+        snprintf(layer_name, sizeof(layer_name), "ae.forward.layer[0]");
+        GpuScopedTimer timer_layer(layer_name, x.stream);
+        const float* output = layers_[0]->forward(x);
+        (void)output;  // Use output to avoid unused variable warning
+    }
     
     // Layers 1..L-1: dense input, using previous layer's output
+    const float* output = layers_[0]->output();
     for (int i = 1; i < num_l_; ++i) {
+        char layer_name[64];
+        snprintf(layer_name, sizeof(layer_name), "ae.forward.layer[%d]", i);
+        GpuScopedTimer timer_layer(layer_name, x.stream);
         output = layers_[i]->forward(output, x.B, x.stream);
     }
+    
+    nvtxRangePop();
 }
 
-float GpuAutoencoder::backward_and_step(const SparseBatch& x, float lr) {
+void GpuAutoencoder::backward_and_step(const SparseBatch& x, float lr) {
+    nvtxRangePushA("GpuAutoencoder::backward_and_step");
+    GpuScopedTimer timer_total("ae.backward.total", x.stream);
+    
     int d0 = dims_[0];
     int dL = dims_[num_l_];
     int B = x.B;
@@ -257,47 +305,60 @@ float GpuAutoencoder::backward_and_step(const SparseBatch& x, float lr) {
     // Get final layer output (reconstruction)
     const float* a_L = layers_[num_l_ - 1]->output();
     
-    // Compute loss: ||a_L - x||_F^2 / (d0 * B)
-    // Strategy: loss_sum = ||a_L||_F^2
-    //           then for each sparse (r, j, v): loss_sum += v^2 - 2*a_L(r,j)*v
-    float loss_h = 0.0f;
-    
-    // Compute ||a_L||_F^2: dot product a_L · a_L
-    CUBLAS_CHECK(cublasSetStream(cublas_handle_, x.stream));
-    CUBLAS_CHECK(cublasSdot(cublas_handle_, dL * B, a_L, 1, a_L, 1, &loss_h));
+    // Compute loss: ||a_L - x||_F^2 / (d0 * B), accumulated on device.
+    // Strategy: d_dot_ = ||a_L||_F^2 (via cublasSdot in DEVICE pointer mode),
+    //           d_loss_ += sum over sparse (r, j, v) of v^2 - 2*a_L(r,j)*v
+    //           d_epoch_loss_sum_ += (d_dot_ + d_loss_) / (d0 * B)
+    // No host sync; loss is read once per epoch via read_epoch_loss().
+
+    // Compute ||a_L||_F^2 into device scalar d_dot_ (DEVICE pointer mode).
+    {
+        GpuScopedTimer timer_dot("ae.bwd.loss_dot", x.stream);
+        CUBLAS_CHECK(cublasSetStream(cublas_handle_, x.stream));
+        CUBLAS_CHECK(cublasSetPointerMode(cublas_handle_, CUBLAS_POINTER_MODE_DEVICE));
+        CUBLAS_CHECK(cublasSdot(cublas_handle_, dL * B, a_L, 1, a_L, 1, d_dot_));
+        CUBLAS_CHECK(cublasSetPointerMode(cublas_handle_, CUBLAS_POINTER_MODE_HOST));
+    }
     
     // Initialize d_grad_loss_ = a_L / B for all entries
     {
         int size = dL * B;
-        CUDA_CHECK(cudaMemcpyAsync(d_grad_loss_, a_L, size * sizeof(float),
-                                   cudaMemcpyDeviceToDevice, x.stream));
+        {
+            GpuScopedTimer timer_copy("ae.bwd.grad_init_copy", x.stream);
+            CUDA_CHECK(cudaMemcpyAsync(d_grad_loss_, a_L, size * sizeof(float),
+                                       cudaMemcpyDeviceToDevice, x.stream));
+        }
         
         // Scale in-place: multiply each element by 1/B
-        float scale = 1.0f / B;
-        CUBLAS_CHECK(cublasSscal(cublas_handle_, size, &scale, d_grad_loss_, 1));
+        {
+            GpuScopedTimer timer_scal("ae.bwd.grad_init_scal", x.stream);
+            float scale = 1.0f / B;
+            CUBLAS_CHECK(cublasSscal(cublas_handle_, size, &scale, d_grad_loss_, 1));
+        }
     }
     
     // Sparse correction kernel: for each sparse (r, j, v):
     //   d_grad_loss_(r,j) = (a_L(r,j) - v) / B
-    //   loss_h += v^2 - 2*a_L(r,j)*v
+    //   d_loss_ += v^2 - 2*a_L(r,j)*v
     {
         CUDA_CHECK(cudaMemsetAsync(d_loss_, 0, sizeof(float), x.stream));
         
-        // Launch one block per column
-        kernel_sparse_loss_and_grad<<<B, 256, 0, x.stream>>>(
-            d0, B, d_grad_loss_, d_loss_,
-            a_L, x.d_col_ptr, x.d_row_idx, x.d_values);
+        {
+            GpuScopedTimer timer_kernel("ae.bwd.loss_grad_kernel", x.stream);
+            // Launch one block per column
+            kernel_sparse_loss_and_grad<<<B, 256, 0, x.stream>>>(
+                d0, B, d_grad_loss_, d_loss_,
+                a_L, x.d_col_ptr, x.d_row_idx, x.d_values);
+        }
         
-        float loss_correction = 0.0f;
-        CUDA_CHECK(cudaMemcpyAsync(&loss_correction, d_loss_, sizeof(float),
-                                   cudaMemcpyDeviceToHost, x.stream));
-        CUDA_CHECK(cudaStreamSynchronize(x.stream));
-        
-        loss_h += loss_correction;
+        // Accumulate this batch's loss into the device-side epoch sum.
+        // No D2H, no host sync.
+        {
+            GpuScopedTimer timer_accum("ae.bwd.loss_accumulate", x.stream);
+            kernel_accumulate_loss<<<1, 1, 0, x.stream>>>(
+                d_dot_, d_loss_, d_epoch_loss_sum_, d0, B);
+        }
     }
-    
-    // Finalize loss: divide by (d0 * B)
-    float loss_final = loss_h / (static_cast<float>(d0) * static_cast<float>(B));
     
     // Backward pass: layers in reverse order
     const float* grad = d_grad_loss_;
@@ -309,18 +370,40 @@ float GpuAutoencoder::backward_and_step(const SparseBatch& x, float lr) {
         
         // Compute gradient with respect to input (needed for previous layer)
         bool compute_grad_input = true;
-        grad = layers_[i]->backward(layer_input, grad, compute_grad_input, x.stream);
+        {
+            char timer_name[64];
+            snprintf(timer_name, sizeof(timer_name), "ae.bwd.layer[%d].back", i);
+            GpuScopedTimer timer_back(timer_name, x.stream);
+            grad = layers_[i]->backward(layer_input, grad, compute_grad_input, x.stream);
+        }
     }
     
     // Layer 0: sparse backward (no grad_input needed/returned)
-    layers_[0]->backward(x, grad);
-    
-    // Adam update on all layers
-    for (auto& layer : layers_) {
-        layer->update(lr, x.stream);
+    {
+        GpuScopedTimer timer_layer0("ae.bwd.layer[0].back", x.stream);
+        layers_[0]->backward(x, grad);
     }
     
-    return loss_final;
+    // Adam update on all layers
+    for (size_t i = 0; i < layers_.size(); ++i) {
+        char timer_name[64];
+        snprintf(timer_name, sizeof(timer_name), "ae.bwd.layer[%zu].update", i);
+        GpuScopedTimer timer_update(timer_name, x.stream);
+        layers_[i]->update(lr, x.stream);
+    }
+    
+    nvtxRangePop();
+}
+
+void GpuAutoencoder::reset_epoch_loss() {
+    CUDA_CHECK(cudaMemset(d_epoch_loss_sum_, 0, sizeof(float)));
+}
+
+float GpuAutoencoder::read_epoch_loss(int num_batches) {
+    float epoch_sum = 0.0f;
+    CUDA_CHECK(cudaMemcpy(&epoch_sum, d_epoch_loss_sum_, sizeof(float),
+                          cudaMemcpyDeviceToHost));
+    return (num_batches > 0) ? epoch_sum / static_cast<float>(num_batches) : 0.0f;
 }
 
 // --- Public accessors ---
