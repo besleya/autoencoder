@@ -7,3 +7,5 @@ main_gpu
 version
 *.nsys-rep
 nsys*.sqlite
+__pycache__
+tests/validate/validate

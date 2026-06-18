@@ -89,8 +89,12 @@ public:
 public:
     struct Impl;
 
+private:
+    std::unique_ptr<Impl> impl_;
+};
+
 // ---------------------------------------------------------------------------
-// Standalone log-normalization helper.
+// Standalone log-normalization helper (free function, not a DataLoader method).
 // Applies per-column log1p normalization in-place on device values.
 // scaler=10000.0f matches the DataLoader's internal kSparseLogNormScaler.
 // The kernel launch is identical to the one inside batch_builder_thread.
@@ -100,7 +104,3 @@ void log_normalize_csc_columns(int n_cols,
                                 const int32_t* d_col_ptr,
                                 float* d_values,
                                 cudaStream_t stream);
-    
-private:
-    std::unique_ptr<Impl> impl_;
-};

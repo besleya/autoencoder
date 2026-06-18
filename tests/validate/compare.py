@@ -158,13 +158,9 @@ def train_autoencoder(model, X_norm, n_epochs=3):
         loss.backward()
         optimizer.step()
         
-        # Re-compute loss after step for epoch metric
-        with torch.no_grad():
-            output_final = model(X_torch)
-            mse_final = criterion(output_final, X_torch).item()
-        
-        epoch_mses.append(mse_final)
-        print(f"[Train] Epoch {epoch + 1}/{n_epochs}: MSE = {mse_final:.8f}")
+        # Record the loss from the training forward pass (NOT a re-computed loss after step)
+        epoch_mses.append(loss.item())
+        print(f"[Train] Epoch {epoch + 1}/{n_epochs}: MSE = {loss.item():.8f}")
     
     # Capture ReLU embedding after training
     with torch.no_grad():
@@ -176,7 +172,97 @@ def train_autoencoder(model, X_norm, n_epochs=3):
     print(f"[Train] Captured embedding shape: {embedding.shape}")
     return epoch_mses, embedding
 
-def compare_results(epoch_mses, embedding):
+def test_lognorm(X_norm):
+    """
+    Compare first 10 columns of log-normalized data.
+    
+    Reads validate_lognorm_10cols.csv from C++ side.
+    Compares against first 10 columns of Python X_norm.
+    
+    Always exit 0.
+    """
+    lognorm_csv_path = "/mnt/home/besleya/autoencoder/tests/validate/validate_lognorm_10cols.csv"
+    
+    if not os.path.exists(lognorm_csv_path):
+        print(f"[Lognorm] WARNING: C++ lognorm CSV not found at {lognorm_csv_path}")
+        print("[Lognorm] Skipped.\n")
+        return
+    
+    print("[Lognorm comparison]")
+    
+    # Load C++ lognorm result
+    try:
+        cpp_lognorm = np.genfromtxt(lognorm_csv_path, delimiter=',', dtype=np.float32)
+    except Exception as e:
+        print(f"[Lognorm] ERROR reading CSV: {e}\n")
+        return
+    
+    # Extract first 10 columns from Python lognorm
+    py_lognorm = X_norm[:, :10]
+    
+    if cpp_lognorm.shape != py_lognorm.shape:
+        print(f"[Lognorm] ERROR: Shape mismatch. PyTorch: {py_lognorm.shape}, C++: {cpp_lognorm.shape}\n")
+        return
+    
+    # Compare element-wise
+    abs_diff = np.abs(py_lognorm - cpp_lognorm)
+    max_abs_diff = np.max(abs_diff)
+    mean_abs_diff = np.mean(abs_diff)
+    
+    test_pass = max_abs_diff < 1e-5
+    status = "PASS" if test_pass else "FAIL"
+    
+    print(f"  max_abs_diff={max_abs_diff:.8e}  mean_abs_diff={mean_abs_diff:.8e}  [{status}]")
+    print(f"  Threshold: max_abs_diff < 1e-5\n")
+
+def test_forward_pass(model, X_norm):
+    """
+    Compare pre-training forward pass embedding.
+    
+    Reads validate_embedding_epoch0.csv from C++ side.
+    Compares against Python forward pass (before training).
+    
+    Always exit 0.
+    """
+    embedding_epoch0_path = "/mnt/home/besleya/autoencoder/tests/validate/validate_embedding_epoch0.csv"
+    
+    if not os.path.exists(embedding_epoch0_path):
+        print(f"[Forward] WARNING: C++ embedding CSV not found at {embedding_epoch0_path}")
+        print("[Forward] Skipped.\n")
+        return
+    
+    print("[Forward pass comparison (epoch 0)]")
+    
+    # Python: forward pass on initialized (not yet trained) model
+    X_torch = torch.from_numpy(X_norm.T).to(device)  # (n_samples, n_genes)
+    with torch.no_grad():
+        hidden = model[0](X_torch)  # (n_samples, 128)
+        hidden = model[1](hidden)   # ReLU, still (n_samples, 128)
+        py_embedding = hidden.cpu().numpy().T  # Transpose to (128, n_samples)
+    
+    # Load C++ embedding
+    try:
+        cpp_embedding = np.genfromtxt(embedding_epoch0_path, delimiter=',', dtype=np.float32)
+    except Exception as e:
+        print(f"[Forward] ERROR reading CSV: {e}\n")
+        return
+    
+    if cpp_embedding.shape != py_embedding.shape:
+        print(f"[Forward] ERROR: Shape mismatch. PyTorch: {py_embedding.shape}, C++: {cpp_embedding.shape}\n")
+        return
+    
+    # Compare element-wise
+    abs_diff = np.abs(py_embedding - cpp_embedding)
+    max_abs_diff = np.max(abs_diff)
+    mean_abs_diff = np.mean(abs_diff)
+    
+    test_pass = max_abs_diff < 1e-3
+    status = "PASS" if test_pass else "FAIL"
+    
+    print(f"  max_abs_diff={max_abs_diff:.8e}  mean_abs_diff={mean_abs_diff:.8e}  [{status}]")
+    print(f"  Threshold: max_abs_diff < 1e-3\n")
+
+def compare_results(epoch_mses, embedding, X_norm, model):
     """
     Load C++ outputs and compare.
     
@@ -294,11 +380,17 @@ def main():
     # Build model
     model = build_deterministic_autoencoder(X_norm.shape[0])
     
+    # Test 1: Log-normalization (before training)
+    test_lognorm(X_norm)
+    
+    # Test 2: Forward pass embedding (before training)
+    test_forward_pass(model, X_norm)
+    
     # Train
     epoch_mses, embedding = train_autoencoder(model, X_norm, n_epochs=3)
     
     # Compare with C++ outputs
-    compare_results(epoch_mses, embedding)
+    compare_results(epoch_mses, embedding, X_norm, model)
     
     # Always exit 0
     sys.exit(0)

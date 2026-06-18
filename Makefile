@@ -23,7 +23,7 @@ NVCCFLAGS ?= -O3 -std=c++17 -x cu -dc --gpu-architecture=sm_90 -Xcompiler "-pthr
 OBJS = main.o autoencoder.o data.o
 TARGET = main_ae
 
-.PHONY: all clean test alt_obj version profile
+.PHONY: all clean test alt_obj version profile validate
 
 # Default target: build test only (main_ae is broken pending downstream
 # Dataset refactor to DeviceCSC)
@@ -89,6 +89,18 @@ bench_loader.o: bench_loader.cpp gpu_data_loader.h gpu_timer.h
 bench_loader.dlink.o: bench_loader.o gpu_data_loader.o
 	$(NVCC) -dlink -o bench_loader.dlink.o bench_loader.o gpu_data_loader.o --gpu-architecture=sm_90
 
+# Validation binary: deterministic training check (writes CSVs; run on GPU node)
+validate: tests/validate/validate
+
+tests/validate/validate: tests/validate/validate.o gpu_autoencoder.o gpu_data_loader.o tests/validate/validate.dlink.o layer.o
+	$(CXX) -pthread -fopenmp $(LDFLAGS) tests/validate/validate.o gpu_autoencoder.o gpu_data_loader.o tests/validate/validate.dlink.o layer.o -o $@ -Wl,--allow-multiple-definition $(CUDA_LIBS) -lcublas -lcusparse -lnvToolsExt -lzstd
+
+tests/validate/validate.o: tests/validate/validate.cpp gpu_autoencoder.h gpu_data_loader.h layer.h
+	$(NVCC) -O3 -lineinfo -std=c++17 -x cu -dc --gpu-architecture=sm_90 $(CUDA_INCLUDE) $(SINGLET_INCLUDE) -I. -c tests/validate/validate.cpp -o tests/validate/validate.o
+
+tests/validate/validate.dlink.o: tests/validate/validate.o gpu_autoencoder.o gpu_data_loader.o layer.o
+	$(NVCC) -dlink -o tests/validate/validate.dlink.o tests/validate/validate.o gpu_autoencoder.o gpu_data_loader.o layer.o --gpu-architecture=sm_90
+
 # profile: main_gpu
 # 	# Usage: make profile ARGS="--epochs 2 --batch 1024 --lr 0.0001 --hidden 1024,128 --chunk 10 --seed 42 files..."
 # 	#        Optional: NSYS_OUT=name (default nsys_main_gpu)
@@ -98,4 +110,5 @@ profile: main_gpu
 
 clean:
 	rm -f $(OBJS) $(TARGET) test.o test main_gpu.o gpu_autoencoder.o gpu_data_loader.o main_gpu.dlink.o main_gpu layer.o bench_loader.o bench_loader.dlink.o bench_loader
+	rm -f tests/validate/validate.o tests/validate/validate.dlink.o tests/validate/validate
 

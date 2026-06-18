@@ -232,10 +232,46 @@ int main() {
     }
 
     // -----------------------------------------------------------------------
+    // 7a. Write log-normalized data: first 10 columns
+    //     (for comparing log-normalization between C++ and Python)
+    // -----------------------------------------------------------------------
+    {
+        const int N_LOGNORM_COLS = 10;
+        const std::string lognorm_path = std::string(OUT_DIR) + "validate_lognorm_10cols.csv";
+        std::ofstream lognorm_file(lognorm_path);
+        if (!lognorm_file) {
+            fprintf(stderr, "ERROR: cannot open %s\n", lognorm_path.c_str());
+            return 1;
+        }
+
+        // Densify first N_LOGNORM_COLS columns from CSC sparse format
+        std::vector<float> h_dense_cols((size_t)m * N_LOGNORM_COLS, 0.0f);
+        for (int j = 0; j < N_LOGNORM_COLS; ++j) {
+            int start = h_col_ptr[j];
+            int end   = h_col_ptr[j + 1];
+            for (int k = start; k < end; ++k) {
+                h_dense_cols[(size_t)h_row_idx[k] + (size_t)j * m] = h_values_lognorm[k];
+            }
+        }
+
+        // Write row-by-row: m rows × 10 cols
+        for (int i = 0; i < m; ++i) {
+            for (int j = 0; j < N_LOGNORM_COLS; ++j) {
+                if (j > 0) lognorm_file << ',';
+                lognorm_file << std::setprecision(9) << h_dense_cols[(size_t)i + (size_t)j * m];
+            }
+            lognorm_file << '\n';
+        }
+        lognorm_file.close();
+        fprintf(stderr, "[validate] wrote log-normalized 10 cols to %s\n", lognorm_path.c_str());
+    }
+
+    // -----------------------------------------------------------------------
     // 8. Open output files
     // -----------------------------------------------------------------------
     const std::string loss_path = std::string(OUT_DIR) + "validate_loss.csv";
     const std::string emb_path  = std::string(OUT_DIR) + "validate_embedding.csv";
+    const std::string emb_epoch0_path = std::string(OUT_DIR) + "validate_embedding_epoch0.csv";
 
     std::ofstream loss_file(loss_path);
     if (!loss_file) {
@@ -245,30 +281,61 @@ int main() {
     loss_file << "epoch,mse\n";
 
     // -----------------------------------------------------------------------
+    // 8a. Pre-training forward pass: capture bottleneck embedding (epoch 0)
+    //     This tests the forward pass before any training updates
+    // -----------------------------------------------------------------------
+    {
+        ae.forward(batch, stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        std::vector<float> h_emb_epoch0((size_t)HIDDEN * B);
+        CUDA_CHECK(cudaMemcpy(h_emb_epoch0.data(),
+                              ae.layer(0)->output(),
+                              (size_t)HIDDEN * B * sizeof(float),
+                              cudaMemcpyDeviceToHost));
+
+        std::ofstream emb_epoch0_file(emb_epoch0_path);
+        if (!emb_epoch0_file) {
+            fprintf(stderr, "ERROR: cannot open %s\n", emb_epoch0_path.c_str());
+            return 1;
+        }
+        // h_emb_epoch0 is (HIDDEN × B) column-major: h_emb[i + j*HIDDEN] = element[i, j]
+        // Output row i = embedding dimension i across all B cells
+        for (int i = 0; i < HIDDEN; ++i) {
+            for (int j = 0; j < B; ++j) {
+                if (j > 0) emb_epoch0_file << ',';
+                emb_epoch0_file << std::setprecision(9) << h_emb_epoch0[i + (size_t)j * HIDDEN];
+            }
+            emb_epoch0_file << '\n';
+        }
+        emb_epoch0_file.close();
+        fprintf(stderr, "[validate] wrote pre-training embedding to %s\n", emb_epoch0_path.c_str());
+    }
+
+    // -----------------------------------------------------------------------
     // 9. Training loop — 3 epochs, full batch (all 256 columns), no shuffling
     // -----------------------------------------------------------------------
     std::vector<float> h_recon((size_t)m * B);
 
     for (int epoch = 1; epoch <= N_EPOCHS; ++epoch) {
-        // --- Forward + backward + Adam step ---
-        ae.forward(batch, stream);
-        ae.backward_and_step(batch, LR, stream);
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-
-        // --- Fresh forward pass to obtain post-update reconstruction ---
+        // --- Forward pass ---
         ae.forward(batch, stream);
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
-        // Copy decoder output (m × B, column-major) to host
+        // Copy reconstruction (m × B, column-major) to host for loss computation
         CUDA_CHECK(cudaMemcpy(h_recon.data(),
                               ae.layer(1)->output(),
                               (size_t)m * B * sizeof(float),
                               cudaMemcpyDeviceToHost));
 
-        // Compute MSE = mean over all m*B elements of (recon - target)^2
+        // Compute MSE from the training forward pass BEFORE the update step
         const float mse = compute_mse(
             h_recon.data(), m, B,
             h_col_ptr.data(), h_row_idx.data(), h_values_lognorm.data());
+
+        // --- Backward + Adam step ---
+        ae.backward_and_step(batch, LR, stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
 
         loss_file << epoch << "," << std::setprecision(9) << mse << "\n";
         fprintf(stderr, "[validate] epoch %d  MSE=%.9f\n", epoch, mse);
