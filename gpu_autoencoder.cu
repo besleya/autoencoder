@@ -263,9 +263,9 @@ void GpuAutoencoder::deallocate_buffers_() {
     initialized_buffers_ = false;
 }
 
-void GpuAutoencoder::forward(const SparseBatch& x) {
+void GpuAutoencoder::forward(const SparseBatch& x, cudaStream_t stream) {
     nvtxRangePushA("GpuAutoencoder::forward");
-    GpuScopedTimer timer_total("ae.forward.total", x.stream);
+    GpuScopedTimer timer_total("ae.forward.total", stream);
     
     // Set batch size on first forward
     if (batch_size_ == 0) {
@@ -277,8 +277,8 @@ void GpuAutoencoder::forward(const SparseBatch& x) {
     {
         char layer_name[64];
         snprintf(layer_name, sizeof(layer_name), "ae.forward.layer[0]");
-        GpuScopedTimer timer_layer(layer_name, x.stream);
-        const float* output = layers_[0]->forward(x);
+        GpuScopedTimer timer_layer(layer_name, stream);
+        const float* output = layers_[0]->forward(x, stream);
         (void)output;  // Use output to avoid unused variable warning
     }
     
@@ -287,16 +287,16 @@ void GpuAutoencoder::forward(const SparseBatch& x) {
     for (int i = 1; i < num_l_; ++i) {
         char layer_name[64];
         snprintf(layer_name, sizeof(layer_name), "ae.forward.layer[%d]", i);
-        GpuScopedTimer timer_layer(layer_name, x.stream);
-        output = layers_[i]->forward(output, x.B, x.stream);
+        GpuScopedTimer timer_layer(layer_name, stream);
+        output = layers_[i]->forward(output, x.B, stream);
     }
     
     nvtxRangePop();
 }
 
-void GpuAutoencoder::backward_and_step(const SparseBatch& x, float lr) {
+void GpuAutoencoder::backward_and_step(const SparseBatch& x, float lr, cudaStream_t stream) {
     nvtxRangePushA("GpuAutoencoder::backward_and_step");
-    GpuScopedTimer timer_total("ae.backward.total", x.stream);
+    GpuScopedTimer timer_total("ae.backward.total", stream);
     
     int d0 = dims_[0];
     int dL = dims_[num_l_];
@@ -313,8 +313,8 @@ void GpuAutoencoder::backward_and_step(const SparseBatch& x, float lr) {
 
     // Compute ||a_L||_F^2 into device scalar d_dot_ (DEVICE pointer mode).
     {
-        GpuScopedTimer timer_dot("ae.bwd.loss_dot", x.stream);
-        CUBLAS_CHECK(cublasSetStream(cublas_handle_, x.stream));
+        GpuScopedTimer timer_dot("ae.bwd.loss_dot", stream);
+        CUBLAS_CHECK(cublasSetStream(cublas_handle_, stream));
         CUBLAS_CHECK(cublasSetPointerMode(cublas_handle_, CUBLAS_POINTER_MODE_DEVICE));
         CUBLAS_CHECK(cublasSdot(cublas_handle_, dL * B, a_L, 1, a_L, 1, d_dot_));
         CUBLAS_CHECK(cublasSetPointerMode(cublas_handle_, CUBLAS_POINTER_MODE_HOST));
@@ -324,14 +324,14 @@ void GpuAutoencoder::backward_and_step(const SparseBatch& x, float lr) {
     {
         int size = dL * B;
         {
-            GpuScopedTimer timer_copy("ae.bwd.grad_init_copy", x.stream);
+            GpuScopedTimer timer_copy("ae.bwd.grad_init_copy", stream);
             CUDA_CHECK(cudaMemcpyAsync(d_grad_loss_, a_L, size * sizeof(float),
-                                       cudaMemcpyDeviceToDevice, x.stream));
+                                       cudaMemcpyDeviceToDevice, stream));
         }
         
         // Scale in-place: multiply each element by 1/B
         {
-            GpuScopedTimer timer_scal("ae.bwd.grad_init_scal", x.stream);
+            GpuScopedTimer timer_scal("ae.bwd.grad_init_scal", stream);
             float scale = 1.0f / B;
             CUBLAS_CHECK(cublasSscal(cublas_handle_, size, &scale, d_grad_loss_, 1));
         }
@@ -341,12 +341,12 @@ void GpuAutoencoder::backward_and_step(const SparseBatch& x, float lr) {
     //   d_grad_loss_(r,j) = (a_L(r,j) - v) / B
     //   d_loss_ += v^2 - 2*a_L(r,j)*v
     {
-        CUDA_CHECK(cudaMemsetAsync(d_loss_, 0, sizeof(float), x.stream));
+        CUDA_CHECK(cudaMemsetAsync(d_loss_, 0, sizeof(float), stream));
         
         {
-            GpuScopedTimer timer_kernel("ae.bwd.loss_grad_kernel", x.stream);
+            GpuScopedTimer timer_kernel("ae.bwd.loss_grad_kernel", stream);
             // Launch one block per column
-            kernel_sparse_loss_and_grad<<<B, 256, 0, x.stream>>>(
+            kernel_sparse_loss_and_grad<<<B, 256, 0, stream>>>(
                 d0, B, d_grad_loss_, d_loss_,
                 a_L, x.d_col_ptr, x.d_row_idx, x.d_values);
         }
@@ -354,8 +354,8 @@ void GpuAutoencoder::backward_and_step(const SparseBatch& x, float lr) {
         // Accumulate this batch's loss into the device-side epoch sum.
         // No D2H, no host sync.
         {
-            GpuScopedTimer timer_accum("ae.bwd.loss_accumulate", x.stream);
-            kernel_accumulate_loss<<<1, 1, 0, x.stream>>>(
+            GpuScopedTimer timer_accum("ae.bwd.loss_accumulate", stream);
+            kernel_accumulate_loss<<<1, 1, 0, stream>>>(
                 d_dot_, d_loss_, d_epoch_loss_sum_, d0, B);
         }
     }
@@ -373,23 +373,23 @@ void GpuAutoencoder::backward_and_step(const SparseBatch& x, float lr) {
         {
             char timer_name[64];
             snprintf(timer_name, sizeof(timer_name), "ae.bwd.layer[%d].back", i);
-            GpuScopedTimer timer_back(timer_name, x.stream);
-            grad = layers_[i]->backward(layer_input, grad, compute_grad_input, x.stream);
+            GpuScopedTimer timer_back(timer_name, stream);
+            grad = layers_[i]->backward(layer_input, grad, compute_grad_input, stream);
         }
     }
     
     // Layer 0: sparse backward (no grad_input needed/returned)
     {
-        GpuScopedTimer timer_layer0("ae.bwd.layer[0].back", x.stream);
-        layers_[0]->backward(x, grad);
+        GpuScopedTimer timer_layer0("ae.bwd.layer[0].back", stream);
+        layers_[0]->backward(x, grad, stream);
     }
     
     // Adam update on all layers
     for (size_t i = 0; i < layers_.size(); ++i) {
         char timer_name[64];
         snprintf(timer_name, sizeof(timer_name), "ae.bwd.layer[%zu].update", i);
-        GpuScopedTimer timer_update(timer_name, x.stream);
-        layers_[i]->update(lr, x.stream);
+        GpuScopedTimer timer_update(timer_name, stream);
+        layers_[i]->update(lr, stream);
     }
     
     nvtxRangePop();

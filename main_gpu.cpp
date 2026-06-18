@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: MIT
-// GPU driver: parse CLI, load dataset via GpuDataLoader, train a GpuAutoencoder.
+// GPU driver: parse CLI, load dataset via DataLoader, train a GpuAutoencoder.
 
 #include "gpu_autoencoder.h"
 #include "gpu_data_loader.h"
 #include "gpu_timer.h"
-#include "data.h"
 
 #include <algorithm>
 #include <chrono>
@@ -19,7 +18,21 @@
 #include <string>
 #include <vector>
 
+#include <cuda_runtime.h>
 #include <nvtx3/nvToolsExt.h>
+
+// ============================================================================
+// CUDA error checking
+// ============================================================================
+
+#define CUDA_CHECK(call) do { \
+    cudaError_t err = (call); \
+    if (err != cudaSuccess) { \
+        std::cerr << "CUDA error at " << __FILE__ << ":" << __LINE__ << ": " \
+                  << cudaGetErrorString(err) << std::endl; \
+        exit(EXIT_FAILURE); \
+    } \
+} while (0)
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -111,24 +124,31 @@ int main(int argc, char** argv) {
         Options opt = parse_args(argc, argv);
         std::cout << "Argument parsing: " << ms_since(t_start) << " ms" << std::endl;
 
-        // Peek the feature count by loading the first file directly.
-        // This is done before constructing the RNG to avoid consuming RNG state
-        // out of order.
-        nvtxRangePushA("main:load_validate");
-        auto t_validate = std::chrono::steady_clock::now();
-        std::cout << "Peeking feature count from " << opt.files[0] << "..." << std::endl;
-        PZHeader hdr = validate_1pz(opt.files[0]);
-        std::cout << "validate_1pz: " << ms_since(t_validate) << " ms" << std::endl;
-        nvtxRangePop();
+        // Build full layer list: [m] + hidden + reverse(hidden[:-1]) + [m]
+        // We'll get m from the loader after construction.
+        std::vector<int> layer_dims;
+        // Placeholder: will be filled after loader is constructed
         
-        const int m = static_cast<int>(hdr.m);
+        // Construct RNG and initialize the autoencoder BEFORE the first epoch.
+        // This ensures RNG is consumed in the same order as the CPU main.cpp.
+        nvtxRangePushA("main:init");
+        auto t_init = std::chrono::steady_clock::now();
+        std::mt19937 rng(opt.seed);
+        
+        // Create the data loader. RNG is passed by reference; from now on,
+        // begin_epoch() and next_batch() will consume RNG state.
+        auto t_loader = std::chrono::steady_clock::now();
+        std::cout << "Constructing GPU data loader..." << std::endl;
+        DataLoader loader(opt.files, opt.chunk_size, opt.batch_size, rng);
+        std::cout << "Data loader construction: " << ms_since(t_loader) << " ms" << std::endl;
+        
+        // Peek the feature count from the loader
+        const int m = loader.m();
         if (m <= 0) {
-            throw std::runtime_error("first file has no features");
+            throw std::runtime_error("loader reports m <= 0");
         }
-        // first_file goes out of scope; its device memory is freed.
 
         // Build full layer list: [m] + hidden + reverse(hidden[:-1]) + [m]
-        std::vector<int> layer_dims;
         layer_dims.push_back(m);
         for (int h : opt.hidden) layer_dims.push_back(h);
         for (int i = static_cast<int>(opt.hidden.size()) - 2; i >= 0; --i) {
@@ -136,22 +156,10 @@ int main(int argc, char** argv) {
         }
         layer_dims.push_back(m);
 
-        // Construct RNG and initialize the autoencoder BEFORE the first epoch.
-        // This ensures RNG is consumed in the same order as the CPU main.cpp.
-        nvtxRangePushA("main:init");
-        auto t_init = std::chrono::steady_clock::now();
-        std::mt19937 rng(opt.seed);
         GpuAutoencoder net;
         net.init(layer_dims, rng);
         std::cout << "Model initialization: " << ms_since(t_init) << " ms" << std::endl;
         nvtxRangePop();
-
-        // Create the data loader. RNG is passed by reference; from now on,
-        // begin_epoch() and next_batch() will consume RNG state.
-        auto t_loader = std::chrono::steady_clock::now();
-        std::cout << "Constructing GPU data loader..." << std::endl;
-        GpuDataLoader loader(opt.files, opt.chunk_size, opt.batch_size, rng);
-        std::cout << "Data loader construction: " << ms_since(t_loader) << " ms" << std::endl;
 
         std::cout << "\n=== Training summary ===\n"
                   << "  files           : " << opt.files.size() << '\n'
@@ -168,6 +176,10 @@ int main(int argc, char** argv) {
                   << "  seed            : " << opt.seed << '\n' << std::endl;
 
         std::vector<float> losses(opt.epochs, 0.0f);
+        
+        // Create trainer stream for computation
+        cudaStream_t trainer_stream;
+        CUDA_CHECK(cudaStreamCreateWithFlags(&trainer_stream, cudaStreamNonBlocking));
         
         nvtxRangePushA("main:train_loop");
         auto t_train_total = std::chrono::steady_clock::now();
@@ -198,15 +210,18 @@ int main(int argc, char** argv) {
                 
                 if (!has_batch) break;
 
+                // GPU fence: wait for loader's H2D + lognorm to complete
+                CUDA_CHECK(cudaStreamWaitEvent(trainer_stream, batch.ready_event, 0));
+
                 nvtxRangePushA("forward");
                 auto t_fwd = std::chrono::steady_clock::now();
-                net.forward(batch);
+                net.forward(batch, trainer_stream);
                 time_forward += ms_since(t_fwd);
                 nvtxRangePop();
 
                 nvtxRangePushA("backward_and_step");
                 auto t_bwd = std::chrono::steady_clock::now();
-                net.backward_and_step(batch, opt.lr);
+                net.backward_and_step(batch, opt.lr, trainer_stream);
                 time_backward += ms_since(t_bwd);
                 nvtxRangePop();
                 
@@ -238,6 +253,9 @@ int main(int argc, char** argv) {
         double train_total_ms = ms_since(t_train_total);
         std::cout << "Total training loop: " << train_total_ms << " ms" << std::endl;
         nvtxRangePop();
+        
+        // Clean up trainer stream
+        CUDA_CHECK(cudaStreamDestroy(trainer_stream));
         
         // Print grand total timings across all epochs
         gpu_timers().report(std::cout, "All Epochs Grand Total", true);

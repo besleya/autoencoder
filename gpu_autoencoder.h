@@ -61,14 +61,15 @@ public:
     // Forward pass. Stores the last batch size internally. Layer 0 input is the
     // sparse mini-batch; deeper layers receive the previous layer's output.
     // On return, the reconstruction is available via the last layer's output().
-    void forward(const SparseBatch& x);
+    // Launches kernels and H2D ops on the provided stream.
+    void forward(const SparseBatch& x, cudaStream_t stream);
 
     // Backprop MSE loss against target `x` (sparse), run one Adam step.
     // Per-batch loss is accumulated into a device-side epoch sum and read via
     // read_epoch_loss(). Mirrors the original autoencoder's semantics including
     // the intentional asymmetry between loss (divided by d0*B) and loss gradient
-    // (divided by B only).
-    void backward_and_step(const SparseBatch& x, float lr);
+    // (divided by B only). Launches kernels and ops on the provided stream.
+    void backward_and_step(const SparseBatch& x, float lr, cudaStream_t stream);
 
     // Reset the device-side epoch loss accumulator to 0. Call once at the
     // start of each epoch, BEFORE the batch loop. Synchronous on the default

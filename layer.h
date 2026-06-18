@@ -55,12 +55,14 @@ public:
 
     // Forward with sparse input. Returns device pointer to output activations
     // (out_dim × batch_size, column-major). Batch size is inferred from x.B.
-    const float* forward(const SparseBatch& x);
+    // Launches kernels and ops on the provided stream.
+    const float* forward(const SparseBatch& x, cudaStream_t stream = 0);
 
     // Backward with sparse input. d_grad_output is device ptr to d L / d y
     // (out_dim × batch_size, column-major). Sparse layers cannot produce
     // gradient w.r.t. the input data, so no grad_input is returned.
-    void backward(const SparseBatch& x, const float* d_grad_output);
+    // Launches kernels and ops on the provided stream.
+    void backward(const SparseBatch& x, const float* d_grad_output, cudaStream_t stream = 0);
 
     // --- Dense-input overloads (require sparse_input() == false) ---
 
@@ -80,6 +82,19 @@ public:
     // Adam optimization step. Uses gradients accumulated by the last backward() call.
     // Updates weights and biases in-place, increments timestep counter.
     void update(float lr, cudaStream_t stream = 0);
+
+    // --- Weight / bias initialization from host (for deterministic tests) ---
+
+    // Copy row-major host weight matrix (size = out_dim * in_dim) to device d_W_.
+    // Resets Adam moment buffers and timestep to 0.
+    void set_weights_from_host(const float* host_W);  // size = out_dim * in_dim, row-major
+
+    // Copy host bias vector (size = out_dim) to device d_b_.
+    // Resets Adam moment buffers and timestep to 0.
+    void set_biases_from_host(const float* host_b);   // size = out_dim
+
+    // Reset Adam optimizer state (moment buffers m/v, timestep t) to zero.
+    void reset_optimizer_state();
 
     // --- Accessors ---
 
@@ -127,9 +142,9 @@ private:
 
     // Private helpers
     void _ensure_batch_buffers(int batch_size, bool need_grad_input);
-    void _sp_forward(const SparseBatch& x);
+    void _sp_forward(const SparseBatch& x, cudaStream_t stream);
     void _dn_forward(const float* d_in, int batch_size, cudaStream_t stream);
-    void _sp_backward(const SparseBatch& x, const float* d_grad_output);
+    void _sp_backward(const SparseBatch& x, const float* d_grad_output, cudaStream_t stream);
     void _dn_backward(const float* d_in, const float* d_grad_output,
                       bool compute_grad_input, cudaStream_t stream);
     void _apply_activation_forward(int batch_size, cudaStream_t stream);
