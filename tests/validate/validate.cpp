@@ -53,56 +53,13 @@ static constexpr float LOGNORM_SCALER  = 10000.0f;
 } while (0)
 
 // ============================================================================
-// MSE helper — computed on the host using the sparse log-normalized target.
-//
-// MSE = mean_over_all_elements( (recon[i,j] - target[i,j])^2 )
-//     = ( ||recon||_F^2  +  sum_{nz} (v^2 - 2*recon[r,j]*v) ) / (m*B)
-//
-// recon:    host pointer, (m × B) column-major
-// col_ptr:  host int32_t[B+1]  (0-based, CSC of the log-normalised input)
-// row_idx:  host int32_t[nnz]
-// values:   host float[nnz]   (log-normalised values)
-// ============================================================================
-
-static float compute_mse(const float*   recon,
-                          int            m,
-                          int            B,
-                          const int32_t* col_ptr,
-                          const int32_t* row_idx,
-                          const float*   values)
-{
-    double acc = 0.0;
-
-    // Dense part: sum recon[i,j]^2 for every element
-    for (int j = 0; j < B; ++j) {
-        const float* col = recon + (size_t)j * m;
-        for (int i = 0; i < m; ++i) {
-            double v = col[i];
-            acc += v * v;
-        }
-    }
-
-    // Sparse correction: for each nonzero (r, j, tgt):
-    //   add  tgt^2 - 2 * recon[r,j] * tgt
-    for (int j = 0; j < B; ++j) {
-        const float* col = recon + (size_t)j * m;
-        int start = col_ptr[j];
-        int end   = col_ptr[j + 1];
-        for (int k = start; k < end; ++k) {
-            double tgt = values[k];
-            double rec = col[row_idx[k]];
-            acc += tgt * tgt - 2.0 * rec * tgt;
-        }
-    }
-
-    return (float)(acc / ((double)m * B));
-}
-
-// ============================================================================
 // main
 // ============================================================================
 
 int main() {
+    // Set GPU device before any CUDA calls
+    CUDA_CHECK(cudaSetDevice(0));
+
     // -----------------------------------------------------------------------
     // 1. Read .1pz file via singlet::pz::read_1pz
     // -----------------------------------------------------------------------
@@ -315,27 +272,20 @@ int main() {
     // -----------------------------------------------------------------------
     // 9. Training loop — 3 epochs, full batch (all 256 columns), no shuffling
     // -----------------------------------------------------------------------
-    std::vector<float> h_recon((size_t)m * B);
-
     for (int epoch = 1; epoch <= N_EPOCHS; ++epoch) {
+        // --- Reset epoch loss accumulator ---
+        ae.reset_epoch_loss();
+
         // --- Forward pass ---
         ae.forward(batch, stream);
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
-        // Copy reconstruction (m × B, column-major) to host for loss computation
-        CUDA_CHECK(cudaMemcpy(h_recon.data(),
-                              ae.layer(1)->output(),
-                              (size_t)m * B * sizeof(float),
-                              cudaMemcpyDeviceToHost));
-
-        // Compute MSE from the training forward pass BEFORE the update step
-        const float mse = compute_mse(
-            h_recon.data(), m, B,
-            h_col_ptr.data(), h_row_idx.data(), h_values_lognorm.data());
-
         // --- Backward + Adam step ---
         ae.backward_and_step(batch, LR, stream);
         CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        // --- Read epoch loss ---
+        const float mse = ae.read_epoch_loss(1);  // num_batches=1
 
         loss_file << epoch << "," << std::setprecision(9) << mse << "\n";
         fprintf(stderr, "[validate] epoch %d  MSE=%.9f\n", epoch, mse);

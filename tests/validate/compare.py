@@ -66,7 +66,7 @@ def load_input_data(filepath, n_cols=256):
     for j, (row_idx, values) in enumerate(col_slice):
         X[row_idx, j] = values.astype(np.float32)
     
-    print(f"[Data] Extracted first {n_cols} columns; dense shape: {X.shape}")
+    print(f"[Data] Extracted first {n_cols} columns; dense shape: {X.shape}", flush=True)
     return X
 
 def log_normalize_columns(X):
@@ -94,7 +94,7 @@ def log_normalize_columns(X):
             X_norm[:, j] = np.log1p(X[:, j] * (10000.0 / col_sum))
         # Else: column unchanged (all zeros or sum is 0)
     
-    print(f"[Normalize] Applied log-normalization; output shape: {X_norm.shape}, dtype: {X_norm.dtype}")
+    print(f"[Normalize] Applied log-normalization; output shape: {X_norm.shape}, dtype: {X_norm.dtype}", flush=True)
     return X_norm
 
 def build_deterministic_autoencoder(input_dim):
@@ -128,7 +128,7 @@ def build_deterministic_autoencoder(input_dim):
             layer2.weight.data[i, j] = val
     layer2.bias.data.zero_()
     
-    print(f"[Model] Built deterministic autoencoder: {input_dim} -> 128 -> {input_dim}")
+    print(f"[Model] Built deterministic autoencoder: {input_dim} -> 128 -> {input_dim}", flush=True)
     return model.to(device).train()
 
 def train_autoencoder(model, X_norm, n_epochs=3):
@@ -169,7 +169,7 @@ def train_autoencoder(model, X_norm, n_epochs=3):
         hidden = model[1](hidden)   # ReLU, still (n_samples, 128)
         embedding = hidden.cpu().numpy().T  # Transpose to (128, n_samples)
     
-    print(f"[Train] Captured embedding shape: {embedding.shape}")
+    print(f"[Train] Captured embedding shape: {embedding.shape}", flush=True)
     return epoch_mses, embedding
 
 def test_lognorm(X_norm):
@@ -213,7 +213,7 @@ def test_lognorm(X_norm):
     status = "PASS" if test_pass else "FAIL"
     
     print(f"  max_abs_diff={max_abs_diff:.8e}  mean_abs_diff={mean_abs_diff:.8e}  [{status}]")
-    print(f"  Threshold: max_abs_diff < 1e-5\n")
+    print(f"  Threshold: max_abs_diff < 1e-5\n", flush=True)
 
 def test_forward_pass(model, X_norm):
     """
@@ -260,7 +260,7 @@ def test_forward_pass(model, X_norm):
     status = "PASS" if test_pass else "FAIL"
     
     print(f"  max_abs_diff={max_abs_diff:.8e}  mean_abs_diff={mean_abs_diff:.8e}  [{status}]")
-    print(f"  Threshold: max_abs_diff < 1e-3\n")
+    print(f"  Threshold: max_abs_diff < 1e-3\n", flush=True)
 
 def compare_results(epoch_mses, embedding, X_norm, model):
     """
@@ -362,7 +362,7 @@ def compare_results(epoch_mses, embedding, X_norm, model):
     overall = mse_pass and embed_pass
     print(f"  MSE comparison: {'PASS' if mse_pass else 'FAIL'} (threshold: rel_diff < 1e-4)")
     print(f"  Embedding comparison: {'PASS' if embed_pass else 'FAIL'} (threshold: max_abs_diff < 1e-3)")
-    print(f"  Overall: {'PASS' if overall else 'FAIL'}\n")
+    print(f"  Overall: {'PASS' if overall else 'FAIL'}\n", flush=True)
 
 def main():
     input_file = "/mnt/home/besleya/quant/GSE260931/GSM8128195/counts.1pz"
