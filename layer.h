@@ -108,6 +108,12 @@ public:
     const float* bias() const noexcept;        // d_b_, length out
     int timestep() const noexcept;             // Adam t
 
+    // Read-only device pointer accessors (for validation/debugging)
+    const float* d_W() const noexcept { return d_W_; }    // weights
+    const float* d_dW() const noexcept { return d_dW_; }  // weight gradients (after backward)
+    const float* d_b() const noexcept { return d_b_; }    // biases
+    const float* d_db() const noexcept { return d_db_; }  // bias gradients (after backward)
+
 private:
     // Configuration
     int in_dim_;

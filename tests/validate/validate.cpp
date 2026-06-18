@@ -60,6 +60,13 @@ int main() {
     // Set GPU device before any CUDA calls
     CUDA_CHECK(cudaSetDevice(0));
 
+    // Verify GPU device is available
+    int device_count = 0;
+    CUDA_CHECK(cudaGetDeviceCount(&device_count));
+    cudaDeviceProp prop;
+    CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
+    fprintf(stderr, "[validate] GPU: %s (device_count=%d)\n", prop.name, device_count);
+
     // -----------------------------------------------------------------------
     // 1. Read .1pz file via singlet::pz::read_1pz
     // -----------------------------------------------------------------------
@@ -289,6 +296,61 @@ int main() {
 
         loss_file << epoch << "," << std::setprecision(9) << mse << "\n";
         fprintf(stderr, "[validate] epoch %d  MSE=%.9f\n", epoch, mse);
+
+        // -----------------------------------------------------------------------
+        // Export weights and gradients for each layer (right after backward_and_step)
+        // -----------------------------------------------------------------------
+        for (int layer_idx = 0; layer_idx < 2; ++layer_idx) {
+            auto layer = ae.layer(layer_idx);
+            const int out_dim = layer->out_dim();
+            const int in_dim = layer->in_dim();
+
+            // --- Export weights ---
+            std::vector<float> h_W((size_t)out_dim * in_dim);
+            CUDA_CHECK(cudaMemcpy(h_W.data(), layer->d_W(),
+                                  (size_t)out_dim * in_dim * sizeof(float),
+                                  cudaMemcpyDeviceToHost));
+
+            std::string weight_csv = std::string(OUT_DIR) + "validate_weights_layer"
+                                   + std::to_string(layer_idx) + "_epoch" + std::to_string(epoch) + ".csv";
+            std::ofstream w_file(weight_csv);
+            if (!w_file) {
+                fprintf(stderr, "ERROR: cannot open %s\n", weight_csv.c_str());
+                return 1;
+            }
+            // Write row-major: out_dim rows × in_dim cols
+            for (int i = 0; i < out_dim; ++i) {
+                for (int j = 0; j < in_dim; ++j) {
+                    if (j > 0) w_file << ',';
+                    w_file << std::setprecision(9) << h_W[(size_t)i * in_dim + j];
+                }
+                w_file << '\n';
+            }
+            w_file.close();
+
+            // --- Export weight gradients ---
+            std::vector<float> h_dW((size_t)out_dim * in_dim);
+            CUDA_CHECK(cudaMemcpy(h_dW.data(), layer->d_dW(),
+                                  (size_t)out_dim * in_dim * sizeof(float),
+                                  cudaMemcpyDeviceToHost));
+
+            std::string grad_csv = std::string(OUT_DIR) + "validate_grads_layer"
+                                 + std::to_string(layer_idx) + "_epoch" + std::to_string(epoch) + ".csv";
+            std::ofstream g_file(grad_csv);
+            if (!g_file) {
+                fprintf(stderr, "ERROR: cannot open %s\n", grad_csv.c_str());
+                return 1;
+            }
+            // Write row-major: out_dim rows × in_dim cols
+            for (int i = 0; i < out_dim; ++i) {
+                for (int j = 0; j < in_dim; ++j) {
+                    if (j > 0) g_file << ',';
+                    g_file << std::setprecision(9) << h_dW[(size_t)i * in_dim + j];
+                }
+                g_file << '\n';
+            }
+            g_file.close();
+        }
     }
     loss_file.close();
 
@@ -327,6 +389,7 @@ int main() {
     CUDA_CHECK(cudaFree(d_row_idx));
     CUDA_CHECK(cudaFree(d_values));
     CUDA_CHECK(cudaStreamDestroy(stream));
+    CUDA_CHECK(cudaDeviceSynchronize());
 
     fprintf(stderr, "[validate] done. Output written to %s\n", OUT_DIR);
     return 0;

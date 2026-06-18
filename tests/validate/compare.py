@@ -138,7 +138,7 @@ def train_autoencoder(model, X_norm, n_epochs=3):
     Input X_norm: shape (n_genes, n_samples), float32
     PyTorch expects (batch_size, features), so transpose to (n_samples, n_genes).
     
-    Returns: list of epoch MSEs, embedding after final epoch (shape 128 x 256)
+    Returns: list of (epoch_mse, weights_list, grads_list) tuples
     """
     X_torch = torch.from_numpy(X_norm.T).to(device)  # (n_samples, n_genes)
     print(f"[Train] Input to model: {X_torch.shape}, dtype: {X_torch.dtype}")
@@ -146,7 +146,7 @@ def train_autoencoder(model, X_norm, n_epochs=3):
     criterion = nn.MSELoss(reduction='mean')
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     
-    epoch_mses = []
+    epoch_results = []
     
     for epoch in range(n_epochs):
         # Forward pass
@@ -156,11 +156,20 @@ def train_autoencoder(model, X_norm, n_epochs=3):
         # Backward pass
         optimizer.zero_grad()
         loss.backward()
+        
+        # Capture gradients BEFORE optimizer.step()
+        grads = [model[0].weight.grad.clone(), model[2].weight.grad.clone()]
+        
+        # Optimizer step
         optimizer.step()
         
-        # Record the loss from the training forward pass (NOT a re-computed loss after step)
-        epoch_mses.append(loss.item())
-        print(f"[Train] Epoch {epoch + 1}/{n_epochs}: MSE = {loss.item():.8f}")
+        # Capture weights AFTER optimizer.step()
+        weights = [model[0].weight.data.clone(), model[2].weight.data.clone()]
+        
+        # Record the loss from the training forward pass
+        mse = loss.item()
+        epoch_results.append((mse, weights, grads))
+        print(f"[Train] Epoch {epoch + 1}/{n_epochs}: MSE = {mse:.8f}")
     
     # Capture ReLU embedding after training
     with torch.no_grad():
@@ -170,7 +179,7 @@ def train_autoencoder(model, X_norm, n_epochs=3):
         embedding = hidden.cpu().numpy().T  # Transpose to (128, n_samples)
     
     print(f"[Train] Captured embedding shape: {embedding.shape}", flush=True)
-    return epoch_mses, embedding
+    return epoch_results, embedding
 
 def test_lognorm(X_norm):
     """
@@ -262,18 +271,132 @@ def test_forward_pass(model, X_norm):
     print(f"  max_abs_diff={max_abs_diff:.8e}  mean_abs_diff={mean_abs_diff:.8e}  [{status}]")
     print(f"  Threshold: max_abs_diff < 1e-3\n", flush=True)
 
-def compare_results(epoch_mses, embedding, X_norm, model):
+def test_weights(epoch, py_weights):
+    """
+    Compare weight matrices for a given epoch.
+    
+    Args:
+        epoch: epoch number (1-indexed)
+        py_weights: list of 2 PyTorch weight tensors [layer0, layer2]
+                   shape (out_dim, in_dim) each
+    
+    Reads C++ weight CSVs and compares.
+    Always returns True/False for pass/fail.
+    """
+    base_path = "/mnt/home/besleya/autoencoder/tests/validate"
+    
+    print(f"[Weights Epoch {epoch}]")
+    all_pass = True
+    
+    for layer_idx in range(2):
+        csv_path = f"{base_path}/validate_weights_layer{layer_idx}_epoch{epoch}.csv"
+        
+        if not os.path.exists(csv_path):
+            print(f"  Layer {layer_idx}: WARNING: CSV not found at {csv_path}")
+            continue
+        
+        try:
+            cpp_weights = np.genfromtxt(csv_path, delimiter=',', dtype=np.float32)
+            py_w = py_weights[layer_idx].cpu().numpy()
+            
+            if cpp_weights.shape != py_w.shape:
+                print(f"  Layer {layer_idx}: ERROR: Shape mismatch. PyTorch: {py_w.shape}, C++: {cpp_weights.shape}")
+                all_pass = False
+                continue
+            
+            abs_diff = np.abs(py_w - cpp_weights)
+            max_abs_diff = np.max(abs_diff)
+            mean_abs_diff = np.mean(abs_diff)
+            
+            test_pass = max_abs_diff < 1e-3
+            status = "PASS" if test_pass else "FAIL"
+            
+            print(f"  Layer {layer_idx}: max_abs_diff={max_abs_diff:.8e}  mean_abs_diff={mean_abs_diff:.8e}  [{status}]  (threshold 1e-3)")
+            
+            if not test_pass:
+                all_pass = False
+        
+        except Exception as e:
+            print(f"  Layer {layer_idx}: ERROR reading CSV: {e}")
+            all_pass = False
+    
+    print()
+    return all_pass
+
+def test_gradients(epoch, py_grads):
+    """
+    Compare weight gradients for a given epoch.
+    
+    Args:
+        epoch: epoch number (1-indexed)
+        py_grads: list of 2 PyTorch gradient tensors [layer0, layer2]
+                 shape (out_dim, in_dim) each
+    
+    Reads C++ gradient CSVs and compares.
+    Always returns True/False for pass/fail.
+    """
+    base_path = "/mnt/home/besleya/autoencoder/tests/validate"
+    
+    print(f"[Gradients Epoch {epoch}]")
+    all_pass = True
+    
+    for layer_idx in range(2):
+        csv_path = f"{base_path}/validate_grads_layer{layer_idx}_epoch{epoch}.csv"
+        
+        if not os.path.exists(csv_path):
+            print(f"  Layer {layer_idx}: WARNING: CSV not found at {csv_path}")
+            continue
+        
+        try:
+            cpp_grads = np.genfromtxt(csv_path, delimiter=',', dtype=np.float32)
+            py_g = py_grads[layer_idx].cpu().numpy()
+            
+            if cpp_grads.shape != py_g.shape:
+                print(f"  Layer {layer_idx}: ERROR: Shape mismatch. PyTorch: {py_g.shape}, C++: {cpp_grads.shape}")
+                all_pass = False
+                continue
+            
+            abs_diff = np.abs(py_g - cpp_grads)
+            max_abs_diff = np.max(abs_diff)
+            mean_abs_diff = np.mean(abs_diff)
+            
+            test_pass = max_abs_diff < 1e-4
+            status = "PASS" if test_pass else "FAIL"
+            
+            print(f"  Layer {layer_idx}: max_abs_diff={max_abs_diff:.8e}  mean_abs_diff={mean_abs_diff:.8e}  [{status}]  (threshold 1e-4)")
+            
+            if not test_pass:
+                all_pass = False
+        
+        except Exception as e:
+            print(f"  Layer {layer_idx}: ERROR reading CSV: {e}")
+            all_pass = False
+    
+    print()
+    return all_pass
+
+
+def compare_results(epoch_results, embedding, X_norm, model):
     """
     Load C++ outputs and compare.
     
     C++ outputs:
       - validate_loss.csv: epoch,mse (3 rows, 1 data row per epoch)
       - validate_embedding.csv: 128 rows x 256 cols, no header
+      - validate_weights_layerN_epochE.csv: weight matrices
+      - validate_grads_layerN_epochE.csv: gradient matrices
     
     Always exit 0.
     """
     loss_csv_path = "/mnt/home/besleya/autoencoder/tests/validate/validate_loss.csv"
     embedding_csv_path = "/mnt/home/besleya/autoencoder/tests/validate/validate_embedding.csv"
+    
+    # Extract MSEs and verify weights/grads for each epoch
+    epoch_mses = []
+    for epoch_num, (mse, weights, grads) in enumerate(epoch_results, start=1):
+        epoch_mses.append(mse)
+        test_weights(epoch_num, weights)
+        test_gradients(epoch_num, grads)
     
     print("\n[PyTorch Results]")
     for i, mse in enumerate(epoch_mses):
@@ -387,10 +510,10 @@ def main():
     test_forward_pass(model, X_norm)
     
     # Train
-    epoch_mses, embedding = train_autoencoder(model, X_norm, n_epochs=3)
+    epoch_results, embedding = train_autoencoder(model, X_norm, n_epochs=3)
     
     # Compare with C++ outputs
-    compare_results(epoch_mses, embedding, X_norm, model)
+    compare_results(epoch_results, embedding, X_norm, model)
     
     # Always exit 0
     sys.exit(0)
