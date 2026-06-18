@@ -186,16 +186,19 @@ struct RingSlot {
 struct DataLoader::Impl {
     // Configuration
     std::vector<std::string> file_paths;
-    int chunk_size;
-    int batch_size;
+    int chunk_size = 0;
+    int batch_size = 0;
     std::mt19937& rng;
-    ConcatPolicy policy;
-    int ring_depth;
-    int n_concurrent_loaders;
-    int omp_threads;
+    ConcatPolicy policy = ConcatPolicy::CONCAT_HOST;
+    int ring_depth = 4;
+    int n_concurrent_loaders = 1;
+    int omp_threads = 1;
+
+    // Explicit constructor to initialize the reference member
+    explicit Impl(std::mt19937& r) : rng(r) {}
 
     // Dataset metadata
-    int m;  // number of features (peeked from first file)
+    int m = 0;  // number of features (peeked from first file)
 
     // CUDA stream (non-blocking, default priority)
     cudaStream_t loader_stream = nullptr;
@@ -204,8 +207,8 @@ struct DataLoader::Impl {
     std::vector<RingSlot> ring;
     std::mutex ring_mtx;
     std::condition_variable ring_cv;
-    int free_count;      // number of FREE slots
-    int ready_count;     // number of READY slots
+    int free_count = 0;      // number of FREE slots
+    int ready_count = 0;     // number of READY slots
     std::deque<int> consumed_slots;  // recently consumed slot indices (for delayed recycling)
 
     // Chunk queue (depth 1)
@@ -220,7 +223,7 @@ struct DataLoader::Impl {
     // Epoch state
     std::vector<std::string> epoch_order;
     size_t chunk_cursor = 0;  // which chunk we're loading next
-    uint64_t chunk_sub_seed;
+    uint64_t chunk_sub_seed = 0;
     bool epoch_started = false;
     bool last_chunk_flag = false;
     bool epoch_eof = false;  // set by T_BB after last batch of last chunk
@@ -613,13 +616,7 @@ static void batch_builder_thread(DataLoader::Impl* impl) {
                     }
                 }
 
-                // Signal T_CL if this is the last batch of the chunk
                 col_idx += B;
-                if (col_idx >= chunk->n_cols) {
-                    std::lock_guard<std::mutex> lock(impl->chunk_consumed_mtx);
-                    impl->chunk_consumed = true;
-                    impl->chunk_consumed_cv.notify_all();
-                }
 
                 // Issue H2D transfers
                 CUDA_CHECK(cudaMemcpyAsync(slot.d_col_ptr.get(), slot.h_col_ptr,
@@ -632,9 +629,10 @@ static void batch_builder_thread(DataLoader::Impl* impl) {
                                           batch_nnz * sizeof(float),
                                           cudaMemcpyHostToDevice, impl->loader_stream));
 
-                // Launch lognorm kernel
-                log_normalize_columns_kernel<<<B, 256, 0, impl->loader_stream>>>(
-                    B, kSparseLogNormScaler, slot.d_col_ptr.get(), slot.d_values.get());
+                // Launch lognorm kernel (via standalone helper so validate.cpp uses same path)
+                log_normalize_csc_columns(B, kSparseLogNormScaler,
+                                          slot.d_col_ptr.get(), slot.d_values.get(),
+                                          impl->loader_stream);
 
                 // Record event
                 CUDA_CHECK(cudaEventRecord(slot.ready_event, impl->loader_stream));
@@ -649,6 +647,13 @@ static void batch_builder_thread(DataLoader::Impl* impl) {
                     ++impl->ready_count;
                     impl->ring_cv.notify_all();
                 }
+            }
+
+            // Signal T_CL that this chunk is consumed even if no full batch was built.
+            {
+                std::lock_guard<std::mutex> lock(impl->chunk_consumed_mtx);
+                impl->chunk_consumed = true;
+                impl->chunk_consumed_cv.notify_all();
             }
 
             // Signal EOF if this was the last chunk
@@ -674,11 +679,10 @@ DataLoader::DataLoader(const std::vector<std::string>& paths,
                        ConcatPolicy policy,
                        int ring_depth,
                        int n_concurrent_loaders)
-    : impl_(std::make_unique<Impl>()) {
+    : impl_(std::make_unique<Impl>(rng)) {
     impl_->file_paths = paths;
     impl_->chunk_size = chunk_size;
     impl_->batch_size = batch_size;
-    impl_->rng = rng;
     impl_->policy = policy;
     impl_->ring_depth = ring_depth;
     impl_->n_concurrent_loaders = n_concurrent_loaders;
@@ -831,4 +835,18 @@ int DataLoader::m() const {
 
 cudaStream_t DataLoader::loader_stream() const {
     return impl_->loader_stream;
+}
+
+// ---------------------------------------------------------------------------
+// Standalone log-normalization helper (declared in gpu_data_loader.h).
+// Wraps the same kernel launched inside batch_builder_thread.
+// ---------------------------------------------------------------------------
+void log_normalize_csc_columns(int n_cols,
+                                float scaler,
+                                const int32_t* d_col_ptr,
+                                float* d_values,
+                                cudaStream_t stream) {
+    if (n_cols <= 0) return;
+    log_normalize_columns_kernel<<<n_cols, 256, 0, stream>>>(
+        n_cols, scaler, d_col_ptr, d_values);
 }
