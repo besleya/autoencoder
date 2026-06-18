@@ -1,0 +1,69 @@
+===============================================
+Step 1: Generating reference test data
+===============================================
+Generated reference data for size=8192
+Files: p_init.bin, m_init.bin, v_init.bin, g.bin, expected_p.bin, expected_m.bin, expected_v.bin, meta.txt
+
+===============================================
+Step 2: Building test and benchmark binaries
+===============================================
+rm -f *.o test_accuracy bench
+/usr/local/cuda/bin/nvcc -O3 -std=c++17 --gpu-architecture=sm_90 --extended-lambda -I/usr/local/cuda/include -c test_accuracy.cu -o test_accuracy.o
+/usr/local/cuda/bin/nvcc -O3 -std=c++17 --gpu-architecture=sm_90 --extended-lambda -I/usr/local/cuda/include -c original.cu -o original.o
+/usr/local/cuda/bin/nvcc -O3 -std=c++17 --gpu-architecture=sm_90 --extended-lambda -I/usr/local/cuda/include -c replacement.cu -o replacement.o
+/usr/local/cuda/bin/nvcc -O3 -std=c++17 --gpu-architecture=sm_90 --extended-lambda -I/usr/local/cuda/include test_accuracy.o original.o replacement.o -L/usr/local/cuda/lib64 -lcudart -lcublas -lcusparse -lnvToolsExt -lpthread -o test_accuracy
+/usr/local/cuda/bin/nvcc -O3 -std=c++17 --gpu-architecture=sm_90 --extended-lambda -I/usr/local/cuda/include -c bench.cu -o bench.o
+/usr/local/cuda/bin/nvcc -O3 -std=c++17 --gpu-architecture=sm_90 --extended-lambda -I/usr/local/cuda/include bench.o original.o replacement.o -L/usr/local/cuda/lib64 -lcudart -lcublas -lcusparse -lnvToolsExt -lpthread -o bench
+
+===============================================
+Step 3: Running accuracy test
+===============================================
+Adam Update Accuracy Test
+==========================
+Parameters: size=8192, lr_t=1.00e-03, beta1=0.90, beta2=0.9990, eps=1.00e-08
+Tolerances: rel=1.00e-05, abs=1.00e-06
+
+=== Testing Original Kernel ===
+p: PASS (max_abs_err=1.86e-08, max_rel_err=6.20e-06, errors=0/8192)
+m: PASS (max_abs_err=1.12e-08, max_rel_err=5.51e-04, errors=0/8192)
+v: PASS (max_abs_err=2.79e-09, max_rel_err=1.53e-03, errors=0/8192)
+
+=== Testing Thrust Replacement ===
+p: PASS (max_abs_err=1.86e-08, max_rel_err=6.20e-06, errors=0/8192)
+m: PASS (max_abs_err=1.12e-08, max_rel_err=5.51e-04, errors=0/8192)
+v: PASS (max_abs_err=2.79e-09, max_rel_err=1.53e-03, errors=0/8192)
+
+=== Summary ===
+Original: PASS
+Thrust:   PASS
+
+===============================================
+Step 4: Running benchmark
+===============================================
+Adam Update Benchmark
+=====================
+Parameters: size=8192, lr_t=1.00e-03, beta1=0.90, beta2=0.9990, eps=1.00e-08
+
+=== Benchmarking Original Kernel ===
+Warmup (10 iterations)...
+Timing (100 iterations)...
+Original Kernel Results:
+  Min:    0.005 ms
+  Median: 0.006 ms
+  Mean:   0.006 ms
+  Max:    0.007 ms
+
+=== Benchmarking Thrust Replacement ===
+Warmup (10 iterations)...
+Timing (100 iterations)...
+Thrust Replacement Results:
+  Min:    0.012 ms
+  Median: 0.013 ms
+  Mean:   0.013 ms
+  Max:    0.017 ms
+
+=== Done ===
+
+===============================================
+All tests completed successfully
+===============================================

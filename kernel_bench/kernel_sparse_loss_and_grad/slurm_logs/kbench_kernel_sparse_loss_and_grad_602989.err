@@ -1,0 +1,6 @@
+Traceback (most recent call last):
+  File "/mnt/home/besleya/autoencoder/kernel_bench/kernel_sparse_loss_and_grad/reference.py", line 154, in <module>
+    main()
+  File "/mnt/home/besleya/autoencoder/kernel_bench/kernel_sparse_loss_and_grad/reference.py", line 70, in main
+    Y_torch[r, j] = values[k]
+TypeError: can't assign a numpy.float32 to a torch.FloatTensor

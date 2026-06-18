@@ -1,0 +1,62 @@
+===============================================
+Step 1: Generating reference test data
+===============================================
+Generated test data: d0=64, B=32, nnz=93, density=4.54%
+Files: a_L.bin, pre_grad.bin, col_ptr.bin, row_idx.bin, values.bin, expected_grad.bin, expected_loss.bin, meta.txt
+
+===============================================
+Step 2: Building test and benchmark binaries
+===============================================
+rm -f test_accuracy bench *.o
+/usr/local/cuda/bin/nvcc -O3 -std=c++17 --gpu-architecture=sm_90 -I/usr/local/cuda/include -o test_accuracy test_accuracy.cu original.cu replacement.cu -L/usr/local/cuda/lib64 -lcudart -lcublas -lcusparse -lnvToolsExt -lpthread
+/usr/local/cuda/bin/nvcc -O3 -std=c++17 --gpu-architecture=sm_90 -I/usr/local/cuda/include -o bench bench.cu original.cu replacement.cu -L/usr/local/cuda/lib64 -lcudart -lcublas -lcusparse -lnvToolsExt -lpthread
+
+===============================================
+Step 3: Running accuracy test
+===============================================
+Test accuracy: kernel_sparse_loss_and_grad
+
+Parameters: d0=64, B=32, nnz=93
+
+Loaded all inputs and expected outputs.
+
+Running ORIGINAL kernel...
+Running REPLACEMENT kernel...
+
+=== GRADIENT COMPARISON ===
+ORIGINAL gradient: PASS
+
+REPLACEMENT gradient: PASS
+
+=== LOSS COMPARISON ===
+Original loss: 1.023720, Expected: 1.023719, Diff: 7.152557e-07
+ORIGINAL loss: PASS
+
+Replacement loss: 1.023719, Expected: 1.023719, Diff: 1.192093e-07
+REPLACEMENT loss: PASS
+
+=== FINAL RESULTS ===
+ORIGINAL: PASS
+REPLACEMENT: PASS
+
+===============================================
+Step 4: Running benchmark
+===============================================
+Benchmark: kernel_sparse_loss_and_grad
+
+Parameters: d0=64, B=32, nnz=93
+
+Benchmarking ORIGINAL kernel...
+ORIGINAL median time: 0.0116 ms
+
+Benchmarking REPLACEMENT kernel...
+REPLACEMENT median time: 0.0961 ms
+
+=== SUMMARY ===
+ORIGINAL:     0.0116 ms
+REPLACEMENT:  0.0961 ms
+Speedup:      0.12 x
+
+===============================================
+All tests completed successfully
+===============================================

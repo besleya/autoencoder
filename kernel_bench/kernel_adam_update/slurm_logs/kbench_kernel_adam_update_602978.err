@@ -1,0 +1,2 @@
+/mnt/home/besleya/autoencoder/kernel_bench/kernel_adam_update/reference.py:50: RuntimeWarning: invalid value encountered in sqrt
+  p[i] -= lr_t * m_val / (np.sqrt(v_val) + eps)

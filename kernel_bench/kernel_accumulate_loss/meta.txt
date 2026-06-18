@@ -1,0 +1,8 @@
+d0 = 64
+B = 32
+denom (d0*B) = 2048
+d_dot = 0.49671414494514465
+d_loss = -0.13826429843902588
+epoch_sum_init = 0.5
+(d_dot + d_loss) / denom = 0.0001750243391143158
+expected_epoch_sum = 0.5001749992370605

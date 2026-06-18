@@ -1,0 +1,6 @@
+/opt/rh/gcc-toolset-13/root/usr/libexec/gcc/x86_64-redhat-linux/13/ld: original.o: in function `kernel_fill_ones(int, float*)':
+tmpxft_00330e47_00000000-6_original.cudafe1.cpp:(.text+0x10): multiple definition of `kernel_fill_ones(int, float*)'; /tmp/tmpxft_00330f35_00000000-11_bench.o:tmpxft_00330f35_00000000-6_bench.cudafe1.cpp:(.text+0x480): first defined here
+/opt/rh/gcc-toolset-13/root/usr/libexec/gcc/x86_64-redhat-linux/13/ld: original.o: in function `__device_stub__Z16kernel_fill_onesiPf(int, float*)':
+tmpxft_00330e47_00000000-6_original.cudafe1.cpp:(.text+0x1c0): multiple definition of `__device_stub__Z16kernel_fill_onesiPf(int, float*)'; /tmp/tmpxft_00330f35_00000000-11_bench.o:tmpxft_00330f35_00000000-6_bench.cudafe1.cpp:(.text+0x630): first defined here
+collect2: error: ld returned 1 exit status
+make: *** [Makefile:25: bench] Error 1

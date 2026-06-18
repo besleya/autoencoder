@@ -1,0 +1,24 @@
+===============================================
+Step 1: Generating reference test data
+===============================================
+n_cols: 256
+nnz_per_col: min=0, max=40, mean=20.19
+total_nnz: 5169
+col_ptr[0]: 0, col_ptr[-1]: 5169
+values_init: min=0.0187, max=99.9714, mean=50.0246
+expected_values: min=0.111315, max=9.210441, mean=5.690162
+Wrote col_ptr.bin
+Wrote values_init.bin
+Wrote scaler.bin
+Wrote expected_values.bin
+Wrote meta.txt
+
+Test data generation complete.
+
+===============================================
+Step 2: Building test and benchmark binaries
+===============================================
+rm -f *.o test_accuracy bench /tmp/orig_klnc.o /tmp/repl_klnc.o
+/usr/local/cuda/bin/nvcc -O3 -std=c++17 --gpu-architecture=sm_90 --extended-lambda -I/usr/local/cuda/include -c original.cu -o original.o
+/usr/local/cuda/bin/nvcc -O3 -std=c++17 --gpu-architecture=sm_90 --extended-lambda -I/usr/local/cuda/include -c replacement.cu -o replacement.o
+/usr/local/cuda/bin/nvcc -O3 -std=c++17 --gpu-architecture=sm_90 --extended-lambda -I/usr/local/cuda/include test_accuracy.cu original.o replacement.o -o test_accuracy -L/usr/local/cuda/lib64 -lcudart -lcublas -lcusparse -lnvToolsExt -lpthread

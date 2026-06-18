@@ -1,0 +1,43 @@
+===============================================
+Step 1: Generating reference test data
+===============================================
+Generated reference data: out=512, B=256
+  z_init.bin: 524288 bytes
+  b.bin: 2048 bytes
+  expected_z.bin: 524288 bytes
+
+===============================================
+Step 2: Building test and benchmark binaries
+===============================================
+rm -f test_accuracy bench *.o
+/usr/local/cuda/bin/nvcc -O3 -std=c++17 --gpu-architecture=sm_90 -I/usr/local/cuda/include test_accuracy.cu original.cu replacement.cu -o test_accuracy -L/usr/local/cuda/lib64 -lcudart -lcublas -lcusparse -lnvToolsExt -lpthread
+/usr/local/cuda/bin/nvcc -O3 -std=c++17 --gpu-architecture=sm_90 -I/usr/local/cuda/include bench.cu original.cu replacement.cu -o bench -L/usr/local/cuda/lib64 -lcudart -lcublas -lcusparse -lnvToolsExt -lpthread
+
+===============================================
+Step 3: Running accuracy test
+===============================================
+Test parameters: out=512, B=256
+Running original kernel...
+Running cuBLAS replacement...
+
+=== Accuracy Results ===
+Original kernel vs expected: 0 errors, max rel_err=0.00e+00
+cuBLAS replacement vs expected: 0 errors, max rel_err=0.00e+00
+PASS: Both implementations match expected result.
+
+===============================================
+Step 4: Running benchmark
+===============================================
+Benchmark parameters: out=512, B=256
+Warmup phase (10 iterations)...
+Timing original kernel (100 iterations)...
+Timing cuBLAS replacement (100 iterations)...
+
+=== Benchmark Results ===
+Original kernel median time: 0.0103 ms
+cuBLAS replacement median time: 0.0110 ms
+Speedup: 0.94x
+
+===============================================
+All tests completed successfully
+===============================================

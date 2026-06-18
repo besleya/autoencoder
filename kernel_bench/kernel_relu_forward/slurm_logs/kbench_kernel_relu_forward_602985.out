@@ -1,0 +1,49 @@
+===============================================
+Step 1: Generating reference test data
+===============================================
+Generated test data: size=131072
+  z.bin: 131072 random floats in [-1, 1]
+  expected_a.bin: ReLU(z)
+  meta.txt: 131072
+
+===============================================
+Step 2: Building test and benchmark binaries
+===============================================
+rm -f test_accuracy bench *.o
+/usr/local/cuda/bin/nvcc -O3 -std=c++17 --gpu-architecture=sm_90 --extended-lambda -I/usr/local/cuda/include test_accuracy.cu original.cu replacement.cu -o test_accuracy -L/usr/local/cuda/lib64 -lcudart -lcublas -lcusparse -lnvToolsExt -lpthread
+/usr/local/cuda/bin/nvcc -O3 -std=c++17 --gpu-architecture=sm_90 --extended-lambda -I/usr/local/cuda/include bench.cu original.cu replacement.cu -o bench -L/usr/local/cuda/lib64 -lcudart -lcublas -lcusparse -lnvToolsExt -lpthread
+
+===============================================
+Step 3: Running accuracy test
+===============================================
+Test size: 131072
+Running original kernel...
+Running replacement kernel...
+Comparing original vs replacement...
+Original vs Replacement: 0 mismatches
+Comparing replacement vs expected...
+
+=== PASS: All tests passed ===
+
+===============================================
+Step 4: Running benchmark
+===============================================
+Benchmark size: 131072
+
+=== Original Kernel (grid-based) ===
+Warmup (10 iterations)...
+Timing (100 iterations)...
+
+=== Replacement Kernel (thrust) ===
+Warmup (10 iterations)...
+Timing (100 iterations)...
+
+=== Results ===
+Original median:     0.005664 ms
+Replacement median:  0.011488 ms
+Speedup:             0.49 x
+  -> Replacement is 50.70% SLOWER
+
+===============================================
+All tests completed successfully
+===============================================

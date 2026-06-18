@@ -1,0 +1,26 @@
+test_accuracy.cu(94): warning #177-D: variable "block" was declared but never referenced
+      dim3 block(256);
+           ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+replacement.cu(69): warning #177-D: variable "count" was declared but never referenced
+              int count = (j + 256 <= B) ? 256 : (B - j);
+                  ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+replacement.cu(61): warning #177-D: variable "block" was declared but never referenced
+          dim3 block(256);
+               ^
+
+replacement.cu(69): warning #177-D: variable "count" was declared but never referenced
+              int count = (j + 256 <= B) ? 256 : (B - j);
+                  ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+replacement.cu(61): warning #177-D: variable "block" was declared but never referenced
+          dim3 block(256);
+               ^
+

@@ -1,0 +1,4 @@
+Traceback (most recent call last):
+  File "/mnt/home/besleya/autoencoder/kernel_bench/kernel_accumulate_loss/reference.py", line 32, in <module>
+    d_dot = np.random.randn().astype(np.float32)
+AttributeError: 'float' object has no attribute 'astype'

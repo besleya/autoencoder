@@ -1,0 +1,64 @@
+===============================================
+Step 1: Generating reference test data
+===============================================
+Generated reference data:
+  d0=64, B=32, denom=2048
+  d_dot=0.496714
+  d_loss=-0.138264
+  epoch_sum_init=0.500000
+  expected_epoch_sum=0.500175
+
+===============================================
+Step 2: Building test and benchmark binaries
+===============================================
+rm -f test_accuracy bench *.o
+/usr/local/cuda/bin/nvcc -O3 -std=c++17 --gpu-architecture=sm_90 -I/usr/local/cuda/include test_accuracy.cu original.cu replacement.cu -o test_accuracy -L/usr/local/cuda/lib64 -lcudart -lcublas -lcusparse -lnvToolsExt -lpthread
+/usr/local/cuda/bin/nvcc -O3 -std=c++17 --gpu-architecture=sm_90 -I/usr/local/cuda/include bench.cu original.cu replacement.cu -o bench -L/usr/local/cuda/lib64 -lcudart -lcublas -lcusparse -lnvToolsExt -lpthread
+
+===============================================
+Step 3: Running accuracy test
+===============================================
+=== Test Accuracy: kernel_accumulate_loss ===
+Parameters: d0=64, B=32, denom=2048
+Inputs: d_dot=0.496714, d_loss=-0.138264, epoch_sum_init=0.500000
+Expected: 0.500175
+
+Test 1: Original kernel
+  Result: 0.500175
+  Status: PASS
+
+Test 2: Replacement (host accumulate)
+  Result: 0.500175
+  Status: PASS
+
+=== All tests completed ===
+
+===============================================
+Step 4: Running benchmark
+===============================================
+=== Benchmark: kernel_accumulate_loss ===
+Parameters: d0=64, B=32
+Warmup iterations: 10
+Timed iterations: 1000
+
+Benchmarking Original Kernel...
+  Median: 0.005568 ms
+  Mean:   0.005601 ms
+  Min:    0.004800 ms
+  Max:    0.009568 ms
+
+Benchmarking Replacement (Host Accumulate)...
+  Median: 0.968480 ms
+  Mean:   0.972655 ms
+  Min:    0.953376 ms
+  Max:    2.183680 ms
+
+=== Comparison ===
+Original median:     0.005632 ms
+Replacement median:  0.968480 ms
+Speedup:             0.01 x
+Result: Original is faster
+
+===============================================
+All tests completed successfully
+===============================================

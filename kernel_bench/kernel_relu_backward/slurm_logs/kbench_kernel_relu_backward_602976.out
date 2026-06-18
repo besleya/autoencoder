@@ -1,0 +1,65 @@
+===============================================
+Step 1: Generating reference test data
+===============================================
+Generated test data:
+  SIZE: 131072
+  dz_init range: [-1.0000, 1.0000]
+  z range: [-1.0000, 1.0000]
+  expected_dz range: [-1.0000, 1.0000]
+  Files written: dz_init.bin, z.bin, expected_dz.bin, meta.txt
+
+===============================================
+Step 2: Building test and benchmark binaries
+===============================================
+rm -f test_accuracy bench *.o
+/usr/local/cuda/bin/nvcc -O3 -std=c++17 --gpu-architecture=sm_90 --extended-lambda -I/usr/local/cuda/include test_accuracy.cu original.cu replacement.cu -o test_accuracy -L/usr/local/cuda/lib64 -lcudart -lcublas -lcusparse -lnvToolsExt -lpthread
+/usr/local/cuda/bin/nvcc -O3 -std=c++17 --gpu-architecture=sm_90 --extended-lambda -I/usr/local/cuda/include bench.cu original.cu replacement.cu -o bench -L/usr/local/cuda/lib64 -lcudart -lcublas -lcusparse -lnvToolsExt -lpthread
+
+===============================================
+Step 3: Running accuracy test
+===============================================
+Test size: 131072 elements
+
+Loading test data...
+Test data loaded.
+
+=== Testing Original Implementation ===
+[original] Max absolute error: 0.000000e+00
+[original] Max relative error: 0.000000e+00
+[original] Total errors: 0 / 131072
+Original: PASS
+
+=== Testing Thrust Implementation ===
+[thrust] Max absolute error: 0.000000e+00
+[thrust] Max relative error: 0.000000e+00
+[thrust] Total errors: 0 / 131072
+Thrust: PASS
+
+=== Summary ===
+Original: PASS
+Thrust: PASS
+
+===============================================
+Step 4: Running benchmark
+===============================================
+Benchmark size: 131072 elements
+
+Loading test data...
+Test data loaded.
+
+=== Benchmarking Original Implementation ===
+Warmup: 10 iterations
+Timed iterations: 100
+
+=== Benchmarking Thrust Implementation ===
+Warmup: 10 iterations
+Timed iterations: 100
+
+=== Results ===
+Original - Median: 0.006208 ms, Average: 0.006256 ms
+Thrust   - Median: 0.012064 ms, Average: 0.012137 ms
+Speedup (median original / median thrust): 0.51 x
+
+===============================================
+All tests completed successfully
+===============================================

@@ -1,0 +1,41 @@
+===============================================
+Step 1: Generating reference test data
+===============================================
+Generated test data: d0=64, B=32, nnz=102, density=4.98%
+Files: a_L.bin, pre_grad.bin, col_ptr.bin, row_idx.bin, values.bin, expected_grad.bin, expected_loss.bin, meta.txt
+
+===============================================
+Step 2: Building test and benchmark binaries
+===============================================
+rm -f test_accuracy bench *.o
+/usr/local/cuda/bin/nvcc -O3 -std=c++17 --gpu-architecture=sm_90 -I/usr/local/cuda/include -o test_accuracy test_accuracy.cu original.cu replacement.cu -L/usr/local/cuda/lib64 -lcudart -lcublas -lcusparse -lnvToolsExt -lpthread
+/usr/local/cuda/bin/nvcc -O3 -std=c++17 --gpu-architecture=sm_90 -I/usr/local/cuda/include -o bench bench.cu original.cu replacement.cu -L/usr/local/cuda/lib64 -lcudart -lcublas -lcusparse -lnvToolsExt -lpthread
+
+===============================================
+Step 3: Running accuracy test
+===============================================
+Test accuracy: kernel_sparse_loss_and_grad
+
+Parameters: d0=64, B=32, nnz=102
+
+Loaded all inputs and expected outputs.
+
+Running ORIGINAL kernel...
+Running REPLACEMENT kernel...
+
+=== GRADIENT COMPARISON ===
+ORIGINAL gradient: FAIL
+
+REPLACEMENT gradient: FAIL
+
+=== LOSS COMPARISON ===
+Original loss: 1.032609, Expected: 1.028034, Diff: 4.575491e-03
+ORIGINAL loss: FAIL
+
+Replacement loss: 1.032609, Expected: 1.028034, Diff: 4.575133e-03
+REPLACEMENT loss: FAIL
+
+=== FINAL RESULTS ===
+ORIGINAL: FAIL
+REPLACEMENT: FAIL
+ERROR: Accuracy test failed!

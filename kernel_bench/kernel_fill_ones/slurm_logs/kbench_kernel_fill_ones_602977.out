@@ -1,0 +1,43 @@
+===============================================
+Step 1: Generating reference test data
+===============================================
+Generated /mnt/home/besleya/autoencoder/kernel_bench/kernel_fill_ones/expected_v.bin (4096 floats)
+Generated /mnt/home/besleya/autoencoder/kernel_bench/kernel_fill_ones/meta.txt
+Expected: all values = 1.0f
+
+===============================================
+Step 2: Building test and benchmark binaries
+===============================================
+rm -f *.o test_accuracy bench slurm-*.out
+/usr/local/cuda/bin/nvcc -O3 -std=c++17 --gpu-architecture=sm_90 --extended-lambda -c original.cu -o original.o
+/usr/local/cuda/bin/nvcc -O3 -std=c++17 --gpu-architecture=sm_90 --extended-lambda -c replacement.cu -o replacement.o
+/usr/local/cuda/bin/nvcc -O3 -std=c++17 --gpu-architecture=sm_90 --extended-lambda -o test_accuracy test_accuracy.cu original.o replacement.o -L/usr/local/cuda/lib64 -lcudart -lcublas -lcusparse -lnvToolsExt -lpthread
+/usr/local/cuda/bin/nvcc -O3 -std=c++17 --gpu-architecture=sm_90 --extended-lambda -o bench bench.cu original.o replacement.o -L/usr/local/cuda/lib64 -lcudart -lcublas -lcusparse -lnvToolsExt -lpthread
+
+===============================================
+Step 3: Running accuracy test
+===============================================
+Test size: n = 4096
+PASS: All 4096 values match expected (bit-exact = 1.0f)
+
+===============================================
+Step 4: Running benchmark
+===============================================
+Benchmark: kernel_fill_ones
+n = 4096, warmup = 10, timed = 100
+
+--- Original Kernel (kernel_fill_ones) ---
+Median time: 0.005760 ms
+
+--- Thrust Replacement (fill_ones_thrust) ---
+Median time: 0.011168 ms
+
+--- Summary ---
+Original median:      0.005760 ms
+Thrust median:        0.011168 ms
+Speedup (orig/thrust): 0.52x
+Result: Original kernel is faster
+
+===============================================
+All tests completed successfully
+===============================================

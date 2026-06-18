@@ -1,0 +1,4 @@
+ORIGINAL grad[10]: got 0.031059, expected -0.012265, rel_diff=3.532368, abs_diff=0.043324
+... (stopping after 10 errors)
+REPLACEMENT grad[10]: got 0.031059, expected -0.012265, rel_diff=3.532368, abs_diff=0.043324
+... (stopping after 10 errors)
