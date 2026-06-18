@@ -5,3 +5,5 @@ main_ae
 output_*.txt
 main_gpu
 version
+*.nsys-rep
+nsys*.sqlite
