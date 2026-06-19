@@ -9,3 +9,4 @@ version
 nsys*.sqlite
 __pycache__
 tests/validate/validate
+*.csv

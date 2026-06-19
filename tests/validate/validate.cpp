@@ -318,11 +318,12 @@ int main() {
                 fprintf(stderr, "ERROR: cannot open %s\n", weight_csv.c_str());
                 return 1;
             }
-            // Write row-major: out_dim rows × in_dim cols
+            // d_W_ is (out_dim × in_dim) column-major: d_W_[i + j*out_dim] = W[i,j]
+            // Write as (out_dim rows × in_dim cols) row-major CSV.
             for (int i = 0; i < out_dim; ++i) {
                 for (int j = 0; j < in_dim; ++j) {
                     if (j > 0) w_file << ',';
-                    w_file << std::setprecision(9) << h_W[(size_t)i * in_dim + j];
+                    w_file << std::setprecision(9) << h_W[(size_t)i + (size_t)j * out_dim];
                 }
                 w_file << '\n';
             }
@@ -341,13 +342,29 @@ int main() {
                 fprintf(stderr, "ERROR: cannot open %s\n", grad_csv.c_str());
                 return 1;
             }
-            // Write row-major: out_dim rows × in_dim cols
-            for (int i = 0; i < out_dim; ++i) {
-                for (int j = 0; j < in_dim; ++j) {
-                    if (j > 0) g_file << ',';
-                    g_file << std::setprecision(9) << h_dW[(size_t)i * in_dim + j];
+            if (layer_idx == 0) {
+                // Layer 0 (sparse backward): d_dW_ is (in_dim × out_dim) row-major.
+                // d_dW_[r*out_dim + c] = dL/dW[hidden=c, gene=r]
+                // Write as (out_dim rows × in_dim cols) to match PyTorch (out×in):
+                // row = hidden index c, col = gene index r → read h_dW[r*out_dim + c]
+                for (int i = 0; i < out_dim; ++i) {       // i = hidden
+                    for (int j = 0; j < in_dim; ++j) {    // j = gene
+                        if (j > 0) g_file << ',';
+                        g_file << std::setprecision(9) << h_dW[(size_t)j * out_dim + i];
+                    }
+                    g_file << '\n';
                 }
-                g_file << '\n';
+            } else {
+                // Layer 1+ (dense backward): d_dW_ is (out_dim × in_dim) column-major.
+                // d_dW_[i + j*out_dim] = dL/dW[i,j]
+                // Write as (out_dim rows × in_dim cols) row-major CSV.
+                for (int i = 0; i < out_dim; ++i) {
+                    for (int j = 0; j < in_dim; ++j) {
+                        if (j > 0) g_file << ',';
+                        g_file << std::setprecision(9) << h_dW[(size_t)i + (size_t)j * out_dim];
+                    }
+                    g_file << '\n';
+                }
             }
             g_file.close();
         }

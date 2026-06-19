@@ -17,7 +17,21 @@ import os
 
 # Force CPU and float32
 torch.set_default_dtype(torch.float32)
-device = torch.device("cpu")
+device = torch.device("cuda")
+
+class Autoencoder(nn.Module):
+    def __init__(self, input_dim):
+        super(Autoencoder, self).__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, 128, bias=True),
+            nn.ReLU()
+        )
+        self.decoder = nn.Linear(128, input_dim, bias=True)
+    
+    def forward(self, x):
+        encoded = self.encoder(x)
+        decoded = self.decoder(encoded)
+        return encoded, decoded
 
 def load_input_data(filepath, n_cols=256):
     """
@@ -134,50 +148,68 @@ def build_deterministic_autoencoder(input_dim):
 def train_autoencoder(model, X_norm, n_epochs=3):
     """
     Train autoencoder for n_epochs full-batch updates.
-    
+
     Input X_norm: shape (n_genes, n_samples), float32
     PyTorch expects (batch_size, features), so transpose to (n_samples, n_genes).
-    
-    Returns: list of (epoch_mse, weights_list, grads_list) tuples
+
+    Loss formula: ((output - X_torch)**2).sum() / (2*B)
+    This matches the C++ gradient formula (a_L - x) / B, which is the gradient of
+    ||a - x||^2 / (2*B).  MSELoss(reduction='mean') uses 2*(a-x)/(d0*B) which differs
+    by a factor of d0/2 and causes eps-regime Adam divergence with sparse data.
+
+    MSE for comparison is computed separately as ||a-x||^2 / (d0*B) = mse_loss(mean),
+    which matches C++'s read_epoch_loss().
+
+    Embedding is captured from epoch n_epochs's TRAINING forward pass (before the Adam
+    step), matching C++'s layer(0)->output() which is also pre-step.
+
+    Returns: list of (epoch_mse, weights_list, grads_list) tuples, final embedding
     """
     X_torch = torch.from_numpy(X_norm.T).to(device)  # (n_samples, n_genes)
+    B = X_torch.shape[0]  # batch size = 256
     print(f"[Train] Input to model: {X_torch.shape}, dtype: {X_torch.dtype}")
-    
-    criterion = nn.MSELoss(reduction='mean')
+
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-    
+
     epoch_results = []
-    
+    embedding = None
+
     for epoch in range(n_epochs):
-        # Forward pass
-        output = model(X_torch)
-        loss = criterion(output, X_torch)
-        
+        # Separate forward pass so we can capture the intermediate embedding.
+        # enc_pre: (B, 128) pre-ReLU; enc_post: (B, 128) post-ReLU; output: (B, d0)
+        enc_pre  = model[0](X_torch)
+        enc_post = model[1](enc_pre)   # ReLU bottleneck
+        output   = model[2](enc_post)
+
+        # Loss for backward: matches C++ gradient (a_L - x) / B
+        # d/d(output) [ ||output - X||^2 / (2*B) ] = (output - X) / B
+        loss_for_grad = ((output - X_torch) ** 2).sum() / (2.0 * B)
+
+        # MSE for comparison: matches C++ read_epoch_loss = ||a-x||^2 / (d0*B)
+        with torch.no_grad():
+            mse = torch.nn.functional.mse_loss(output, X_torch).item()
+
         # Backward pass
         optimizer.zero_grad()
-        loss.backward()
-        
+        loss_for_grad.backward()
+
         # Capture gradients BEFORE optimizer.step()
         grads = [model[0].weight.grad.clone(), model[2].weight.grad.clone()]
-        
+
         # Optimizer step
         optimizer.step()
-        
+
         # Capture weights AFTER optimizer.step()
         weights = [model[0].weight.data.clone(), model[2].weight.data.clone()]
-        
-        # Record the loss from the training forward pass
-        mse = loss.item()
+
+        # Capture embedding from the LAST epoch's training forward (before step),
+        # matching C++ layer(0)->output() which is also pre-step.
+        if epoch == n_epochs - 1:
+            embedding = enc_post.detach().cpu().numpy().T  # (128, n_samples)
+
         epoch_results.append((mse, weights, grads))
         print(f"[Train] Epoch {epoch + 1}/{n_epochs}: MSE = {mse:.8f}")
-    
-    # Capture ReLU embedding after training
-    with torch.no_grad():
-        # Forward through encoder layers
-        hidden = model[0](X_torch)  # (n_samples, 128)
-        hidden = model[1](hidden)   # ReLU, still (n_samples, 128)
-        embedding = hidden.cpu().numpy().T  # Transpose to (128, n_samples)
-    
+
     print(f"[Train] Captured embedding shape: {embedding.shape}", flush=True)
     return epoch_results, embedding
 
