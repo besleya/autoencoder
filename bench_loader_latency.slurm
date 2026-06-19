@@ -5,8 +5,7 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=128G
 #SBATCH --time=01:00:00
-#SBATCH --output=/mnt/home/besleya/autoencoder/slurm_logs/%x_%j.out
-#SBATCH --error=/mnt/home/besleya/autoencoder/slurm_logs/%x_%j.err
+#SBATCH --output=/mnt/home/besleya/autoencoder/slurm_logs/output_%j_%x.txt
 
 set -euo pipefail
 
