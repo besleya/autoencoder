@@ -50,8 +50,8 @@
 
 // Compute loss and initialize loss gradient:
 //   loss_acc = ||a_L||_F^2
-//   d_grad_loss = a_L / B (for all entries)
-//   For each sparse (r, j, v): d_grad_loss(r,j) = (a_L(r,j) - v) / B
+//   d_grad_loss = 2 * a_L / (B * d0) (for all entries)
+//   For each sparse (r, j, v): d_grad_loss(r,j) = 2 * (a_L(r,j) - v) / (B * d0)
 //                              loss_acc += v^2 - 2*a_L(r,j)*v
 // Then loss = loss_acc / (d0 * B)
 //
@@ -72,8 +72,8 @@ __global__ void kernel_sparse_loss_and_grad(
         float v = values[k];
         float a_val = a_L[r + (size_t)j * d0];
         
-        // d_grad_loss(r,j) = (a_L(r,j) - v) / B
-        d_grad_loss[r + (size_t)j * d0] = (a_val - v) / B;
+        // d_grad_loss(r,j) = 2 * (a_L(r,j) - v) / (B * d0)
+        d_grad_loss[r + (size_t)j * d0] = 2.0f * (a_val - v) / (static_cast<float>(B) * static_cast<float>(d0));
         
         // Accumulate loss correction
         float correction = v * v - 2.0f * a_val * v;
@@ -320,7 +320,7 @@ void GpuAutoencoder::backward_and_step(const SparseBatch& x, float lr, cudaStrea
         CUBLAS_CHECK(cublasSetPointerMode(cublas_handle_, CUBLAS_POINTER_MODE_HOST));
     }
     
-    // Initialize d_grad_loss_ = a_L / B for all entries
+    // Initialize d_grad_loss_ = 2 * a_L / (B * d0) for all entries
     {
         int size = dL * B;
         {
@@ -329,16 +329,16 @@ void GpuAutoencoder::backward_and_step(const SparseBatch& x, float lr, cudaStrea
                                        cudaMemcpyDeviceToDevice, stream));
         }
         
-        // Scale in-place: multiply each element by 1/B
+        // Scale in-place: multiply each element by 2 / (B * d0)
         {
             GpuScopedTimer timer_scal("ae.bwd.grad_init_scal", stream);
-            float scale = 1.0f / B;
+            float scale = 2.0f / (static_cast<float>(B) * static_cast<float>(d0));
             CUBLAS_CHECK(cublasSscal(cublas_handle_, size, &scale, d_grad_loss_, 1));
         }
     }
     
     // Sparse correction kernel: for each sparse (r, j, v):
-    //   d_grad_loss_(r,j) = (a_L(r,j) - v) / B
+    //   d_grad_loss_(r,j) = 2 * (a_L(r,j) - v) / (B * d0)
     //   d_loss_ += v^2 - 2*a_L(r,j)*v
     {
         CUDA_CHECK(cudaMemsetAsync(d_loss_, 0, sizeof(float), stream));

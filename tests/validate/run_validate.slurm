@@ -27,6 +27,6 @@ echo "C++ validator exited with code: $CPP_EXIT_CODE"
 
 # Run Python comparison
 echo "Running Python comparison..."
-/mnt/home/besleya/s3/bin/python3 /mnt/home/besleya/autoencoder/tests/validate/compare.py
+/mnt/home/besleya/s3/bin/python3 /mnt/home/besleya/autoencoder/tests/validate/compare.py --recompute-cache
 
 echo "Job $SLURM_JOB_ID finished. See /mnt/home/besleya/autoencoder/tests/validate/output_$SLURM_JOB_ID.txt"

@@ -93,10 +93,10 @@ __global__ void kernel_fill_ones(int n, float* v) {
     }
 }
 
-// Adam update: p = p - lr_t * m / (sqrt(v) + eps)
+// Adam update: p = p - lr * (m/bc1) / (sqrt(v/bc2) + eps)
 __global__ void kernel_adam_update(
     int size, float* p, float* m, float* v, const float* g,
-    float lr_t, float beta1, float beta2, float eps) {
+    float lr, float beta1, float beta2, float eps, float bc1, float bc2) {
     
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < size) {
@@ -107,7 +107,9 @@ __global__ void kernel_adam_update(
         m[idx] = m_val;
         v[idx] = v_val;
         
-        p[idx] -= lr_t * m_val / (sqrtf(v_val) + eps);
+        float m_hat = m_val / bc1;
+        float v_hat = v_val / bc2;
+        p[idx] -= lr * m_hat / (sqrtf(v_hat) + eps);
     }
 }
 
@@ -268,7 +270,6 @@ void Layer::update(float lr, cudaStream_t stream) {
     ++t_;
     float bc1 = 1.0f - std::pow(0.9f, static_cast<float>(t_));
     float bc2 = 1.0f - std::pow(0.999f, static_cast<float>(t_));
-    float lr_t = lr * std::sqrt(bc2) / bc1;
 
     int size_w = out_dim_ * in_dim_;
     int size_b = out_dim_;
@@ -280,7 +281,7 @@ void Layer::update(float lr, cudaStream_t stream) {
         get_grid_block(size_w, grid, block);
         kernel_adam_update<<<grid, block, 0, stream>>>(
             size_w, d_W_, d_mW_, d_vW_, d_dW_,
-            lr_t, 0.9f, 0.999f, 1e-8f);
+            lr, 0.9f, 0.999f, 1e-8f, bc1, bc2);
     }
 
     // Update b
@@ -290,7 +291,7 @@ void Layer::update(float lr, cudaStream_t stream) {
         get_grid_block(size_b, grid, block);
         kernel_adam_update<<<grid, block, 0, stream>>>(
             size_b, d_b_, d_mb_, d_vb_, d_db_,
-            lr_t, 0.9f, 0.999f, 1e-8f);
+            lr, 0.9f, 0.999f, 1e-8f, bc1, bc2);
     }
     
     nvtxRangePop();

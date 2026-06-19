@@ -10,6 +10,7 @@ Data orientation:
 """
 
 import sys
+import argparse
 import numpy as np
 import torch
 import torch.nn as nn
@@ -52,13 +53,8 @@ class Autoencoder(nn.Module):
         decoded = self.decoder(encoded)
         return encoded, decoded
     
-    def training_loss(self, output, target):
-        """Compute loss for backward pass: ||output - target||^2 / (2*B)."""
-        B = output.shape[0]
-        return ((output - target) ** 2).sum() / (2.0 * B)
-    
-    def reporting_mse(self, output, target):
-        """Compute MSE for reporting: matches C++ read_epoch_loss."""
+    def mse(self, output, target):
+        """Compute MSE for loss: ||output - target||^2 / (d0 * B)."""
         return torch.nn.functional.mse_loss(output, target)
 
 def load_input_data(filepath, n_cols=256):
@@ -116,10 +112,10 @@ def log_normalize_columns(X):
     Apply log-normalization matching gpu_data_loader.cu::log_normalize_columns_kernel.
     
     Per column j:
-      col_sum_j = sum of non-zero values in column j
-      For each non-zero x in column j: x_new = log1p(x * 10000.0 / col_sum_j)
-      Zeros stay zero.
-      If col_sum_j == 0, column is unchanged.
+        col_sum_j = sum of non-zero values in column j
+        For each non-zero x in column j: x_new = log1p(x * 10000.0 / col_sum_j)
+        Zeros stay zero.
+        If col_sum_j == 0, column is unchanged.
     
     Input: X shape (n_genes, n_samples), float32
     Output: normalized X, float32
@@ -146,13 +142,8 @@ def train_autoencoder(model, X_norm, n_epochs=3):
     Input X_norm: shape (n_genes, n_samples), float32
     PyTorch expects (batch_size, features), so transpose to (n_samples, n_genes).
 
-    Loss formula: ((output - X_torch)**2).sum() / (2*B)
-    This matches the C++ gradient formula (a_L - x) / B, which is the gradient of
-    ||a - x||^2 / (2*B).  MSELoss(reduction='mean') uses 2*(a-x)/(d0*B) which differs
-    by a factor of d0/2 and causes eps-regime Adam divergence with sparse data.
-
-    MSE for comparison is computed separately as ||a-x||^2 / (d0*B) = mse_loss(mean),
-    which matches C++'s read_epoch_loss().
+    Loss formula: MSE = ||output - target||^2 / (d0 * B)
+    This matches the C++ loss and gradient formula.
 
     Embedding is captured from epoch n_epochs's TRAINING forward pass (before the Adam
     step), matching C++'s layer(0)->output() which is also pre-step.
@@ -172,16 +163,12 @@ def train_autoencoder(model, X_norm, n_epochs=3):
         # Forward pass
         encoded, output = model(X_torch)
 
-        # Loss for backward: matches C++ gradient (a_L - x) / B
-        loss_for_grad = model.training_loss(output, X_torch)
-
-        # MSE for comparison: matches C++ read_epoch_loss
-        with torch.no_grad():
-            mse = model.reporting_mse(output, X_torch).item()
+        # Compute MSE loss (matches C++ formula: sum((a-x)^2) / (d0*B))
+        mse = model.mse(output, X_torch)
 
         # Backward pass
         optimizer.zero_grad()
-        loss_for_grad.backward()
+        mse.backward()
 
         # Capture gradients BEFORE optimizer.step()
         grads = [model.encoder[0].weight.grad.clone(), model.decoder.weight.grad.clone()]
@@ -197,8 +184,8 @@ def train_autoencoder(model, X_norm, n_epochs=3):
         if epoch == n_epochs - 1:
             embedding = encoded.detach().cpu().numpy().T  # (128, n_samples)
 
-        epoch_results.append((mse, weights, grads))
-        print(f"[Train] Epoch {epoch + 1}/{n_epochs}: MSE = {mse:.8f}")
+        epoch_results.append((mse.item(), weights, grads))
+        print(f"[Train] Epoch {epoch + 1}/{n_epochs}: MSE = {mse.item():.8f}")
 
     print(f"[Train] Captured embedding shape: {embedding.shape}", flush=True)
     return epoch_results, embedding
@@ -210,14 +197,15 @@ def test_lognorm(X_norm):
     Reads validate_lognorm_10cols.csv from C++ side.
     Compares against first 10 columns of Python X_norm.
     
-    Always exit 0.
+    Returns:
+        bool: True if test passes.
     """
     lognorm_csv_path = "/mnt/home/besleya/autoencoder/tests/validate/validate_lognorm_10cols.csv"
     
     if not os.path.exists(lognorm_csv_path):
         print(f"[Lognorm] WARNING: C++ lognorm CSV not found at {lognorm_csv_path}")
         print("[Lognorm] Skipped.\n")
-        return
+        return False
     
     print("[Lognorm comparison]")
     
@@ -226,14 +214,14 @@ def test_lognorm(X_norm):
         cpp_lognorm = np.genfromtxt(lognorm_csv_path, delimiter=',', dtype=np.float32)
     except Exception as e:
         print(f"[Lognorm] ERROR reading CSV: {e}\n")
-        return
+        return False
     
     # Extract first 10 columns from Python lognorm
     py_lognorm = X_norm[:, :10]
     
     if cpp_lognorm.shape != py_lognorm.shape:
         print(f"[Lognorm] ERROR: Shape mismatch. PyTorch: {py_lognorm.shape}, C++: {cpp_lognorm.shape}\n")
-        return
+        return False
     
     # Compare element-wise
     abs_diff = np.abs(py_lognorm - cpp_lognorm)
@@ -245,41 +233,110 @@ def test_lognorm(X_norm):
     
     print(f"  max_abs_diff={max_abs_diff:.8e}  mean_abs_diff={mean_abs_diff:.8e}  [{status}]")
     print(f"  Threshold: max_abs_diff < 1e-5\n", flush=True)
+    return test_pass
 
-def test_forward_pass(model, X_norm):
+def save_cache(cache_file, X_norm, embedding_epoch0, epoch_results, embedding_final):
+    """
+    Save expensive computed values to a compressed .npz file.
+    
+    Args:
+        cache_file: path to .npz file
+        X_norm: log-normalized data, shape (n_genes, n_samples)
+        embedding_epoch0: pre-train embedding, shape (128, n_samples)
+        epoch_results: list of (mse, weights, grads) tuples
+        embedding_final: final embedding after training, shape (128, n_samples)
+    """
+    n_epochs = len(epoch_results)
+    
+    # Extract MSEs
+    mses = np.array([mse for mse, _, _ in epoch_results], dtype=np.float32)
+    
+    # Stack weights and grads
+    weights_enc = np.stack([w[0].cpu().numpy() for _, w, _ in epoch_results], axis=0).astype(np.float32)
+    weights_dec = np.stack([w[1].cpu().numpy() for _, w, _ in epoch_results], axis=0).astype(np.float32)
+    grads_enc = np.stack([g[0].cpu().numpy() for _, _, g in epoch_results], axis=0).astype(np.float32)
+    grads_dec = np.stack([g[1].cpu().numpy() for _, _, g in epoch_results], axis=0).astype(np.float32)
+    
+    np.savez_compressed(
+        cache_file,
+        lognorm=X_norm.astype(np.float32),
+        embedding_epoch0=embedding_epoch0.astype(np.float32),
+        mses=mses,
+        weights_enc=weights_enc,
+        weights_dec=weights_dec,
+        grads_enc=grads_enc,
+        grads_dec=grads_dec,
+        embedding_final=embedding_final.astype(np.float32)
+    )
+    print(f"[Cache] Saved to {cache_file}", flush=True)
+
+def load_cache(cache_file):
+    """
+    Load cached values from .npz file.
+    
+    Returns:
+        (X_norm, embedding_epoch0, epoch_results, embedding_final)
+        where epoch_results is list of (mse, weights, grads) tuples
+        and weights/grads are already as numpy arrays
+    """
+    if not os.path.exists(cache_file):
+        print(f"ERROR: Cache file not found: {cache_file}")
+        sys.exit(1)
+    
+    with np.load(cache_file) as data:
+        X_norm = data['lognorm']
+        embedding_epoch0 = data['embedding_epoch0']
+        mses = data['mses']
+        weights_enc = data['weights_enc']
+        weights_dec = data['weights_dec']
+        grads_enc = data['grads_enc']
+        grads_dec = data['grads_dec']
+        embedding_final = data['embedding_final']
+    
+    # Reconstruct epoch_results as list of (mse, weights, grads)
+    # weights and grads remain as numpy arrays (not torch tensors)
+    epoch_results = []
+    for i in range(len(mses)):
+        mse = float(mses[i])
+        weights = [weights_enc[i], weights_dec[i]]
+        grads = [grads_enc[i], grads_dec[i]]
+        epoch_results.append((mse, weights, grads))
+    
+    print(f"[Cache] Loaded from {cache_file}", flush=True)
+    return X_norm, embedding_epoch0, epoch_results, embedding_final
+
+def test_forward_pass(py_embedding):
     """
     Compare pre-training forward pass embedding.
     
     Reads validate_embedding_epoch0.csv from C++ side.
-    Compares against Python forward pass (before training).
+    Compares against provided embedding (pre-train).
     
-    Always exit 0.
+    Args:
+        py_embedding: numpy array, shape (128, n_samples)
+    
+    Returns:
+        bool: True if test passes.
     """
     embedding_epoch0_path = "/mnt/home/besleya/autoencoder/tests/validate/validate_embedding_epoch0.csv"
     
     if not os.path.exists(embedding_epoch0_path):
         print(f"[Forward] WARNING: C++ embedding CSV not found at {embedding_epoch0_path}")
         print("[Forward] Skipped.\n")
-        return
+        return False
     
     print("[Forward pass comparison (epoch 0)]")
-    
-    # Python: forward pass on initialized (not yet trained) model
-    X_torch = torch.from_numpy(X_norm.T).to(device)  # (n_samples, n_genes)
-    with torch.no_grad():
-        encoded, _ = model(X_torch)
-        py_embedding = encoded.cpu().numpy().T  # Transpose to (128, n_samples)
     
     # Load C++ embedding
     try:
         cpp_embedding = np.genfromtxt(embedding_epoch0_path, delimiter=',', dtype=np.float32)
     except Exception as e:
         print(f"[Forward] ERROR reading CSV: {e}\n")
-        return
+        return False
     
     if cpp_embedding.shape != py_embedding.shape:
         print(f"[Forward] ERROR: Shape mismatch. PyTorch: {py_embedding.shape}, C++: {cpp_embedding.shape}\n")
-        return
+        return False
     
     # Compare element-wise
     abs_diff = np.abs(py_embedding - cpp_embedding)
@@ -291,6 +348,7 @@ def test_forward_pass(model, X_norm):
     
     print(f"  max_abs_diff={max_abs_diff:.8e}  mean_abs_diff={mean_abs_diff:.8e}  [{status}]")
     print(f"  Threshold: max_abs_diff < 1e-3\n", flush=True)
+    return test_pass
 
 def test_weights(epoch, py_weights):
     """
@@ -298,7 +356,7 @@ def test_weights(epoch, py_weights):
     
     Args:
         epoch: epoch number (1-indexed)
-        py_weights: list of 2 PyTorch weight tensors [layer0, layer2]
+        py_weights: list of 2 weight arrays [layer0, layer2], either torch tensors or numpy arrays
                    shape (out_dim, in_dim) each
     
     Reads C++ weight CSVs and compares.
@@ -318,7 +376,8 @@ def test_weights(epoch, py_weights):
         
         try:
             cpp_weights = np.genfromtxt(csv_path, delimiter=',', dtype=np.float32)
-            py_w = py_weights[layer_idx].cpu().numpy()
+            w = py_weights[layer_idx]
+            py_w = w.cpu().numpy() if torch.is_tensor(w) else w
             
             if cpp_weights.shape != py_w.shape:
                 print(f"  Layer {layer_idx}: ERROR: Shape mismatch. PyTorch: {py_w.shape}, C++: {cpp_weights.shape}")
@@ -350,7 +409,7 @@ def test_gradients(epoch, py_grads):
     
     Args:
         epoch: epoch number (1-indexed)
-        py_grads: list of 2 PyTorch gradient tensors [layer0, layer2]
+        py_grads: list of 2 gradient arrays [layer0, layer2], either torch tensors or numpy arrays
                  shape (out_dim, in_dim) each
     
     Reads C++ gradient CSVs and compares.
@@ -370,7 +429,8 @@ def test_gradients(epoch, py_grads):
         
         try:
             cpp_grads = np.genfromtxt(csv_path, delimiter=',', dtype=np.float32)
-            py_g = py_grads[layer_idx].cpu().numpy()
+            g = py_grads[layer_idx]
+            py_g = g.cpu().numpy() if torch.is_tensor(g) else g
             
             if cpp_grads.shape != py_g.shape:
                 print(f"  Layer {layer_idx}: ERROR: Shape mismatch. PyTorch: {py_g.shape}, C++: {cpp_grads.shape}")
@@ -396,146 +456,192 @@ def test_gradients(epoch, py_grads):
     print()
     return all_pass
 
-
-def compare_results(epoch_results, embedding, X_norm, model):
+def test_loss(mses):
     """
-    Load C++ outputs and compare.
+    Compare per-epoch MSE against C++ validate_loss.csv.
     
-    C++ outputs:
-      - validate_loss.csv: epoch,mse (3 rows, 1 data row per epoch)
-      - validate_embedding.csv: 128 rows x 256 cols, no header
-      - validate_weights_layerN_epochE.csv: weight matrices
-      - validate_grads_layerN_epochE.csv: gradient matrices
+    Args:
+       mses: iterable of per-epoch Python MSE floats.
     
-    Always exit 0.
+    Returns:
+       bool: True if all epochs pass.
     """
     loss_csv_path = "/mnt/home/besleya/autoencoder/tests/validate/validate_loss.csv"
+    
+    if not os.path.exists(loss_csv_path):
+       print("[MSE comparison]")
+       print(f"  WARNING: C++ loss CSV not found at {loss_csv_path}")
+       print("  Skipped.\n")
+       return False
+    
+    print("[MSE comparison]")
+    
+    # Load C++ MSEs
+    try:
+       cpp_data = np.genfromtxt(loss_csv_path, delimiter=',', dtype=np.float64, skip_header=1)
+       if cpp_data.ndim == 1:
+           cpp_mses = [cpp_data[1]] if len(cpp_data) > 1 else []
+       else:
+           cpp_mses = cpp_data[:, 1]
+    except Exception as e:
+       print(f"  ERROR reading CSV: {e}\n")
+       return False
+    
+    mses_list = list(mses)
+    all_pass = True
+    
+    for epoch_num, (pytorch_mse, cpp_mse) in enumerate(zip(mses_list, cpp_mses), start=1):
+       abs_diff = abs(float(pytorch_mse) - float(cpp_mse))
+       rel_diff = abs_diff / (abs(float(cpp_mse)) + 1e-12)
+       test_pass = rel_diff < 1e-4
+       status = "PASS" if test_pass else "FAIL"
+        
+       print(f"  Epoch {epoch_num}: PyTorch={float(pytorch_mse):.8f}  C++={float(cpp_mse):.8f}  "
+             f"abs_diff={abs_diff:.2e}  rel_diff={rel_diff:.2e}  [{status}]")
+        
+       if not test_pass:
+           all_pass = False
+    
+    print()
+    return all_pass
+
+def test_embedding_final(embedding):
+    """
+    Compare final-epoch embedding against C++ validate_embedding.csv.
+    
+    Args:
+       embedding: numpy array, shape (128, n_samples)
+    
+    Returns:
+       bool: True if max_abs_diff < 1e-3.
+    """
     embedding_csv_path = "/mnt/home/besleya/autoencoder/tests/validate/validate_embedding.csv"
     
-    # Extract MSEs and verify weights/grads for each epoch
-    epoch_mses = []
-    for epoch_num, (mse, weights, grads) in enumerate(epoch_results, start=1):
-        epoch_mses.append(mse)
-        test_weights(epoch_num, weights)
-        test_gradients(epoch_num, grads)
-    
-    print("\n[PyTorch Results]")
-    for i, mse in enumerate(epoch_mses):
-        print(f"  Epoch {i + 1}: MSE = {mse:.8f}")
-    print(f"  Embedding shape: {embedding.shape}")
-    print(f"  Embedding[0, :5] = {embedding[0, :5]}")
-    
-    # Check if C++ CSVs exist
-    if not os.path.exists(loss_csv_path):
-        print(f"\nWARNING: C++ loss CSV not found at {loss_csv_path}")
-        print("Comparison skipped. PyTorch reference output above.\n")
-        return
-    
     if not os.path.exists(embedding_csv_path):
-        print(f"\nWARNING: C++ embedding CSV not found at {embedding_csv_path}")
-        print("Comparison skipped. PyTorch reference output above.\n")
-        return
+       print("[Embedding comparison (final)]")
+       print(f"  WARNING: C++ embedding CSV not found at {embedding_csv_path}")
+       print("  Skipped.\n")
+       return False
     
-    print("\n[C++ vs PyTorch Comparison]")
-    
-    # Load C++ loss
-    cpp_mses = []
-    try:
-        with open(loss_csv_path, 'r') as f:
-            lines = f.readlines()
-            # Skip header
-            for line in lines[1:]:
-                parts = line.strip().split(',')
-                if len(parts) >= 2:
-                    cpp_mses.append(float(parts[1]))
-    except Exception as e:
-        print(f"ERROR reading loss CSV: {e}")
-        return
-    
-    # Compare per-epoch MSE
-    print("\n  Per-epoch MSE:")
-    mse_pass = True
-    for i in range(len(epoch_mses)):
-        if i >= len(cpp_mses):
-            print(f"    Epoch {i + 1}: PyTorch MSE = {epoch_mses[i]:.8f}, C++ missing")
-            mse_pass = False
-            continue
-        
-        pytorch_mse = epoch_mses[i]
-        cpp_mse = cpp_mses[i]
-        abs_diff = abs(pytorch_mse - cpp_mse)
-        rel_diff = abs_diff / (abs(cpp_mse) + 1e-12)
-        
-        status = "PASS" if rel_diff < 1e-4 else "FAIL"
-        print(f"    Epoch {i + 1}: PyTorch={pytorch_mse:.8f}  C++={cpp_mse:.8f}  "
-              f"abs_diff={abs_diff:.8f}  rel_diff={rel_diff:.8e}  [{status}]")
-        
-        if rel_diff >= 1e-4:
-            mse_pass = False
+    print("[Embedding comparison (final)]")
     
     # Load C++ embedding
-    cpp_embedding = None
     try:
-        cpp_embedding = np.genfromtxt(embedding_csv_path, delimiter=',', dtype=np.float32)
+       cpp_embedding = np.genfromtxt(embedding_csv_path, delimiter=',', dtype=np.float32)
     except Exception as e:
-        print(f"\nERROR reading embedding CSV: {e}")
-        return
+       print(f"  ERROR reading CSV: {e}\n")
+       return False
     
     if cpp_embedding.shape != embedding.shape:
-        print(f"\nERROR: Shape mismatch. PyTorch: {embedding.shape}, C++: {cpp_embedding.shape}")
-        return
+       print(f"  ERROR: Shape mismatch. PyTorch: {embedding.shape}, C++: {cpp_embedding.shape}\n")
+       return False
     
-    # Compare embedding
-    print(f"\n  Embedding comparison (shape {embedding.shape}):")
+    # Compare element-wise
     abs_diff = np.abs(embedding - cpp_embedding)
     max_abs_diff = np.max(abs_diff)
     mean_abs_diff = np.mean(abs_diff)
     
-    # Relative difference, avoiding division by zero
-    rel_diff = abs_diff / (np.abs(cpp_embedding) + 1e-12)
-    max_rel_diff = np.max(rel_diff)
+    test_pass = max_abs_diff < 1e-3
+    status = "PASS" if test_pass else "FAIL"
     
-    embed_pass = max_abs_diff < 1e-3
-    status = "PASS" if embed_pass else "FAIL"
-    
-    print(f"    max_abs_diff={max_abs_diff:.8e}  mean_abs_diff={mean_abs_diff:.8e}  "
-          f"max_rel_diff={max_rel_diff:.8e}  [{status}]")
-    
-    # Summary
-    print("\n[Summary]")
-    overall = mse_pass and embed_pass
-    print(f"  MSE comparison: {'PASS' if mse_pass else 'FAIL'} (threshold: rel_diff < 1e-4)")
-    print(f"  Embedding comparison: {'PASS' if embed_pass else 'FAIL'} (threshold: max_abs_diff < 1e-3)")
-    print(f"  Overall: {'PASS' if overall else 'FAIL'}\n", flush=True)
+    print(f"  max_abs_diff={max_abs_diff:.8e}  mean_abs_diff={mean_abs_diff:.8e}  [{status}]")
+    print(f"  Threshold: max_abs_diff < 1e-3\n", flush=True)
+    return test_pass
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="Validate PyTorch autoencoder against C++ implementation with optional caching."
+    )
+    
+    cache_group = parser.add_mutually_exclusive_group(required=True)
+    cache_group.add_argument(
+        '--recompute-cache',
+        action='store_true',
+        help="Run the Python pipeline fresh, save results to cache file, then run comparisons."
+    )
+    cache_group.add_argument(
+        '--use-cache',
+        action='store_true',
+        help="Load saved results from cache file, skip the Python pipeline, run comparisons against cached values."
+    )
+    
+    parser.add_argument(
+        '--cache-file',
+        type=str,
+        default='tests/validate/.compare_cache.npz',
+        help="Path to the .npz cache file (default: tests/validate/.compare_cache.npz)."
+    )
+    
+    args = parser.parse_args()
+    
+    # Resolve cache file path
+    cache_file = args.cache_file
+    if not os.path.isabs(cache_file):
+        # Make it relative to the current working directory
+        cache_file = os.path.join(os.getcwd(), cache_file)
+    
     input_file = "/mnt/home/besleya/quant/GSE260931/GSM8128195/counts.1pz"
     
-    if not os.path.exists(input_file):
-        print(f"ERROR: Input file not found: {input_file}")
-        sys.exit(1)
+    if args.recompute_cache:
+        if not os.path.exists(input_file):
+            print(f"ERROR: Input file not found: {input_file}")
+            sys.exit(1)
+        
+        # Load data
+        X = load_input_data(input_file, n_cols=256)
+        
+        # Normalize
+        X_norm = log_normalize_columns(X)
+        
+        # Build model
+        model = Autoencoder(X_norm.shape[0], deterministic=True).to(device).train()
+        print(f"[Model] Built deterministic autoencoder: {X_norm.shape[0]} -> 128 -> {X_norm.shape[0]}", flush=True)
+        
+        # Compute pre-train embedding
+        X_torch = torch.from_numpy(X_norm.T).to(device)
+        with torch.no_grad():
+            encoded, _ = model(X_torch)
+            embedding_epoch0 = encoded.cpu().numpy().T  # (128, n_samples)
+        
+        # Train
+        epoch_results, embedding_final = train_autoencoder(model, X_norm, n_epochs=3)
+        
+        # Save cache
+        save_cache(cache_file, X_norm, embedding_epoch0, epoch_results, embedding_final)
+        
+    else:  # use_cache
+        X_norm, embedding_epoch0, epoch_results, embedding_final = load_cache(cache_file)
     
-    # Load data
-    X = load_input_data(input_file, n_cols=256)
+    # Run comparisons (identical in both modes)
+    results = []
     
-    # Normalize
-    X_norm = log_normalize_columns(X)
+    results.append(("Lognorm", test_lognorm(X_norm)))
+    results.append(("Forward pass (epoch 0)", test_forward_pass(embedding_epoch0)))
     
-    # Build model
-    model = Autoencoder(X_norm.shape[0], deterministic=True).to(device).train()
-    print(f"[Model] Built deterministic autoencoder: {X_norm.shape[0]} -> 128 -> {X_norm.shape[0]}", flush=True)
+    # Compare per-epoch results
+    for epoch_num, (mse, weights, grads) in enumerate(epoch_results, start=1):
+       results.append((f"Weights epoch {epoch_num}", test_weights(epoch_num, weights)))
+       results.append((f"Gradients epoch {epoch_num}", test_gradients(epoch_num, grads)))
     
-    # Test 1: Log-normalization (before training)
-    test_lognorm(X_norm)
+    # Compare per-epoch MSE
+    mses = [mse for mse, _, _ in epoch_results]
+    results.append(("Per-epoch MSE", test_loss(mses)))
     
-    # Test 2: Forward pass embedding (before training)
-    test_forward_pass(model, X_norm)
+    # Compare final embedding
+    results.append(("Final embedding", test_embedding_final(embedding_final)))
     
-    # Train
-    epoch_results, embedding = train_autoencoder(model, X_norm, n_epochs=3)
+    # Print summary
+    print("[Test Summary]")
+    passed = sum(1 for _, status in results if status)
+    failed = sum(1 for _, status in results if not status)
+    total = len(results)
     
-    # Compare with C++ outputs
-    compare_results(epoch_results, embedding, X_norm, model)
+    for name, status in results:
+       status_str = "PASS" if status else "FAIL"
+       print(f"  {status_str:4s}  {name}")
+    
+    print("-" * 48)
+    print(f"  {passed} passed, {failed} failed ({total} total)\n", flush=True)
     
     # Always exit 0
     sys.exit(0)
