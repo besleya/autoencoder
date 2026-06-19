@@ -17,21 +17,49 @@ import os
 
 # Force CPU and float32
 torch.set_default_dtype(torch.float32)
-device = torch.device("cuda")
+device = torch.device("cpu")
 
 class Autoencoder(nn.Module):
-    def __init__(self, input_dim):
+    def __init__(self, input_dim, deterministic=False):
         super(Autoencoder, self).__init__()
         self.encoder = nn.Sequential(
             nn.Linear(input_dim, 128, bias=True),
             nn.ReLU()
         )
         self.decoder = nn.Linear(128, input_dim, bias=True)
+        if deterministic:
+            self._init_deterministic_weights(input_dim)
+    
+    def _init_deterministic_weights(self, input_dim):
+        """Initialize weights using deterministic formula: ((i*d + j) % 7 - 3) * 0.01."""
+        # Layer 0: Linear(input_dim, 128)
+        layer0 = self.encoder[0]
+        for i in range(128):
+            for j in range(input_dim):
+                val = ((((i * input_dim + j) % 7) - 3) * 0.01)
+                layer0.weight.data[i, j] = val
+        layer0.bias.data.zero_()
+        
+        # Layer: decoder Linear(128, input_dim)
+        for i in range(input_dim):
+            for j in range(128):
+                val = ((((i * 128 + j) % 7) - 3) * 0.01)
+                self.decoder.weight.data[i, j] = val
+        self.decoder.bias.data.zero_()
     
     def forward(self, x):
         encoded = self.encoder(x)
         decoded = self.decoder(encoded)
         return encoded, decoded
+    
+    def training_loss(self, output, target):
+        """Compute loss for backward pass: ||output - target||^2 / (2*B)."""
+        B = output.shape[0]
+        return ((output - target) ** 2).sum() / (2.0 * B)
+    
+    def reporting_mse(self, output, target):
+        """Compute MSE for reporting: matches C++ read_epoch_loss."""
+        return torch.nn.functional.mse_loss(output, target)
 
 def load_input_data(filepath, n_cols=256):
     """
@@ -111,40 +139,6 @@ def log_normalize_columns(X):
     print(f"[Normalize] Applied log-normalization; output shape: {X_norm.shape}, dtype: {X_norm.dtype}", flush=True)
     return X_norm
 
-def build_deterministic_autoencoder(input_dim):
-    """
-    Build nn.Sequential(nn.Linear(input_dim, 128), nn.ReLU(), nn.Linear(128, input_dim)).
-    Override weights using deterministic formula:
-      W[i,j] = ((((i * in_dim + j) % 7) - 3) * 0.01)
-    All biases set to zero.
-    """
-    model = nn.Sequential(
-        nn.Linear(input_dim, 128, bias=True),
-        nn.ReLU(),
-        nn.Linear(128, input_dim, bias=True)
-    )
-    
-    # Layer 0: Linear(input_dim, 128)
-    layer0 = model[0]
-    in_dim0, out_dim0 = input_dim, 128
-    for i in range(out_dim0):
-        for j in range(in_dim0):
-            val = ((((i * in_dim0 + j) % 7) - 3) * 0.01)
-            layer0.weight.data[i, j] = val
-    layer0.bias.data.zero_()
-    
-    # Layer 2: Linear(128, input_dim)
-    layer2 = model[2]
-    in_dim2, out_dim2 = 128, input_dim
-    for i in range(out_dim2):
-        for j in range(in_dim2):
-            val = ((((i * in_dim2 + j) % 7) - 3) * 0.01)
-            layer2.weight.data[i, j] = val
-    layer2.bias.data.zero_()
-    
-    print(f"[Model] Built deterministic autoencoder: {input_dim} -> 128 -> {input_dim}", flush=True)
-    return model.to(device).train()
-
 def train_autoencoder(model, X_norm, n_epochs=3):
     """
     Train autoencoder for n_epochs full-batch updates.
@@ -175,37 +169,33 @@ def train_autoencoder(model, X_norm, n_epochs=3):
     embedding = None
 
     for epoch in range(n_epochs):
-        # Separate forward pass so we can capture the intermediate embedding.
-        # enc_pre: (B, 128) pre-ReLU; enc_post: (B, 128) post-ReLU; output: (B, d0)
-        enc_pre  = model[0](X_torch)
-        enc_post = model[1](enc_pre)   # ReLU bottleneck
-        output   = model[2](enc_post)
+        # Forward pass
+        encoded, output = model(X_torch)
 
         # Loss for backward: matches C++ gradient (a_L - x) / B
-        # d/d(output) [ ||output - X||^2 / (2*B) ] = (output - X) / B
-        loss_for_grad = ((output - X_torch) ** 2).sum() / (2.0 * B)
+        loss_for_grad = model.training_loss(output, X_torch)
 
-        # MSE for comparison: matches C++ read_epoch_loss = ||a-x||^2 / (d0*B)
+        # MSE for comparison: matches C++ read_epoch_loss
         with torch.no_grad():
-            mse = torch.nn.functional.mse_loss(output, X_torch).item()
+            mse = model.reporting_mse(output, X_torch).item()
 
         # Backward pass
         optimizer.zero_grad()
         loss_for_grad.backward()
 
         # Capture gradients BEFORE optimizer.step()
-        grads = [model[0].weight.grad.clone(), model[2].weight.grad.clone()]
+        grads = [model.encoder[0].weight.grad.clone(), model.decoder.weight.grad.clone()]
 
         # Optimizer step
         optimizer.step()
 
         # Capture weights AFTER optimizer.step()
-        weights = [model[0].weight.data.clone(), model[2].weight.data.clone()]
+        weights = [model.encoder[0].weight.data.clone(), model.decoder.weight.data.clone()]
 
         # Capture embedding from the LAST epoch's training forward (before step),
         # matching C++ layer(0)->output() which is also pre-step.
         if epoch == n_epochs - 1:
-            embedding = enc_post.detach().cpu().numpy().T  # (128, n_samples)
+            embedding = encoded.detach().cpu().numpy().T  # (128, n_samples)
 
         epoch_results.append((mse, weights, grads))
         print(f"[Train] Epoch {epoch + 1}/{n_epochs}: MSE = {mse:.8f}")
@@ -277,9 +267,8 @@ def test_forward_pass(model, X_norm):
     # Python: forward pass on initialized (not yet trained) model
     X_torch = torch.from_numpy(X_norm.T).to(device)  # (n_samples, n_genes)
     with torch.no_grad():
-        hidden = model[0](X_torch)  # (n_samples, 128)
-        hidden = model[1](hidden)   # ReLU, still (n_samples, 128)
-        py_embedding = hidden.cpu().numpy().T  # Transpose to (128, n_samples)
+        encoded, _ = model(X_torch)
+        py_embedding = encoded.cpu().numpy().T  # Transpose to (128, n_samples)
     
     # Load C++ embedding
     try:
@@ -533,7 +522,8 @@ def main():
     X_norm = log_normalize_columns(X)
     
     # Build model
-    model = build_deterministic_autoencoder(X_norm.shape[0])
+    model = Autoencoder(X_norm.shape[0], deterministic=True).to(device).train()
+    print(f"[Model] Built deterministic autoencoder: {X_norm.shape[0]} -> 128 -> {X_norm.shape[0]}", flush=True)
     
     # Test 1: Log-normalization (before training)
     test_lognorm(X_norm)
