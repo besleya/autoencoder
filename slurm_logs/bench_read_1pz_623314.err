@@ -1,0 +1,5 @@
+# g++ -O2 -fopenmp -std=c++17 bench_read_1pz.cpp -o bench_read_1pz -lsinglet_pz -I<singlet_include>
+# g++ -O2 -fopenmp -std=c++17 bench_read_1pz.cpp -o bench_read_1pz -lsinglet_pz -I<singlet_include>
+# g++ -O2 -fopenmp -std=c++17 bench_read_1pz.cpp -o bench_read_1pz -lsinglet_pz -I<singlet_include>
+# g++ -O2 -fopenmp -std=c++17 bench_read_1pz.cpp -o bench_read_1pz -lsinglet_pz -I<singlet_include>
+# g++ -O2 -fopenmp -std=c++17 bench_read_1pz.cpp -o bench_read_1pz -lsinglet_pz -I<singlet_include>
