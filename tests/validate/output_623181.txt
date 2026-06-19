@@ -1,0 +1,90 @@
+Starting validation job 623181
+Clearing old files...
+rm -f main.o autoencoder.o data.o main_ae test.o test main_gpu.o gpu_autoencoder.o gpu_data_loader.o main_gpu.dlink.o main_gpu layer.o bench_loader.o bench_loader.dlink.o bench_loader
+rm -f tests/validate/validate.o tests/validate/validate.dlink.o tests/validate/validate
+Building C++ validator...
+/usr/local/cuda/bin/nvcc -O3 -lineinfo -std=c++17 -x cu -dc --gpu-architecture=sm_90 -I/usr/local/cuda/include -I/mnt/home/besleya/singlet/include -I. -c tests/validate/validate.cpp -o tests/validate/validate.o
+/usr/local/cuda/bin/nvcc -O3 -lineinfo -std=c++17 -x cu -rdc=true --gpu-architecture=sm_90 -I/usr/local/cuda/include -I/mnt/home/besleya/singlet/include -c gpu_autoencoder.cu -o gpu_autoencoder.o
+/usr/local/cuda/bin/nvcc -O3 -lineinfo -std=c++17 -x cu -rdc=true --gpu-architecture=sm_90 -I/usr/local/cuda/include -I/mnt/home/besleya/singlet/include -c gpu_data_loader.cu -o gpu_data_loader.o
+/usr/local/cuda/bin/nvcc -O3 -lineinfo -std=c++17 -x cu -rdc=true --gpu-architecture=sm_90 -I/usr/local/cuda/include -I/mnt/home/besleya/singlet/include -c layer.cu -o layer.o
+/usr/local/cuda/bin/nvcc -dlink -o tests/validate/validate.dlink.o tests/validate/validate.o gpu_autoencoder.o gpu_data_loader.o layer.o --gpu-architecture=sm_90
+/opt/rh/gcc-toolset-13/root/bin/g++ -pthread -fopenmp -fopenmp -pthread tests/validate/validate.o gpu_autoencoder.o gpu_data_loader.o tests/validate/validate.dlink.o layer.o -o tests/validate/validate -Wl,--allow-multiple-definition -L/usr/local/cuda/lib64 -lcudart -lcublas -lcusparse -lnvToolsExt -lzstd
+Running C++ validator...
+[validate] GPU: NVIDIA H100 NVL (device_count=1)
+[validate] reading /mnt/home/besleya/quant/GSE260931/GSM8128195/counts.1pz
+[validate] m=115818  n=760  nnz=65009
+[validate] sliced B=256 cols, nnz=20757
+[validate] wrote log-normalized 10 cols to /mnt/home/besleya/autoencoder/tests/validate/validate_lognorm_10cols.csv
+[validate] wrote pre-training embedding to /mnt/home/besleya/autoencoder/tests/validate/validate_embedding_epoch0.csv
+[validate] epoch 1  MSE=0.182224825
+[validate] epoch 2  MSE=0.081529200
+[validate] epoch 3  MSE=0.043269988
+[validate] done. Output written to /mnt/home/besleya/autoencoder/tests/validate/
+C++ validator exited with code: 0
+Running Python comparison...
+[Data] Loaded sparse matrix: 115818 genes × 760 samples (CSC format)
+[Data] Extracted first 256 columns; dense shape: (115818, 256)
+[Normalize] Applied log-normalization; output shape: (115818, 256), dtype: float32
+[Model] Built deterministic autoencoder: 115818 -> 128 -> 115818
+[Train] Input to model: torch.Size([256, 115818]), dtype: torch.float32
+[Train] Epoch 1/3: MSE = 0.18222480
+[Train] Epoch 2/3: MSE = 0.08134536
+[Train] Epoch 3/3: MSE = 0.04308824
+[Train] Captured embedding shape: (128, 256)
+[Cache] Saved to /mnt/home/besleya/autoencoder/tests/validate/.compare_cache.npz
+[Lognorm comparison]
+  max_abs_diff=4.76837158e-07  mean_abs_diff=4.11712466e-13  [PASS]
+  Threshold: max_abs_diff < 1e-5
+
+[Forward pass comparison (epoch 0)]
+  max_abs_diff=9.53674316e-07  mean_abs_diff=3.90164132e-08  [PASS]
+  Threshold: max_abs_diff < 1e-3
+
+[Weights Epoch 1]
+  Layer 0: max_abs_diff=3.34996730e-06  mean_abs_diff=1.27945857e-11  [PASS]  (threshold 1e-3)
+  Layer 1: max_abs_diff=3.53902578e-08  mean_abs_diff=1.02364506e-10  [PASS]  (threshold 1e-3)
+
+[Gradients Epoch 1]
+  Layer 0: max_abs_diff=1.30385160e-08  mean_abs_diff=1.91575419e-11  [PASS]  (threshold 1e-4)
+  Layer 1: max_abs_diff=5.45696821e-12  mean_abs_diff=1.27344560e-13  [PASS]  (threshold 1e-4)
+
+[Weights Epoch 2]
+  Layer 0: max_abs_diff=1.20095909e-04  mean_abs_diff=5.66073695e-08  [PASS]  (threshold 1e-3)
+  Layer 1: max_abs_diff=1.02464226e-04  mean_abs_diff=3.33375556e-06  [PASS]  (threshold 1e-3)
+
+[Gradients Epoch 2]
+  Layer 0: max_abs_diff=5.20567410e-05  mean_abs_diff=1.80827531e-08  [PASS]  (threshold 1e-4)
+  Layer 1: max_abs_diff=3.62506398e-08  mean_abs_diff=3.59293661e-09  [PASS]  (threshold 1e-4)
+
+[Weights Epoch 3]
+  Layer 0: max_abs_diff=6.38533558e-04  mean_abs_diff=1.41439415e-07  [PASS]  (threshold 1e-3)
+  Layer 1: max_abs_diff=1.89911574e-04  mean_abs_diff=9.11606639e-06  [PASS]  (threshold 1e-3)
+
+[Gradients Epoch 3]
+  Layer 0: max_abs_diff=6.77153002e-05  mean_abs_diff=1.85882421e-08  [PASS]  (threshold 1e-4)
+  Layer 1: max_abs_diff=5.60103217e-08  mean_abs_diff=3.52331564e-09  [PASS]  (threshold 1e-4)
+
+[MSE comparison]
+  Epoch 1: PyTorch=0.18222480  C++=0.18222483  abs_diff=2.98e-08  rel_diff=1.63e-07  [PASS]
+  Epoch 2: PyTorch=0.08134536  C++=0.08152920  abs_diff=1.84e-04  rel_diff=2.25e-03  [FAIL]
+  Epoch 3: PyTorch=0.04308824  C++=0.04326999  abs_diff=1.82e-04  rel_diff=4.20e-03  [FAIL]
+
+[Embedding comparison (final)]
+  max_abs_diff=6.75647706e-03  mean_abs_diff=6.09853072e-04  [FAIL]
+  Threshold: max_abs_diff < 1e-3
+
+[Test Summary]
+  PASS  Lognorm
+  PASS  Forward pass (epoch 0)
+  PASS  Weights epoch 1
+  PASS  Gradients epoch 1
+  PASS  Weights epoch 2
+  PASS  Gradients epoch 2
+  PASS  Weights epoch 3
+  PASS  Gradients epoch 3
+  FAIL  Per-epoch MSE
+  FAIL  Final embedding
+------------------------------------------------
+  8 passed, 2 failed (10 total)
+
+Job 623181 finished. See /mnt/home/besleya/autoencoder/tests/validate/output_623181.txt
