@@ -4,6 +4,7 @@
 #include "gpu_autoencoder.h"
 #include "gpu_data_loader.h"
 #include "gpu_timer.h"
+#include "ring.h"
 
 #include <algorithm>
 #include <chrono>
@@ -136,10 +137,11 @@ int main(int argc, char** argv) {
         std::mt19937 rng(opt.seed);
         
         // Create the data loader. RNG is passed by reference; from now on,
-        // begin_epoch() and next_batch() will consume RNG state.
+        // begin_epoch() will consume RNG state for shuffling.
         auto t_loader = std::chrono::steady_clock::now();
         std::cout << "Constructing GPU data loader..." << std::endl;
-        DataLoader loader(opt.files, opt.chunk_size, opt.batch_size, rng);
+        Ring ring(1, 4, AlternationPolicy::SINGLE);
+        DataLoader loader(opt.files, opt.chunk_size, opt.batch_size, rng, &ring, /*lane_id=*/0);
         std::cout << "Data loader construction: " << ms_since(t_loader) << " ms" << std::endl;
         
         // Peek the feature count from the loader
@@ -195,17 +197,18 @@ int main(int argc, char** argv) {
 
             int num_batches = 0;
             SparseBatch batch;
+            int lane, slot;
 
             // Accumulate timing per-epoch
-            double time_next_batch = 0.0;
+            double time_acquire_ready = 0.0;
             double time_forward = 0.0;
             double time_backward = 0.0;
 
             while (true) {
-                nvtxRangePushA("next_batch");
+                nvtxRangePushA("acquire_ready");
                 auto t_batch_load = std::chrono::steady_clock::now();
-                bool has_batch = loader.next_batch(&batch);
-                time_next_batch += ms_since(t_batch_load);
+                bool has_batch = ring.acquire_ready(&batch, &lane, &slot);
+                time_acquire_ready += ms_since(t_batch_load);
                 nvtxRangePop();
                 
                 if (!has_batch) break;
@@ -224,6 +227,7 @@ int main(int argc, char** argv) {
                 net.backward_and_step(batch, opt.lr, trainer_stream);
                 time_backward += ms_since(t_bwd);
                 nvtxRangePop();
+                ring.release_consumed(lane, slot);
                 
                 ++num_batches;
             }
@@ -238,7 +242,7 @@ int main(int argc, char** argv) {
                       << "  batches=" << num_batches
                       << "  mean_recon_loss=" << mean_loss
                       << "  cpu_launch_total=" << epoch_ms << " ms"
-                      << "  [cpu_launch_next_batch=" << time_next_batch << " ms"
+                      << "  [cpu_launch_acquire_ready=" << time_acquire_ready << " ms"
                       << ", cpu_launch_forward=" << time_forward << " ms"
                       << ", cpu_launch_backward=" << time_backward << " ms]"
                       << std::endl;
