@@ -1,0 +1,225 @@
+// SPDX-License-Identifier: MIT
+// ring.h — Ring buffer for multi-lane batch scheduling in sparse GPU DataLoader.
+//
+// A Ring multiplexes multiple data sources ("lanes") via a configurable
+// alternation policy. Each lane has its own producer (e.g., DataLoader's T_BB)
+// and a shared consumer (trainer). Tracks per-lane statistics (trainer stalls,
+// producer stalls) and provides state machine for batch lifecycle.
+
+#pragma once
+
+#include <cuda_runtime.h>
+#include <cstdint>
+#include <memory>
+#include <vector>
+
+// ============================================================================
+// SparseBatch — public contract for one mini-batch
+// ============================================================================
+
+// A single mini-batch: sparse CSC of shape (m × B) resident on device.
+// All pointers are device-resident. The event is signaled after H2D + lognorm
+// are enqueued (GPU signals when complete). Trainer pattern:
+//   SparseBatch b;
+//   int lane, slot;
+//   ring.acquire_ready(&b, &lane, &slot);
+//   cudaStreamWaitEvent(trainer_stream, b.ready_event, 0);
+//   net.forward(b, trainer_stream);
+//   ...training...
+//   ring.release_consumed(lane, slot);
+//
+// Lifetime: pointers and event remain valid until ring_depth-th subsequent
+// acquire_ready() call (default ring_depth=4). Trainer holds at most 1 batch
+// at a time per lane.
+struct SparseBatch {
+    int m;                  // features (rows), same as dataset
+    int B;                  // batch size (cols)
+    int nnz;                // nonzeros in this batch
+    const int32_t* d_col_ptr;   // device, length B+1
+    const int32_t* d_row_idx;   // device, length nnz
+    const float*   d_values;    // device, length nnz
+    cudaEvent_t    ready_event; // signaled after H2D + lognorm; owned by slot
+    bool           eof_after;   // true on the last batch of epoch
+};
+
+// ============================================================================
+// AlternationPolicy — multi-lane scheduling mode
+// ============================================================================
+
+enum class AlternationPolicy {
+    SINGLE,         // exactly one lane (n_lanes must be 1); no scheduling logic
+    ROUND_ROBIN,    // cycle through lanes in order; skip lanes with no READY slot
+    WEIGHTED,       // weighted round-robin based on per-lane weights
+    CALLER_CHOOSES  // trainer explicitly selects a lane via acquire_ready_from
+};
+
+// ============================================================================
+// Ring — multi-lane batch buffer with state management and statistics
+// ============================================================================
+
+class Ring {
+public:
+    // Per-lane statistics. Updated atomically during slot transitions.
+    struct Stats {
+        uint64_t trainer_waits = 0;        // # times trainer blocked in acquire_ready
+        uint64_t trainer_wait_ns_total = 0;  // total nanoseconds trainer spent blocked
+        uint64_t producer_waits = 0;       // # times producer blocked on acquire_free
+        uint64_t producer_wait_ns_total = 0; // total nanoseconds producer spent blocked
+        uint64_t batches_published = 0;    // # batches transitioned to READY
+        uint64_t batches_consumed = 0;     // # batches transitioned to CONSUMED
+    };
+
+    // Constructor. Initializes n_lanes lanes, each with ring_depth slots.
+    // For SINGLE policy, n_lanes must be 1.
+    // Allocates CUDA events and device/host buffers; starts with all slots FREE.
+    Ring(int n_lanes, int ring_depth,
+         AlternationPolicy policy = AlternationPolicy::SINGLE);
+
+    ~Ring();
+
+    // Non-copyable, non-movable.
+    Ring(const Ring&) = delete;
+    Ring& operator=(const Ring&) = delete;
+
+    // ========================================================================
+    // Producer API (called by data loader, e.g., T_BB thread per lane)
+    // ========================================================================
+
+    // Block until a FREE slot is available in `lane`. Returns slot index (0..ring_depth-1).
+    // Updates slot state: FREE → BUILDING. Returns -1 if stopped_ became true while waiting.
+    // Increments producer_waits and producer_wait_ns_total if blocking was necessary.
+    int acquire_free(int lane);
+
+    // Thin view into a slot's buffers for populating during BUILDING state.
+    struct SlotView {
+        // Pinned host buffers — current pointers and capacities.
+        // These are SNAPSHOTS taken at the moment slot_view() was called.
+        // If ensure_capacity() is called and triggers a realloc, the snapshot
+        // becomes stale — the caller MUST call slot_view() again to refresh.
+        int32_t* h_col_ptr;
+        int32_t* h_row_idx;
+        float*   h_values;
+        size_t   h_col_capacity;
+        size_t   h_row_capacity;
+        size_t   h_val_capacity;
+
+        // Device buffers — same snapshot semantics as the host pointers above.
+        int32_t* d_col_ptr;
+        int32_t* d_row_idx;
+        float*   d_values;
+        size_t   d_col_capacity;
+        size_t   d_row_capacity;
+        size_t   d_val_capacity;
+
+        cudaEvent_t ready_event;
+    };
+
+    // Get a mutable view into slot's buffers. Called between acquire_free and
+    // publish_ready by the producer to fill host buffers and prepare enqueuing.
+    // After call, if ensure_capacity was needed, call slot_view again to refresh pointers.
+    SlotView slot_view(int lane, int slot_idx);
+
+    // Grow (or leave unchanged) all pinned and device buffers in this slot to
+    // at least the specified capacities. Reallocates and changes pointers if needed.
+    // NOT thread-safe with other Ring operations on the same slot; the slot must
+    // be in BUILDING state (only the producer for this lane touches it).
+    // Calls cudaFreeHost/cudaMallocHost and cudaFree/cudaMalloc directly.
+    void ensure_capacity(int lane, int slot_idx,
+                         size_t col_ptr_n, size_t row_idx_n, size_t val_n);
+
+    // Mark slot as READY. Updates slot state: BUILDING → READY. T_BB should have
+    // already enqueued H2D transfers and lognorm kernel, and called
+    // cudaEventRecord(slot.ready_event, loader_stream) before calling this.
+    // Parameters B, nnz, eof_after are copied into the slot's metadata.
+    // Notifies all consumer-side waiters in the condition variable.
+    void publish_ready(int lane, int slot_idx, int B, int nnz, bool eof_after);
+
+    // ========================================================================
+    // Consumer API (called by trainer thread)
+    // ========================================================================
+
+    // Block until SOME lane (per policy_) has a READY slot, OR all lanes have
+    // published EOF and their EOF batch has been consumed (end-of-epoch condition).
+    // On success, fills *out with device pointers + event, sets *out_lane to the
+    // lane id, and sets *out_slot to the slot index; returns true.
+    // On epoch end, returns false.
+    // Updates slot state: READY → CONSUMED.
+    // Increments trainer_waits + trainer_wait_ns_total if blocking was needed.
+    bool acquire_ready(SparseBatch* out, int* out_lane, int* out_slot);
+
+    // CALLER_CHOOSES variant: pull only from `lane`. Blocks waiting on that lane
+    // specifically until a READY slot is available OR that lane reaches epoch end.
+    // On success, fills *out and sets *out_slot; returns true.
+    // Returns false if `lane` has no more batches (eof_after was consumed).
+    bool acquire_ready_from(int lane, SparseBatch* out, int* out_slot);
+
+    // Release the slot in `lane` so it can recycle to FREE state.
+    // Updates slot state: CONSUMED → FREE. Notifies producer-side waiters.
+    void release_consumed(int lane, int slot_idx);
+
+    // ========================================================================
+    // Epoch lifecycle
+    // ========================================================================
+
+    // Reset per-lane EOF state. Called at the start of each epoch to clear the
+    // eof_published and eof_consumed flags for `lane`. Allows the lane to
+    // produce and consume a new epoch's batches. Does NOT reset stats.
+    void begin_epoch(int lane);
+
+    // ========================================================================
+    // Statistics and configuration
+    // ========================================================================
+
+    // Get per-lane statistics snapshot.
+    Stats stats(int lane) const;
+
+    // Get total statistics (sum across all lanes).
+    Stats stats_total() const;
+
+    // Reset all per-lane stats to zero. Called optionally between epochs.
+    void reset_stats();
+
+    // Set the weight for `lane` (used by WEIGHTED policy). Default is 1.0.
+    // Weights need not sum to 1; they are normalized internally.
+    // For WEIGHTED policy, you should call this for all lanes before
+    // begin_epoch() so the schedule is correct.
+    void set_weight(int lane, double w);
+
+    // Set the feature count m (number of rows). Called once by the data loader
+    // before publishing the first batch. After set, m() returns this value.
+    void set_m(int m);
+
+    // Get feature count (peeked from first decoded file by data loader).
+    int m() const;
+
+    // Configuration accessors.
+    int n_lanes() const;
+    int ring_depth() const;
+
+    // ========================================================================
+    // Shutdown (for destructor and forced cleanup)
+    // ========================================================================
+
+    // Set stopped_ flag and notify all waiters. All acquire_free and acquire_ready
+    // calls will return failure (-1 or false) after shutdown. Called from destructor.
+    void shutdown();
+
+private:
+    // Internal structures and helpers.
+    struct Lane;  // forward decl for impl
+    struct Slot;
+
+    std::vector<Lane> lanes_;
+    int n_lanes_ = 0;
+    int ring_depth_ = 0;
+    AlternationPolicy policy_;
+    int next_lane_rr_ = 0;  // round-robin state
+    std::vector<int> weighted_schedule_;  // precomputed schedule for WEIGHTED
+    int m_ = 0;
+
+    std::mutex mtx_;
+    std::condition_variable cv_;
+    std::atomic<bool> stopped_{false};
+};
+
+#endif  // RING_H

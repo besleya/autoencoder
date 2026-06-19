@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
-// gpu_data_loader.cu — implementation of async sparse GPU DataLoader.
+// gpu_data_loader.cu — async sparse GPU DataLoader delegating to Ring.
 //
 // Two-thread architecture (T_CL: chunk-loader, T_BB: batch-builder)
-// with ring buffer (depth K, default 4) and chunk queue (depth 1).
-// Implements DESIGN.md specification sections 2–10 and 13.
+// with 2-deep chunk queue. All slot/buffer/event management delegated to Ring.
+// Implements PLAN.md specification.
 
 #include "gpu_data_loader.h"
 
@@ -146,39 +146,6 @@ struct ChunkData {
     int m;
 };
 
-// Ring buffer slot state machine: FREE → BUILDING → READY → CONSUMED → FREE
-enum class SlotState { FREE, BUILDING, READY, CONSUMED };
-
-// A single ring buffer slot.
-struct RingSlot {
-    // Pinned host buffers
-    singlet::gpu::core::PinnedBuffer h_col_ptr_buf;
-    singlet::gpu::core::PinnedBuffer h_row_idx_buf;
-    singlet::gpu::core::PinnedBuffer h_values_buf;
-
-    int32_t* h_col_ptr = nullptr;
-    int32_t* h_row_idx = nullptr;
-    float*   h_values  = nullptr;
-    size_t   h_col_capacity = 0;   // in int32_t (for col_ptr[B+1])
-    size_t   h_row_capacity = 0;   // in int32_t
-    size_t   h_val_capacity = 0;   // in float
-
-    // Device buffers
-    singlet::gpu::core::DeviceMemory<int32_t> d_col_ptr;
-    singlet::gpu::core::DeviceMemory<int32_t> d_row_idx;
-    singlet::gpu::core::DeviceMemory<float>   d_values;
-
-    // Event (created at construction, reused)
-    cudaEvent_t ready_event = nullptr;
-
-    // Current batch metadata
-    int B = 0;           // batch size (columns)
-    int nnz = 0;         // nonzeros
-    bool eof_after = false;
-
-    SlotState state = SlotState::FREE;
-};
-
 // ============================================================================
 // DataLoader::Impl — the pimpl struct holding all internal state
 // ============================================================================
@@ -190,9 +157,11 @@ struct DataLoader::Impl {
     int batch_size = 0;
     std::mt19937& rng;
     ConcatPolicy policy = ConcatPolicy::CONCAT_HOST;
-    int ring_depth = 4;
-    int n_concurrent_loaders = 1;
-    int omp_threads = 1;
+    int omp_threads = 16;
+
+    // External Ring and lane
+    Ring* ring = nullptr;
+    int lane_id_ = -1;
 
     // Explicit constructor to initialize the reference member
     explicit Impl(std::mt19937& r) : rng(r) {}
@@ -203,30 +172,19 @@ struct DataLoader::Impl {
     // CUDA stream (non-blocking, default priority)
     cudaStream_t loader_stream = nullptr;
 
-    // Ring buffer
-    std::vector<RingSlot> ring;
-    std::mutex ring_mtx;
-    std::condition_variable ring_cv;
-    int free_count = 0;      // number of FREE slots
-    int ready_count = 0;     // number of READY slots
-    std::deque<int> consumed_slots;  // recently consumed slot indices (for delayed recycling)
-
-    // Chunk queue (depth 1)
+    // Chunk queue (2-deep: max size 2 to overlap decode with training)
     std::mutex chunk_mtx;
     std::condition_variable chunk_cv;
-    std::mutex chunk_consumed_mtx;
-    std::condition_variable chunk_consumed_cv;
-    std::unique_ptr<ChunkData> chunk_data;
-    bool chunk_full = false;      // true if chunk_data is populated
-    bool chunk_consumed = false;  // signaled by T_BB after last column of chunk
+    std::deque<std::unique_ptr<ChunkData>> chunk_queue;
+    static constexpr size_t kChunkQueueMaxSize = 2;
 
     // Epoch state
     std::vector<std::string> epoch_order;
     size_t chunk_cursor = 0;  // which chunk we're loading next
     uint64_t chunk_sub_seed = 0;
     bool epoch_started = false;
-    bool last_chunk_flag = false;
-    bool epoch_eof = false;  // set by T_BB after last batch of last chunk
+    bool last_chunk_pushed = false;
+    bool epoch_eof = false;
 
     // Worker threads
     std::thread t_cl;
@@ -237,21 +195,12 @@ struct DataLoader::Impl {
     ~Impl() {
         stop = true;
         chunk_cv.notify_all();
-        ring_cv.notify_all();
-        chunk_consumed_cv.notify_all();
         if (t_cl.joinable()) t_cl.join();
         if (t_bb.joinable()) t_bb.join();
 
         // Cleanup CUDA stream
         if (loader_stream) {
             CUDA_CHECK_SILENT(cudaStreamDestroy(loader_stream));
-        }
-
-        // Cleanup ring slots
-        for (auto& slot : ring) {
-            if (slot.ready_event) {
-                CUDA_CHECK_SILENT(cudaEventDestroy(slot.ready_event));
-            }
         }
     }
 };
@@ -261,32 +210,40 @@ struct DataLoader::Impl {
 // ============================================================================
 
 // T_CL: Chunk loader thread
+// Decodes files in parallel (OpenMP) and pushes decoded chunks to queue (2-deep).
 static void chunk_loader_thread(DataLoader::Impl* impl) {
     try {
         while (!impl->stop) {
-            // Wait for epoch to start or stop signal
+            // Wait for epoch to start AND queue has space
             size_t chunk_start;
             size_t chunk_end;
             bool is_last_chunk;
             {
                 std::unique_lock<std::mutex> lock(impl->chunk_mtx);
                 impl->chunk_cv.wait(lock, [impl]() {
-                    return (impl->epoch_started && !impl->chunk_full) || impl->last_chunk_flag || impl->stop;
+                    return (impl->epoch_started && impl->chunk_queue.size() < impl->kChunkQueueMaxSize) ||
+                           impl->stop;
                 });
                 if (impl->stop) break;
-                if (impl->last_chunk_flag && impl->chunk_full) {
-                    // Wait for chunk to be consumed
-                    continue;
-                }
 
-                // Determine which chunk to load
+                // Check if there are files to load
                 chunk_start = impl->chunk_cursor;
                 if (chunk_start >= impl->epoch_order.size()) {
-                    impl->last_chunk_flag = true;
+                    // No more files; if we haven't pushed sentinel yet, do so
+                    if (!impl->last_chunk_pushed) {
+                        impl->last_chunk_pushed = true;
+                        // Signal T_BB that no more chunks are coming
+                        impl->chunk_cv.notify_all();
+                    }
+                    // Wait for next epoch
+                    std::unique_lock<std::mutex> lock2(impl->chunk_mtx);
+                    impl->chunk_cv.wait(lock2, [impl]() {
+                        return !impl->epoch_started || impl->stop;
+                    });
                     continue;
                 }
 
-                chunk_end = std::min(chunk_start + (size_t)impl->chunk_size, 
+                chunk_end = std::min(chunk_start + (size_t)impl->chunk_size,
                                      impl->epoch_order.size());
                 is_last_chunk = (chunk_end >= impl->epoch_order.size());
             }
@@ -408,25 +365,15 @@ static void chunk_loader_thread(DataLoader::Impl* impl) {
                 chunk_data_ptr->n_cols = total_cols;
             }
 
-            // Push to chunk queue and wait for T_BB to consume
+            // Push to chunk queue
             {
                 std::unique_lock<std::mutex> lock(impl->chunk_mtx);
-                impl->chunk_data = std::move(chunk_data_ptr);
-                impl->chunk_full = true;
-                if (is_last_chunk) {
-                    impl->last_chunk_flag = true;
-                }
+                impl->chunk_queue.push_back(std::move(chunk_data_ptr));
                 impl->chunk_cursor = chunk_end;
+                if (is_last_chunk) {
+                    impl->last_chunk_pushed = true;
+                }
                 impl->chunk_cv.notify_all();
-            }
-
-            // Wait for T_BB to signal chunk consumed (after last column copied)
-            {
-                std::unique_lock<std::mutex> lock(impl->chunk_consumed_mtx);
-                impl->chunk_consumed_cv.wait(lock, [impl]() {
-                    return impl->chunk_consumed || impl->stop;
-                });
-                impl->chunk_consumed = false;
             }
         }
     } catch (const std::exception& e) {
@@ -436,23 +383,39 @@ static void chunk_loader_thread(DataLoader::Impl* impl) {
 }
 
 // T_BB: Batch builder thread
+// Pops chunks from queue, builds batches, publishes to Ring.
 static void batch_builder_thread(DataLoader::Impl* impl) {
     try {
         while (!impl->stop) {
-            // Wait for chunk to be ready
+            // Wait for a chunk from queue
             std::unique_ptr<ChunkData> chunk;
+            bool is_last_chunk = false;
             {
                 std::unique_lock<std::mutex> lock(impl->chunk_mtx);
                 impl->chunk_cv.wait(lock, [impl]() {
-                    return impl->chunk_full || impl->stop;
+                    return !impl->chunk_queue.empty() || (impl->last_chunk_pushed && impl->chunk_queue.empty()) || impl->stop;
                 });
                 if (impl->stop) break;
-                if (!impl->chunk_data) continue;
 
-                chunk = std::move(impl->chunk_data);
-                impl->chunk_full = false;
+                // If queue is empty AND we've pushed the last chunk, we're done with this epoch
+                if (impl->chunk_queue.empty()) {
+                    if (impl->last_chunk_pushed) {
+                        // Epoch complete; wait for next begin_epoch
+                        impl->epoch_eof = true;
+                        continue;
+                    }
+                    continue;
+                }
+
+                chunk = std::move(impl->chunk_queue.front());
+                impl->chunk_queue.pop_front();
+                is_last_chunk = impl->last_chunk_pushed && impl->chunk_queue.empty();
+
+                // Notify T_CL that queue has space now
                 impl->chunk_cv.notify_all();
             }
+
+            if (!chunk) continue;
 
             // Generate column permutation for this chunk
             std::mt19937 chunk_rng(impl->chunk_sub_seed);
@@ -476,38 +439,21 @@ static void batch_builder_thread(DataLoader::Impl* impl) {
 
             // Build batches from this chunk
             int col_idx = 0;
-            bool is_last_chunk = impl->last_chunk_flag;
-
             while (col_idx < chunk->n_cols) {
                 // Check if this batch would be too small (drop tail)
                 if (col_idx + impl->batch_size > chunk->n_cols) {
                     break;
                 }
 
-                // Acquire a FREE slot
-                int slot_idx;
-                {
-                    std::unique_lock<std::mutex> lock(impl->ring_mtx);
-                    impl->ring_cv.wait(lock, [impl]() {
-                        return impl->free_count > 0 || impl->stop;
-                    });
-                    if (impl->stop) break;
-
-                    // Find a FREE slot
-                    slot_idx = -1;
-                    for (int i = 0; i < impl->ring_depth; ++i) {
-                        if (impl->ring[i].state == SlotState::FREE) {
-                            slot_idx = i;
-                            break;
-                        }
-                    }
-                    if (slot_idx < 0) continue;
-
-                    impl->ring[slot_idx].state = SlotState::BUILDING;
-                    --impl->free_count;
+                // Acquire a FREE slot from Ring
+                int slot_idx = impl->ring->acquire_free(impl->lane_id_);
+                if (slot_idx < 0) {
+                    // Ring is shutting down
+                    return;
                 }
 
-                auto& slot = impl->ring[slot_idx];
+                // Get slot view for filling
+                Ring::SlotView slot_view = impl->ring->slot_view(impl->lane_id_, slot_idx);
                 int B = impl->batch_size;
 
                 // Compute nnz for this batch and gather column data
@@ -524,40 +470,27 @@ static void batch_builder_thread(DataLoader::Impl* impl) {
                         batch_col_ptr[b + 1] = batch_nnz;
                     }
 
-                    // Grow pinned + device buffers if needed
-                    if (batch_col_ptr[B] > (int)slot.h_row_capacity) {
-                        slot.h_col_ptr_buf = singlet::gpu::core::PinnedPool::acquire(
-                            (B + 1) * sizeof(int32_t));
-                        slot.h_row_idx_buf = singlet::gpu::core::PinnedPool::acquire(
-                            batch_col_ptr[B] * sizeof(int32_t));
-                        slot.h_values_buf = singlet::gpu::core::PinnedPool::acquire(
-                            batch_col_ptr[B] * sizeof(float));
+                    // Ensure capacity (grow if needed)
+                    impl->ring->ensure_capacity(impl->lane_id_, slot_idx,
+                                                B + 1, batch_nnz, batch_nnz);
 
-                        slot.h_col_ptr = slot.h_col_ptr_buf.as<int32_t>();
-                        slot.h_row_idx = slot.h_row_idx_buf.as<int32_t>();
-                        slot.h_values = slot.h_values_buf.as<float>();
+                    // Refresh pointers after potential reallocation
+                    slot_view = impl->ring->slot_view(impl->lane_id_, slot_idx);
 
-                        slot.h_col_capacity = B + 1;
-                        slot.h_row_capacity = batch_col_ptr[B];
-                        slot.h_val_capacity = batch_col_ptr[B];
+                    // Copy column pointers
+                    std::memcpy(slot_view.h_col_ptr, batch_col_ptr.data(), (B + 1) * sizeof(int32_t));
 
-                        slot.d_col_ptr = singlet::gpu::core::DeviceMemory<int32_t>(B + 1);
-                        slot.d_row_idx = singlet::gpu::core::DeviceMemory<int32_t>(batch_col_ptr[B]);
-                        slot.d_values = singlet::gpu::core::DeviceMemory<float>(batch_col_ptr[B]);
-                    }
-
-                    // Sequential copy of column data
-                    std::memcpy(slot.h_col_ptr, batch_col_ptr.data(), (B + 1) * sizeof(int32_t));
+                    // Copy row indices and values
                     int offset = 0;
                     for (int b = 0; b < B; ++b) {
                         int global_col = col_perm[col_idx + b];
                         int start = chunk->concat.col_ptr[global_col];
                         int end = chunk->concat.col_ptr[global_col + 1];
                         int col_nnz = end - start;
-                        std::memcpy(slot.h_row_idx + offset,
+                        std::memcpy(slot_view.h_row_idx + offset,
                                     chunk->concat.row_idx.data() + start,
                                     col_nnz * sizeof(int32_t));
-                        std::memcpy(slot.h_values + offset,
+                        std::memcpy(slot_view.h_values + offset,
                                     chunk->concat.values.data() + start,
                                     col_nnz * sizeof(float));
                         offset += col_nnz;
@@ -576,30 +509,17 @@ static void batch_builder_thread(DataLoader::Impl* impl) {
                         batch_col_ptr[b + 1] = batch_nnz;
                     }
 
-                    // Check and allocate buffers once (before second pass)
-                    if (batch_col_ptr[B] > (int)slot.h_row_capacity) {
-                        slot.h_col_ptr_buf = singlet::gpu::core::PinnedPool::acquire(
-                            (B + 1) * sizeof(int32_t));
-                        slot.h_row_idx_buf = singlet::gpu::core::PinnedPool::acquire(
-                            batch_col_ptr[B] * sizeof(int32_t));
-                        slot.h_values_buf = singlet::gpu::core::PinnedPool::acquire(
-                            batch_col_ptr[B] * sizeof(float));
+                    // Ensure capacity (grow if needed)
+                    impl->ring->ensure_capacity(impl->lane_id_, slot_idx,
+                                                B + 1, batch_nnz, batch_nnz);
 
-                        slot.h_col_ptr = slot.h_col_ptr_buf.as<int32_t>();
-                        slot.h_row_idx = slot.h_row_idx_buf.as<int32_t>();
-                        slot.h_values = slot.h_values_buf.as<float>();
+                    // Refresh pointers after potential reallocation
+                    slot_view = impl->ring->slot_view(impl->lane_id_, slot_idx);
 
-                        slot.h_col_capacity = B + 1;
-                        slot.h_row_capacity = batch_col_ptr[B];
-                        slot.h_val_capacity = batch_col_ptr[B];
-
-                        slot.d_col_ptr = singlet::gpu::core::DeviceMemory<int32_t>(B + 1);
-                        slot.d_row_idx = singlet::gpu::core::DeviceMemory<int32_t>(batch_col_ptr[B]);
-                        slot.d_values = singlet::gpu::core::DeviceMemory<float>(batch_col_ptr[B]);
-                    }
+                    // Copy column pointers
+                    std::memcpy(slot_view.h_col_ptr, batch_col_ptr.data(), (B + 1) * sizeof(int32_t));
 
                     // Second pass: memcpy data
-                    std::memcpy(slot.h_col_ptr, batch_col_ptr.data(), (B + 1) * sizeof(int32_t));
                     int offset = 0;
                     for (int b = 0; b < B; ++b) {
                         auto [fi, ci] = chunk->column_permutation[col_idx + b];
@@ -608,9 +528,9 @@ static void batch_builder_thread(DataLoader::Impl* impl) {
                         int end = file.col_ptr[ci + 1];
                         int col_nnz = end - start;
 
-                        std::memcpy(slot.h_row_idx + offset, file.row_idx.data() + start,
+                        std::memcpy(slot_view.h_row_idx + offset, file.row_idx.data() + start,
                                     col_nnz * sizeof(int32_t));
-                        std::memcpy(slot.h_values + offset, file.values.data() + start,
+                        std::memcpy(slot_view.h_values + offset, file.values.data() + start,
                                     col_nnz * sizeof(float));
                         offset += col_nnz;
                     }
@@ -619,48 +539,29 @@ static void batch_builder_thread(DataLoader::Impl* impl) {
                 col_idx += B;
 
                 // Issue H2D transfers
-                CUDA_CHECK(cudaMemcpyAsync(slot.d_col_ptr.get(), slot.h_col_ptr,
+                CUDA_CHECK(cudaMemcpyAsync(slot_view.d_col_ptr, slot_view.h_col_ptr,
                                           (B + 1) * sizeof(int32_t),
                                           cudaMemcpyHostToDevice, impl->loader_stream));
-                CUDA_CHECK(cudaMemcpyAsync(slot.d_row_idx.get(), slot.h_row_idx,
+                CUDA_CHECK(cudaMemcpyAsync(slot_view.d_row_idx, slot_view.h_row_idx,
                                           batch_nnz * sizeof(int32_t),
                                           cudaMemcpyHostToDevice, impl->loader_stream));
-                CUDA_CHECK(cudaMemcpyAsync(slot.d_values.get(), slot.h_values,
+                CUDA_CHECK(cudaMemcpyAsync(slot_view.d_values, slot_view.h_values,
                                           batch_nnz * sizeof(float),
                                           cudaMemcpyHostToDevice, impl->loader_stream));
 
-                // Launch lognorm kernel (via standalone helper so validate.cpp uses same path)
+                // Launch lognorm kernel
                 log_normalize_csc_columns(B, kSparseLogNormScaler,
-                                          slot.d_col_ptr.get(), slot.d_values.get(),
+                                          slot_view.d_col_ptr, slot_view.d_values,
                                           impl->loader_stream);
 
-                // Record event
-                CUDA_CHECK(cudaEventRecord(slot.ready_event, impl->loader_stream));
+                // Record event on loader stream
+                CUDA_CHECK(cudaEventRecord(slot_view.ready_event, impl->loader_stream));
 
-                // Mark slot READY
-                {
-                    std::lock_guard<std::mutex> lock(impl->ring_mtx);
-                    slot.B = B;
-                    slot.nnz = batch_nnz;
-                    slot.eof_after = (col_idx >= chunk->n_cols) && is_last_chunk;
-                    slot.state = SlotState::READY;
-                    ++impl->ready_count;
-                    impl->ring_cv.notify_all();
-                }
-            }
+                // Determine if this is the last batch of the epoch
+                bool eof_after = (col_idx >= chunk->n_cols) && is_last_chunk;
 
-            // Signal T_CL that this chunk is consumed even if no full batch was built.
-            {
-                std::lock_guard<std::mutex> lock(impl->chunk_consumed_mtx);
-                impl->chunk_consumed = true;
-                impl->chunk_consumed_cv.notify_all();
-            }
-
-            // Signal EOF if this was the last chunk
-            if (is_last_chunk) {
-                std::lock_guard<std::mutex> lock(impl->ring_mtx);
-                impl->epoch_eof = true;
-                impl->ring_cv.notify_all();
+                // Publish to Ring
+                impl->ring->publish_ready(impl->lane_id_, slot_idx, B, batch_nnz, eof_after);
             }
         }
     } catch (const std::exception& e) {
@@ -674,18 +575,21 @@ static void batch_builder_thread(DataLoader::Impl* impl) {
 // ============================================================================
 
 DataLoader::DataLoader(const std::vector<std::string>& paths,
-                       int chunk_size, int batch_size,
+                       int chunk_size,
+                       int batch_size,
                        std::mt19937& rng,
+                       Ring* ring,
+                       int lane_id,
                        ConcatPolicy policy,
-                       int ring_depth,
-                       int n_concurrent_loaders)
+                       int omp_threads)
     : impl_(std::make_unique<Impl>(rng)) {
     impl_->file_paths = paths;
     impl_->chunk_size = chunk_size;
     impl_->batch_size = batch_size;
     impl_->policy = policy;
-    impl_->ring_depth = ring_depth;
-    impl_->n_concurrent_loaders = n_concurrent_loaders;
+    impl_->ring = ring;
+    impl_->lane_id_ = lane_id;
+    impl_->omp_threads = (omp_threads > 0) ? omp_threads : 16;
 
     // Validate arguments
     if (paths.empty()) {
@@ -697,15 +601,12 @@ DataLoader::DataLoader(const std::vector<std::string>& paths,
     if (batch_size <= 0) {
         throw std::runtime_error("DataLoader: batch_size must be > 0");
     }
-    if (ring_depth <= 0) {
-        throw std::runtime_error("DataLoader: ring_depth must be > 0");
+    if (ring == nullptr) {
+        throw std::runtime_error("DataLoader: ring must not be null");
     }
-    if (n_concurrent_loaders <= 0) {
-        throw std::runtime_error("DataLoader: n_concurrent_loaders must be > 0");
+    if (lane_id < 0 || lane_id >= ring->n_lanes()) {
+        throw std::runtime_error("DataLoader: lane_id out of range");
     }
-
-    // Compute OMP thread budget
-    impl_->omp_threads = std::max(1, omp_get_max_threads() / n_concurrent_loaders);
 
     // Peek m from first file
     try {
@@ -716,18 +617,11 @@ DataLoader::DataLoader(const std::vector<std::string>& paths,
         std::terminate();
     }
 
+    // Tell Ring the feature count
+    ring->set_m(impl_->m);
+
     // Create non-blocking stream at default priority
     CUDA_CHECK(cudaStreamCreateWithFlags(&impl_->loader_stream, cudaStreamNonBlocking));
-
-    // Initialize ring buffer
-    impl_->ring.resize(ring_depth);
-    impl_->free_count = ring_depth;
-    impl_->ready_count = 0;
-
-    for (int i = 0; i < ring_depth; ++i) {
-        CUDA_CHECK(cudaEventCreateWithFlags(&impl_->ring[i].ready_event,
-                                            cudaEventDisableTiming));
-    }
 
     // Spawn worker threads
     impl_->t_cl = std::thread(chunk_loader_thread, impl_.get());
@@ -748,85 +642,22 @@ void DataLoader::begin_epoch() {
 
     // Reset state
     {
-        std::lock_guard<std::mutex> lock(impl_->ring_mtx);
-        impl_->free_count = impl_->ring_depth;
-        impl_->ready_count = 0;
-        for (auto& slot : impl_->ring) {
-            slot.state = SlotState::FREE;
-        }
-        impl_->consumed_slots.clear();
-        impl_->epoch_eof = false;
-    }
-
-    // Reset chunk state
-    {
         std::lock_guard<std::mutex> lock(impl_->chunk_mtx);
         impl_->chunk_cursor = 0;
-        impl_->last_chunk_flag = false;
+        impl_->last_chunk_pushed = false;
+        impl_->epoch_eof = false;
+        impl_->chunk_queue.clear();
     }
 
-    // Signal T_CL to start
+    // Call Ring to reset this lane's epoch state
+    impl_->ring->begin_epoch(impl_->lane_id_);
+
+    // Signal workers that epoch is starting
     {
         std::lock_guard<std::mutex> lock(impl_->chunk_mtx);
         impl_->epoch_started = true;
         impl_->chunk_cv.notify_all();
     }
-}
-
-bool DataLoader::next_batch(SparseBatch* out) {
-    std::unique_lock<std::mutex> lock(impl_->ring_mtx);
-
-    // Wait for a READY slot or EOF
-    impl_->ring_cv.wait(lock, [this]() {
-        return impl_->ready_count > 0 || impl_->epoch_eof;
-    });
-
-    // Check if we have a ready batch
-    if (impl_->ready_count == 0) {
-        // Epoch exhausted
-        return false;
-    }
-
-    // Find the first READY slot (FIFO order)
-    int slot_idx = -1;
-    for (int i = 0; i < impl_->ring_depth; ++i) {
-        if (impl_->ring[i].state == SlotState::READY) {
-            slot_idx = i;
-            break;
-        }
-    }
-
-    if (slot_idx < 0) {
-        return false;
-    }
-
-    auto& slot = impl_->ring[slot_idx];
-
-    // Fill output
-    out->m = impl_->m;
-    out->B = slot.B;
-    out->nnz = slot.nnz;
-    out->d_col_ptr = slot.d_col_ptr.get();
-    out->d_row_idx = slot.d_row_idx.get();
-    out->d_values = slot.d_values.get();
-    out->ready_event = slot.ready_event;
-    out->eof_after = slot.eof_after;
-
-    // Mark slot CONSUMED
-    slot.state = SlotState::CONSUMED;
-    --impl_->ready_count;
-    impl_->consumed_slots.push_back(slot_idx);
-
-    // Recycle old slots if we've consumed K batches
-    while ((int)impl_->consumed_slots.size() >= impl_->ring_depth) {
-        int old_slot = impl_->consumed_slots.front();
-        impl_->consumed_slots.pop_front();
-        impl_->ring[old_slot].state = SlotState::FREE;
-        ++impl_->free_count;
-    }
-
-    impl_->ring_cv.notify_all();
-    return true;
 }
 
 int DataLoader::m() const {
@@ -835,6 +666,10 @@ int DataLoader::m() const {
 
 cudaStream_t DataLoader::loader_stream() const {
     return impl_->loader_stream;
+}
+
+int DataLoader::lane_id() const {
+    return impl_->lane_id_;
 }
 
 // ---------------------------------------------------------------------------

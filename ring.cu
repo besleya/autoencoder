@@ -1,0 +1,657 @@
+// SPDX-License-Identifier: MIT
+// ring.cu — implementation of Ring buffer for multi-lane batch scheduling.
+
+#include "ring.h"
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <numeric>
+#include <sstream>
+#include <stdexcept>
+
+// ============================================================================
+// CUDA error checking
+// ============================================================================
+
+#define CUDA_CHECK(call) do { \
+    cudaError_t err = (call); \
+    if (err != cudaSuccess) { \
+        std::ostringstream oss; \
+        oss << "CUDA error at " << __FILE__ << ":" << __LINE__ << ": " \
+            << cudaGetErrorString(err); \
+        throw std::runtime_error(oss.str()); \
+    } \
+} while (0)
+
+// ============================================================================
+// Internal structures: Slot and Lane
+// ============================================================================
+
+namespace {
+
+// A single slot in the ring buffer.
+struct Slot {
+    // Pinned host buffers
+    int32_t* h_col_ptr = nullptr;
+    int32_t* h_row_idx = nullptr;
+    float*   h_values  = nullptr;
+    size_t   h_col_capacity = 0;   // in int32_t
+    size_t   h_row_capacity = 0;
+    size_t   h_val_capacity = 0;
+
+    // Device buffers
+    int32_t* d_col_ptr = nullptr;
+    int32_t* d_row_idx = nullptr;
+    float*   d_values  = nullptr;
+    size_t   d_col_capacity = 0;
+    size_t   d_row_capacity = 0;
+    size_t   d_val_capacity = 0;
+
+    // Event (created at construction)
+    cudaEvent_t ready_event = nullptr;
+
+    // Current batch metadata
+    int B = 0;
+    int nnz = 0;
+    bool eof_after = false;
+
+    // State machine: FREE, BUILDING, READY, CONSUMED, FREE, ...
+    enum class State { FREE, BUILDING, READY, CONSUMED };
+    State state = State::FREE;
+
+    // Cleanup
+    void destroy() {
+        if (h_col_ptr) { cudaFreeHost(h_col_ptr); h_col_ptr = nullptr; }
+        if (h_row_idx) { cudaFreeHost(h_row_idx); h_row_idx = nullptr; }
+        if (h_values) { cudaFreeHost(h_values); h_values = nullptr; }
+        if (d_col_ptr) { cudaFree(d_col_ptr); d_col_ptr = nullptr; }
+        if (d_row_idx) { cudaFree(d_row_idx); d_row_idx = nullptr; }
+        if (d_values) { cudaFree(d_values); d_values = nullptr; }
+        if (ready_event) { cudaEventDestroy(ready_event); ready_event = nullptr; }
+    }
+};
+
+// Per-lane state.
+struct Lane {
+    std::vector<Slot> slots;
+    int free_count = 0;
+    int ready_count = 0;
+
+    // EOF handling
+    bool eof_published = false;    // producer has sent a batch with eof_after=true
+    bool eof_consumed = false;     // trainer has consumed the eof_after=true batch
+
+    // Weight for WEIGHTED policy
+    double weight = 1.0;
+
+    // Statistics
+    Ring::Stats stats;
+};
+
+}  // anonymous namespace
+
+// ============================================================================
+// Ring implementation
+// ============================================================================
+
+Ring::Ring(int n_lanes, int ring_depth, AlternationPolicy policy)
+    : n_lanes_(n_lanes), ring_depth_(ring_depth), policy_(policy) {
+    if (n_lanes <= 0 || ring_depth <= 0) {
+        throw std::runtime_error("Ring: n_lanes and ring_depth must be > 0");
+    }
+    if (policy == AlternationPolicy::SINGLE && n_lanes != 1) {
+        throw std::runtime_error("Ring: SINGLE policy requires n_lanes == 1");
+    }
+
+    // Initialize lanes
+    lanes_.resize(n_lanes);
+    for (int i = 0; i < n_lanes; ++i) {
+        lanes_[i].slots.resize(ring_depth);
+        lanes_[i].free_count = ring_depth;
+        lanes_[i].ready_count = 0;
+
+        // Create CUDA events for each slot
+        for (int j = 0; j < ring_depth; ++j) {
+            CUDA_CHECK(cudaEventCreate(&lanes_[i].slots[j].ready_event,
+                                       cudaEventDisableTiming));
+        }
+    }
+
+    // Precompute weighted schedule if needed
+    if (policy == AlternationPolicy::WEIGHTED) {
+        rebuild_weighted_schedule_impl(weighted_schedule_, lanes_);
+    }
+}
+
+Ring::~Ring() {
+    shutdown();
+    for (int i = 0; i < n_lanes_; ++i) {
+        for (int j = 0; j < ring_depth_; ++j) {
+            lanes_[i].slots[j].destroy();
+        }
+    }
+}
+
+// Rebuild the weighted schedule (called by constructor and set_weight).
+// For simplicity, creates a schedule of at most 64 repeats.
+namespace {
+void rebuild_weighted_schedule_impl(std::vector<int>& schedule,
+                                     const std::vector<Lane>& lanes) {
+    schedule.clear();
+    if (lanes.empty()) return;
+
+    // Find LCM of n_lanes and limit schedule size
+    std::vector<double> weights;
+    for (const auto& lane : lanes) {
+        weights.push_back(lane.weight);
+    }
+
+    // Normalize weights to integers for scheduling
+    double min_w = *std::min_element(weights.begin(), weights.end());
+    if (min_w <= 0.0) min_w = 1.0;
+
+    std::vector<int> int_weights;
+    for (double w : weights) {
+        int_weights.push_back(std::max(1, static_cast<int>(std::round(w / min_w))));
+    }
+
+    int total = std::accumulate(int_weights.begin(), int_weights.end(), 0);
+    total = std::min(total, 64);  // cap schedule size
+
+    // Build simple round-robin schedule with weight repetition
+    for (int repeat = 0; repeat < total; ++repeat) {
+        int lane_id = repeat % lanes.size();
+        schedule.push_back(lane_id);
+    }
+}
+}  // anonymous namespace
+
+int Ring::acquire_free(int lane) {
+    if (lane < 0 || lane >= n_lanes_) {
+        throw std::runtime_error("Ring::acquire_free: invalid lane");
+    }
+
+    std::unique_lock<std::mutex> lock(mtx_);
+
+    // Define the wait predicate
+    auto predicate = [this, lane] {
+        return lanes_[lane].free_count > 0 || stopped_;
+    };
+
+    // Check if we need to wait
+    bool was_ready = predicate();
+    auto t_start = std::chrono::steady_clock::now();
+
+    if (!was_ready) {
+        cv_.wait(lock, predicate);
+    }
+
+    auto t_end = std::chrono::steady_clock::now();
+
+    if (stopped_) return -1;
+
+    // Find the first FREE slot
+    int slot_idx = -1;
+    for (int i = 0; i < ring_depth_; ++i) {
+        if (lanes_[lane].slots[i].state == Slot::State::FREE) {
+            slot_idx = i;
+            break;
+        }
+    }
+
+    if (slot_idx == -1) {
+        throw std::runtime_error("Ring::acquire_free: no FREE slot found (logic error)");
+    }
+
+    // Transition to BUILDING
+    lanes_[lane].slots[slot_idx].state = Slot::State::BUILDING;
+    lanes_[lane].free_count--;
+
+    // Update stats only if we actually waited
+    if (!was_ready) {
+        auto elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            t_end - t_start).count();
+        lanes_[lane].stats.producer_waits++;
+        lanes_[lane].stats.producer_wait_ns_total += elapsed_ns;
+    }
+
+    return slot_idx;
+}
+
+Ring::SlotView Ring::slot_view(int lane, int slot_idx) {
+    if (lane < 0 || lane >= n_lanes_ || slot_idx < 0 || slot_idx >= ring_depth_) {
+        throw std::runtime_error("Ring::slot_view: invalid lane or slot_idx");
+    }
+
+    Slot& slot = lanes_[lane].slots[slot_idx];
+
+    return SlotView{
+        .h_col_ptr = slot.h_col_ptr,
+        .h_row_idx = slot.h_row_idx,
+        .h_values = slot.h_values,
+        .h_col_capacity = slot.h_col_capacity,
+        .h_row_capacity = slot.h_row_capacity,
+        .h_val_capacity = slot.h_val_capacity,
+        .d_col_ptr = slot.d_col_ptr,
+        .d_row_idx = slot.d_row_idx,
+        .d_values = slot.d_values,
+        .d_col_capacity = slot.d_col_capacity,
+        .d_row_capacity = slot.d_row_capacity,
+        .d_val_capacity = slot.d_val_capacity,
+        .ready_event = slot.ready_event,
+    };
+}
+
+void Ring::ensure_capacity(int lane, int slot_idx,
+                           size_t col_ptr_n, size_t row_idx_n, size_t val_n) {
+    if (lane < 0 || lane >= n_lanes_ || slot_idx < 0 || slot_idx >= ring_depth_) {
+        throw std::runtime_error("Ring::ensure_capacity: invalid lane or slot_idx");
+    }
+
+    Slot& slot = lanes_[lane].slots[slot_idx];
+
+    // Pinned host buffer: col_ptr
+    if (col_ptr_n > slot.h_col_capacity) {
+        if (slot.h_col_ptr) CUDA_CHECK(cudaFreeHost(slot.h_col_ptr));
+        CUDA_CHECK(cudaMallocHost(&slot.h_col_ptr, col_ptr_n * sizeof(int32_t)));
+        slot.h_col_capacity = col_ptr_n;
+    }
+
+    // Pinned host buffer: row_idx
+    if (row_idx_n > slot.h_row_capacity) {
+        if (slot.h_row_idx) CUDA_CHECK(cudaFreeHost(slot.h_row_idx));
+        CUDA_CHECK(cudaMallocHost(&slot.h_row_idx, row_idx_n * sizeof(int32_t)));
+        slot.h_row_capacity = row_idx_n;
+    }
+
+    // Pinned host buffer: values
+    if (val_n > slot.h_val_capacity) {
+        if (slot.h_values) CUDA_CHECK(cudaFreeHost(slot.h_values));
+        CUDA_CHECK(cudaMallocHost(&slot.h_values, val_n * sizeof(float)));
+        slot.h_val_capacity = val_n;
+    }
+
+    // Device buffer: col_ptr
+    if (col_ptr_n > slot.d_col_capacity) {
+        if (slot.d_col_ptr) CUDA_CHECK(cudaFree(slot.d_col_ptr));
+        CUDA_CHECK(cudaMalloc(&slot.d_col_ptr, col_ptr_n * sizeof(int32_t)));
+        slot.d_col_capacity = col_ptr_n;
+    }
+
+    // Device buffer: row_idx
+    if (row_idx_n > slot.d_row_capacity) {
+        if (slot.d_row_idx) CUDA_CHECK(cudaFree(slot.d_row_idx));
+        CUDA_CHECK(cudaMalloc(&slot.d_row_idx, row_idx_n * sizeof(int32_t)));
+        slot.d_row_capacity = row_idx_n;
+    }
+
+    // Device buffer: values
+    if (val_n > slot.d_val_capacity) {
+        if (slot.d_values) CUDA_CHECK(cudaFree(slot.d_values));
+        CUDA_CHECK(cudaMalloc(&slot.d_values, val_n * sizeof(float)));
+        slot.d_val_capacity = val_n;
+    }
+}
+
+void Ring::publish_ready(int lane, int slot_idx, int B, int nnz, bool eof_after) {
+    if (lane < 0 || lane >= n_lanes_ || slot_idx < 0 || slot_idx >= ring_depth_) {
+        throw std::runtime_error("Ring::publish_ready: invalid lane or slot_idx");
+    }
+
+    std::lock_guard<std::mutex> lock(mtx_);
+
+    Slot& slot = lanes_[lane].slots[slot_idx];
+    if (slot.state != Slot::State::BUILDING) {
+        throw std::runtime_error("Ring::publish_ready: slot not in BUILDING state");
+    }
+
+    // Update metadata
+    slot.B = B;
+    slot.nnz = nnz;
+    slot.eof_after = eof_after;
+
+    // Transition to READY
+    slot.state = Slot::State::READY;
+    lanes_[lane].ready_count++;
+    lanes_[lane].stats.batches_published++;
+
+    // Track EOF
+    if (eof_after) {
+        lanes_[lane].eof_published = true;
+    }
+
+    // Notify trainer-side waiters
+    cv_.notify_all();
+}
+
+bool Ring::acquire_ready(SparseBatch* out, int* out_lane, int* out_slot) {
+    if (!out || !out_lane || !out_slot) {
+        throw std::runtime_error("Ring::acquire_ready: null pointer argument");
+    }
+
+    std::unique_lock<std::mutex> lock(mtx_);
+
+    // Define the wait predicate
+    auto predicate = [this] {
+        // Check if any lane has a READY slot
+        for (int i = 0; i < n_lanes_; ++i) {
+            if (lanes_[i].ready_count > 0) return true;
+        }
+        // Check if all lanes are done (published EOF and consumed EOF)
+        bool all_done = true;
+        for (int i = 0; i < n_lanes_; ++i) {
+            if (!(lanes_[i].eof_published && lanes_[i].eof_consumed)) {
+                all_done = false;
+                break;
+            }
+        }
+        if (all_done) return true;
+        return stopped_;
+    };
+
+    // Check if we need to wait
+    bool was_ready = predicate();
+    auto t_start = std::chrono::steady_clock::now();
+
+    if (!was_ready) {
+        cv_.wait(lock, predicate);
+    }
+
+    auto t_end = std::chrono::steady_clock::now();
+
+    if (stopped_) return false;
+
+    // Check if all lanes are done (published EOF and consumed EOF)
+    bool all_done = true;
+    for (int i = 0; i < n_lanes_; ++i) {
+        if (!(lanes_[i].eof_published && lanes_[i].eof_consumed)) {
+            all_done = false;
+            break;
+        }
+    }
+    if (all_done) {
+        return false;  // End of epoch
+    }
+
+    // Pick a lane according to policy
+    int chosen_lane = -1;
+    switch (policy_) {
+        case AlternationPolicy::SINGLE: {
+            if (lanes_[0].ready_count > 0) chosen_lane = 0;
+            break;
+        }
+        case AlternationPolicy::ROUND_ROBIN: {
+            // Scan starting from next_lane_rr_
+            for (int offset = 0; offset < n_lanes_; ++offset) {
+                int lane = (next_lane_rr_ + offset) % n_lanes_;
+                if (lanes_[lane].ready_count > 0) {
+                    chosen_lane = lane;
+                    next_lane_rr_ = (lane + 1) % n_lanes_;
+                    break;
+                }
+            }
+            break;
+        }
+        case AlternationPolicy::WEIGHTED: {
+            // Use precomputed schedule
+            if (!weighted_schedule_.empty()) {
+                for (int offset = 0; offset < static_cast<int>(weighted_schedule_.size());
+                     ++offset) {
+                    int lane = weighted_schedule_[(next_lane_rr_ + offset) %
+                                                  weighted_schedule_.size()];
+                    if (lanes_[lane].ready_count > 0) {
+                        chosen_lane = lane;
+                        next_lane_rr_ = (next_lane_rr_ + offset + 1) %
+                                       weighted_schedule_.size();
+                        break;
+                    }
+                }
+            }
+            break;
+        }
+        case AlternationPolicy::CALLER_CHOOSES:
+            // This shouldn't be called; use acquire_ready_from instead
+            throw std::runtime_error(
+                "Ring::acquire_ready: CALLER_CHOOSES policy requires acquire_ready_from");
+    }
+
+    if (chosen_lane == -1) {
+        // No READY slot found; shouldn't happen if predicate was correct
+        return false;
+    }
+
+    // Find the first READY slot in chosen_lane
+    int slot_idx = -1;
+    for (int i = 0; i < ring_depth_; ++i) {
+        if (lanes_[chosen_lane].slots[i].state == Slot::State::READY) {
+            slot_idx = i;
+            break;
+        }
+    }
+
+    if (slot_idx == -1) {
+        throw std::runtime_error("Ring::acquire_ready: no READY slot found (logic error)");
+    }
+
+    // Transition to CONSUMED
+    Slot& slot = lanes_[chosen_lane].slots[slot_idx];
+    slot.state = Slot::State::CONSUMED;
+    lanes_[chosen_lane].ready_count--;
+    lanes_[chosen_lane].stats.batches_consumed++;
+
+    // Track EOF consumption
+    if (slot.eof_after) {
+        lanes_[chosen_lane].eof_consumed = true;
+    }
+
+    // Update stats only if we actually waited
+    if (!was_ready) {
+        auto elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            t_end - t_start).count();
+        lanes_[chosen_lane].stats.trainer_waits++;
+        lanes_[chosen_lane].stats.trainer_wait_ns_total += elapsed_ns;
+    }
+
+    // Fill output
+    out->m = m_;
+    out->B = slot.B;
+    out->nnz = slot.nnz;
+    out->d_col_ptr = slot.d_col_ptr;
+    out->d_row_idx = slot.d_row_idx;
+    out->d_values = slot.d_values;
+    out->ready_event = slot.ready_event;
+    out->eof_after = slot.eof_after;
+    *out_lane = chosen_lane;
+    *out_slot = slot_idx;
+
+    return true;
+}
+
+bool Ring::acquire_ready_from(int lane, SparseBatch* out, int* out_slot) {
+    if (lane < 0 || lane >= n_lanes_) {
+        throw std::runtime_error("Ring::acquire_ready_from: invalid lane");
+    }
+    if (!out || !out_slot) {
+        throw std::runtime_error("Ring::acquire_ready_from: null pointer argument");
+    }
+
+    std::unique_lock<std::mutex> lock(mtx_);
+
+    // Define the wait predicate
+    auto predicate = [this, lane] {
+        if (lanes_[lane].ready_count > 0) return true;
+        if (lanes_[lane].eof_consumed) return true;  // lane is done
+        return stopped_;
+    };
+
+    // Check if we need to wait
+    bool was_ready = predicate();
+    auto t_start = std::chrono::steady_clock::now();
+
+    if (!was_ready) {
+        cv_.wait(lock, predicate);
+    }
+
+    auto t_end = std::chrono::steady_clock::now();
+
+    if (stopped_) return false;
+
+    // Check if this lane is EOF-consumed (done)
+    if (lanes_[lane].eof_consumed) {
+        return false;
+    }
+
+    if (lanes_[lane].ready_count == 0) {
+        throw std::runtime_error("Ring::acquire_ready_from: no READY slot (logic error)");
+    }
+
+    // Find the first READY slot in lane
+    int slot_idx = -1;
+    for (int i = 0; i < ring_depth_; ++i) {
+        if (lanes_[lane].slots[i].state == Slot::State::READY) {
+            slot_idx = i;
+            break;
+        }
+    }
+
+    if (slot_idx == -1) {
+        throw std::runtime_error("Ring::acquire_ready_from: no READY slot found (logic error)");
+    }
+
+    // Transition to CONSUMED
+    Slot& slot = lanes_[lane].slots[slot_idx];
+    slot.state = Slot::State::CONSUMED;
+    lanes_[lane].ready_count--;
+    lanes_[lane].stats.batches_consumed++;
+
+    // Track EOF consumption
+    if (slot.eof_after) {
+        lanes_[lane].eof_consumed = true;
+    }
+
+    // Update stats only if we actually waited
+    if (!was_ready) {
+        auto elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            t_end - t_start).count();
+        lanes_[lane].stats.trainer_waits++;
+        lanes_[lane].stats.trainer_wait_ns_total += elapsed_ns;
+    }
+
+    // Fill output
+    out->m = m_;
+    out->B = slot.B;
+    out->nnz = slot.nnz;
+    out->d_col_ptr = slot.d_col_ptr;
+    out->d_row_idx = slot.d_row_idx;
+    out->d_values = slot.d_values;
+    out->ready_event = slot.ready_event;
+    out->eof_after = slot.eof_after;
+    *out_slot = slot_idx;
+
+    return true;
+}
+
+void Ring::release_consumed(int lane, int slot_idx) {
+    if (lane < 0 || lane >= n_lanes_ || slot_idx < 0 || slot_idx >= ring_depth_) {
+        throw std::runtime_error("Ring::release_consumed: invalid lane or slot_idx");
+    }
+
+    std::lock_guard<std::mutex> lock(mtx_);
+
+    Slot& slot = lanes_[lane].slots[slot_idx];
+    if (slot.state != Slot::State::CONSUMED) {
+        throw std::runtime_error("Ring::release_consumed: slot not in CONSUMED state");
+    }
+
+    // Transition to FREE
+    slot.state = Slot::State::FREE;
+    lanes_[lane].free_count++;
+
+    // Notify producer-side waiters
+    cv_.notify_all();
+}
+
+void Ring::begin_epoch(int lane) {
+    if (lane < 0 || lane >= n_lanes_) {
+        throw std::runtime_error("Ring::begin_epoch: invalid lane");
+    }
+
+    std::lock_guard<std::mutex> lock(mtx_);
+
+    lanes_[lane].eof_published = false;
+    lanes_[lane].eof_consumed = false;
+}
+
+Ring::Stats Ring::stats(int lane) const {
+    if (lane < 0 || lane >= n_lanes_) {
+        throw std::runtime_error("Ring::stats: invalid lane");
+    }
+
+    std::lock_guard<std::mutex> lock(mtx_);
+    return lanes_[lane].stats;
+}
+
+Ring::Stats Ring::stats_total() const {
+    std::lock_guard<std::mutex> lock(mtx_);
+
+    Stats total{};
+    for (const auto& lane : lanes_) {
+        total.trainer_waits += lane.stats.trainer_waits;
+        total.trainer_wait_ns_total += lane.stats.trainer_wait_ns_total;
+        total.producer_waits += lane.stats.producer_waits;
+        total.producer_wait_ns_total += lane.stats.producer_wait_ns_total;
+        total.batches_published += lane.stats.batches_published;
+        total.batches_consumed += lane.stats.batches_consumed;
+    }
+    return total;
+}
+
+void Ring::reset_stats() {
+    std::lock_guard<std::mutex> lock(mtx_);
+
+    for (auto& lane : lanes_) {
+        lane.stats = Stats{};
+    }
+}
+
+void Ring::set_weight(int lane, double w) {
+    if (lane < 0 || lane >= n_lanes_) {
+        throw std::runtime_error("Ring::set_weight: invalid lane");
+    }
+
+    std::lock_guard<std::mutex> lock(mtx_);
+    lanes_[lane].weight = w;
+
+    if (policy_ == AlternationPolicy::WEIGHTED) {
+        rebuild_weighted_schedule_impl(weighted_schedule_, lanes_);
+    }
+}
+
+void Ring::set_m(int m) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    m_ = m;
+}
+
+int Ring::m() const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    return m_;
+}
+
+int Ring::n_lanes() const {
+    return n_lanes_;
+}
+
+int Ring::ring_depth() const {
+    return ring_depth_;
+}
+
+void Ring::shutdown() {
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        stopped_ = true;
+    }
+    cv_.notify_all();
+}

@@ -302,19 +302,23 @@ Three numbers per run:
 
 ## How it works
 
+The benchmark does **not** simulate a trainer. Instead it measures **the fastest possible inter-batch interval** — the floor that an actual trainer's step time would have to stay above to avoid stalling.
+
 ```
 DataLoader(paths=<chosen set>, chunk_size, batch_size=512)
 begin_epoch();
 
 loop N times:
     t0 = now()
-    next_batch(&b)
-    t1 = now()                          // wait_time = t1 - t0
+    next_batch(&b)              // wait_time = (t1-t0); ~0 if loader keeps up
+    t1 = now()
     cudaStreamWaitEvent(stream, b.ready_event)
-    cudaStreamSynchronize(stream)        // force the lognorm to truly complete
-    sleep_for(step_ms)                   // simulated trainer compute
-    t2 = now()                          // batch_to_batch = t2 - prev_t2
+    cudaStreamSynchronize(stream)  // force the lognorm to truly complete
+    t2 = now()                  // gpu_ready_time = (t2-t1)
+                                // batch_interval = (t2 - prev_t2)
 ```
+
+The reported `min_step_ms` is `max(batch_interval)` across steady-state batches — any trainer step shorter than that would have stalled. The reported `mean_step_ms` is `mean(batch_interval)` — what a trainer step *averages* to if it goes as fast as the loader can feed.
 
 ## CLI
 
@@ -323,45 +327,45 @@ bench_loader_latency \
     --paths <dir-or-listfile> \
     --chunk-size 64 \
     --batch-size 512 \
-    --step-ms 30 \
     --n-batches 500 \
     --decode-threads 16 \
     --ring-depth 4
 ```
+
+(No `--step-ms`. The benchmark *derives* the step-ms floor; it doesn't take one.)
 
 ## What it prints
 
 ```
 # steady-state (excluding first 4 batches)
 batches              : 496
-mean batch-to-batch  : 30.12 ms   (target: == step-ms == 30.0)
-p50 / p95 / max      : 30.05 / 30.4 / 31.1 ms
-mean trainer-wait    : 0.005 ms   (target: ~0)
+mean batch interval  : 8.2 ms      <-- floor: trainer can go this fast on average
+p50 / p95 / max      : 7.9 / 12.0 / 18.4 ms
+min trainer step ms  : 18.4 ms     <-- HARD FLOOR: shorter steps will stall
+mean trainer-wait    : 0.005 ms    (target: ~0 — i.e. loader was ready)
 p50 / p95 / max wait : 0.0 / 0.02 / 1.4 ms
-trainer_waits count  : 3 / 496    (target: 0)
-producer_waits count : 491 / 500  (expected: high — loader pacing itself)
+trainer_waits count  : 0 / 496     (target: 0)
+producer_waits count : 491 / 500   (expected: high — loader pacing itself)
 
 # warmup (first 4 batches)
-mean batch-to-batch  : 215 ms
-mean trainer-wait    : 185 ms     (expected — cold decode)
+mean batch interval  : 215 ms
+mean trainer-wait    : 185 ms      (expected — cold decode)
 ```
 
-The pass/fail criteria:
-
-- **`trainer_waits == 0` in steady state** — the GPU never had to wait. This is the hard requirement.
-- **`mean batch-to-batch ≈ step-ms`** — the loader is keeping pace with the simulated trainer.
-- `producer_waits` being high is **good** — it means the loader is throttled by the ring being full (i.e. faster than the trainer needs).
+Interpretation:
+- `min trainer step ms` is the **headline number**: trainers faster than this will stall this loader.
+- `trainer_waits` should be 0 because there's no artificial step — the trainer pulls back-to-back and the only time it waits is the warmup. If `trainer_waits > 0` in steady-state with no artificial step, the loader is internally throttled (e.g. blocking on chunk decode), which is the bug we want to find.
+- High `producer_waits` is **good** — it means the ring was full sometimes, i.e. the loader is faster than the back-to-back pull rate.
 
 ## Sweeps
 
 The script form (`bench_loader_latency.slurm`) runs the binary across:
 
-- `step-ms ∈ {10, 30, 100}` — simulates fast/normal/slow trainers.
-- `chunk-size ∈ {32, 64, 128}` — finds the sweet spot.
+- `chunk-size ∈ {32, 64, 128}` — finds the sweet spot for `min trainer step ms`.
 - `ring-depth ∈ {2, 4, 8}` — confirms 4 is enough (it should be).
 - `decode-threads ∈ {8, 16, 32}` — confirms 16 is enough.
 
-For each combo, prints a one-line summary: `step=30 chunk=64 ring=4 dec=16 trainer_waits=0 mean_wait=0.005ms`. Anything with `trainer_waits>0` at `step-ms=30` is a failing config.
+For each combo, prints a one-line summary: `chunk=64 ring=4 dec=16 min_step_ms=18.4 mean_step_ms=8.2 trainer_waits=0`. The config with the lowest `min_step_ms` and `trainer_waits=0` wins.
 
 ## Why this test matters
 
