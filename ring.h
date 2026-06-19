@@ -12,6 +12,9 @@
 #include <cstdint>
 #include <memory>
 #include <vector>
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
 
 // ============================================================================
 // SparseBatch — public contract for one mini-batch
@@ -205,9 +208,67 @@ public:
     void shutdown();
 
 private:
-    // Internal structures and helpers.
-    struct Lane;  // forward decl for impl
-    struct Slot;
+    // Internal structures: Slot and Lane definitions.
+    
+public:
+    struct Slot {
+        // Pinned host buffers
+        int32_t* h_col_ptr = nullptr;
+        int32_t* h_row_idx = nullptr;
+        float*   h_values  = nullptr;
+        size_t   h_col_capacity = 0;   // in int32_t
+        size_t   h_row_capacity = 0;
+        size_t   h_val_capacity = 0;
+
+        // Device buffers
+        int32_t* d_col_ptr = nullptr;
+        int32_t* d_row_idx = nullptr;
+        float*   d_values  = nullptr;
+        size_t   d_col_capacity = 0;
+        size_t   d_row_capacity = 0;
+        size_t   d_val_capacity = 0;
+
+        // Event (created at construction)
+        cudaEvent_t ready_event = nullptr;
+
+        // Current batch metadata
+        int B = 0;
+        int nnz = 0;
+        bool eof_after = false;
+
+        // State machine: FREE, BUILDING, READY, CONSUMED, FREE, ...
+        enum class State { FREE, BUILDING, READY, CONSUMED };
+        State state = State::FREE;
+
+        // Cleanup
+        void destroy() {
+            if (h_col_ptr) { cudaFreeHost(h_col_ptr); h_col_ptr = nullptr; }
+            if (h_row_idx) { cudaFreeHost(h_row_idx); h_row_idx = nullptr; }
+            if (h_values) { cudaFreeHost(h_values); h_values = nullptr; }
+            if (d_col_ptr) { cudaFree(d_col_ptr); d_col_ptr = nullptr; }
+            if (d_row_idx) { cudaFree(d_row_idx); d_row_idx = nullptr; }
+            if (d_values) { cudaFree(d_values); d_values = nullptr; }
+            if (ready_event) { cudaEventDestroy(ready_event); ready_event = nullptr; }
+        }
+    };
+
+    struct Lane {
+        std::vector<Slot> slots;
+        int free_count = 0;
+        int ready_count = 0;
+
+        // EOF handling
+        bool eof_published = false;    // producer has sent a batch with eof_after=true
+        bool eof_consumed = false;     // trainer has consumed the eof_after=true batch
+
+        // Weight for WEIGHTED policy
+        double weight = 1.0;
+
+        // Statistics
+        Stats stats;
+    };
+
+private:
 
     std::vector<Lane> lanes_;
     int n_lanes_ = 0;
@@ -217,9 +278,7 @@ private:
     std::vector<int> weighted_schedule_;  // precomputed schedule for WEIGHTED
     int m_ = 0;
 
-    std::mutex mtx_;
-    std::condition_variable cv_;
+    mutable std::mutex mtx_;
+    mutable std::condition_variable cv_;
     std::atomic<bool> stopped_{false};
 };
-
-#endif  // RING_H

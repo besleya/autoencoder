@@ -26,72 +26,11 @@
     } \
 } while (0)
 
-// ============================================================================
-// Internal structures: Slot and Lane
-// ============================================================================
+// Internal structures Slot and Lane are defined in ring.h as private nested structs.
 
-namespace {
-
-// A single slot in the ring buffer.
-struct Slot {
-    // Pinned host buffers
-    int32_t* h_col_ptr = nullptr;
-    int32_t* h_row_idx = nullptr;
-    float*   h_values  = nullptr;
-    size_t   h_col_capacity = 0;   // in int32_t
-    size_t   h_row_capacity = 0;
-    size_t   h_val_capacity = 0;
-
-    // Device buffers
-    int32_t* d_col_ptr = nullptr;
-    int32_t* d_row_idx = nullptr;
-    float*   d_values  = nullptr;
-    size_t   d_col_capacity = 0;
-    size_t   d_row_capacity = 0;
-    size_t   d_val_capacity = 0;
-
-    // Event (created at construction)
-    cudaEvent_t ready_event = nullptr;
-
-    // Current batch metadata
-    int B = 0;
-    int nnz = 0;
-    bool eof_after = false;
-
-    // State machine: FREE, BUILDING, READY, CONSUMED, FREE, ...
-    enum class State { FREE, BUILDING, READY, CONSUMED };
-    State state = State::FREE;
-
-    // Cleanup
-    void destroy() {
-        if (h_col_ptr) { cudaFreeHost(h_col_ptr); h_col_ptr = nullptr; }
-        if (h_row_idx) { cudaFreeHost(h_row_idx); h_row_idx = nullptr; }
-        if (h_values) { cudaFreeHost(h_values); h_values = nullptr; }
-        if (d_col_ptr) { cudaFree(d_col_ptr); d_col_ptr = nullptr; }
-        if (d_row_idx) { cudaFree(d_row_idx); d_row_idx = nullptr; }
-        if (d_values) { cudaFree(d_values); d_values = nullptr; }
-        if (ready_event) { cudaEventDestroy(ready_event); ready_event = nullptr; }
-    }
-};
-
-// Per-lane state.
-struct Lane {
-    std::vector<Slot> slots;
-    int free_count = 0;
-    int ready_count = 0;
-
-    // EOF handling
-    bool eof_published = false;    // producer has sent a batch with eof_after=true
-    bool eof_consumed = false;     // trainer has consumed the eof_after=true batch
-
-    // Weight for WEIGHTED policy
-    double weight = 1.0;
-
-    // Statistics
-    Ring::Stats stats;
-};
-
-}  // anonymous namespace
+// Forward declaration
+static void rebuild_weighted_schedule_impl(std::vector<int>& schedule,
+                                            const std::vector<Ring::Lane>& lanes);
 
 // ============================================================================
 // Ring implementation
@@ -137,9 +76,8 @@ Ring::~Ring() {
 
 // Rebuild the weighted schedule (called by constructor and set_weight).
 // For simplicity, creates a schedule of at most 64 repeats.
-namespace {
-void rebuild_weighted_schedule_impl(std::vector<int>& schedule,
-                                     const std::vector<Lane>& lanes) {
+static void rebuild_weighted_schedule_impl(std::vector<int>& schedule,
+                                            const std::vector<Ring::Lane>& lanes) {
     schedule.clear();
     if (lanes.empty()) return;
 
@@ -167,7 +105,6 @@ void rebuild_weighted_schedule_impl(std::vector<int>& schedule,
         schedule.push_back(lane_id);
     }
 }
-}  // anonymous namespace
 
 int Ring::acquire_free(int lane) {
     if (lane < 0 || lane >= n_lanes_) {
@@ -196,7 +133,7 @@ int Ring::acquire_free(int lane) {
     // Find the first FREE slot
     int slot_idx = -1;
     for (int i = 0; i < ring_depth_; ++i) {
-        if (lanes_[lane].slots[i].state == Slot::State::FREE) {
+        if (lanes_[lane].slots[i].state == Ring::Slot::State::FREE) {
             slot_idx = i;
             break;
         }
@@ -207,7 +144,7 @@ int Ring::acquire_free(int lane) {
     }
 
     // Transition to BUILDING
-    lanes_[lane].slots[slot_idx].state = Slot::State::BUILDING;
+    lanes_[lane].slots[slot_idx].state = Ring::Slot::State::BUILDING;
     lanes_[lane].free_count--;
 
     // Update stats only if we actually waited
@@ -226,9 +163,9 @@ Ring::SlotView Ring::slot_view(int lane, int slot_idx) {
         throw std::runtime_error("Ring::slot_view: invalid lane or slot_idx");
     }
 
-    Slot& slot = lanes_[lane].slots[slot_idx];
+    Ring::Slot& slot = lanes_[lane].slots[slot_idx];
 
-    return SlotView{
+    return Ring::SlotView{
         .h_col_ptr = slot.h_col_ptr,
         .h_row_idx = slot.h_row_idx,
         .h_values = slot.h_values,
@@ -251,7 +188,7 @@ void Ring::ensure_capacity(int lane, int slot_idx,
         throw std::runtime_error("Ring::ensure_capacity: invalid lane or slot_idx");
     }
 
-    Slot& slot = lanes_[lane].slots[slot_idx];
+    Ring::Slot& slot = lanes_[lane].slots[slot_idx];
 
     // Pinned host buffer: col_ptr
     if (col_ptr_n > slot.h_col_capacity) {
@@ -303,8 +240,8 @@ void Ring::publish_ready(int lane, int slot_idx, int B, int nnz, bool eof_after)
 
     std::lock_guard<std::mutex> lock(mtx_);
 
-    Slot& slot = lanes_[lane].slots[slot_idx];
-    if (slot.state != Slot::State::BUILDING) {
+    Ring::Slot& slot = lanes_[lane].slots[slot_idx];
+    if (slot.state != Ring::Slot::State::BUILDING) {
         throw std::runtime_error("Ring::publish_ready: slot not in BUILDING state");
     }
 
@@ -314,7 +251,7 @@ void Ring::publish_ready(int lane, int slot_idx, int B, int nnz, bool eof_after)
     slot.eof_after = eof_after;
 
     // Transition to READY
-    slot.state = Slot::State::READY;
+    slot.state = Ring::Slot::State::READY;
     lanes_[lane].ready_count++;
     lanes_[lane].stats.batches_published++;
 
@@ -349,7 +286,7 @@ bool Ring::acquire_ready(SparseBatch* out, int* out_lane, int* out_slot) {
             }
         }
         if (all_done) return true;
-        return stopped_;
+        return stopped_.load();
     };
 
     // Check if we need to wait
@@ -426,7 +363,7 @@ bool Ring::acquire_ready(SparseBatch* out, int* out_lane, int* out_slot) {
     // Find the first READY slot in chosen_lane
     int slot_idx = -1;
     for (int i = 0; i < ring_depth_; ++i) {
-        if (lanes_[chosen_lane].slots[i].state == Slot::State::READY) {
+        if (lanes_[chosen_lane].slots[i].state == Ring::Slot::State::READY) {
             slot_idx = i;
             break;
         }
@@ -437,8 +374,8 @@ bool Ring::acquire_ready(SparseBatch* out, int* out_lane, int* out_slot) {
     }
 
     // Transition to CONSUMED
-    Slot& slot = lanes_[chosen_lane].slots[slot_idx];
-    slot.state = Slot::State::CONSUMED;
+    Ring::Slot& slot = lanes_[chosen_lane].slots[slot_idx];
+    slot.state = Ring::Slot::State::CONSUMED;
     lanes_[chosen_lane].ready_count--;
     lanes_[chosen_lane].stats.batches_consumed++;
 
@@ -484,7 +421,7 @@ bool Ring::acquire_ready_from(int lane, SparseBatch* out, int* out_slot) {
     auto predicate = [this, lane] {
         if (lanes_[lane].ready_count > 0) return true;
         if (lanes_[lane].eof_consumed) return true;  // lane is done
-        return stopped_;
+        return stopped_.load();
     };
 
     // Check if we need to wait
@@ -511,7 +448,7 @@ bool Ring::acquire_ready_from(int lane, SparseBatch* out, int* out_slot) {
     // Find the first READY slot in lane
     int slot_idx = -1;
     for (int i = 0; i < ring_depth_; ++i) {
-        if (lanes_[lane].slots[i].state == Slot::State::READY) {
+        if (lanes_[lane].slots[i].state == Ring::Slot::State::READY) {
             slot_idx = i;
             break;
         }
@@ -522,8 +459,8 @@ bool Ring::acquire_ready_from(int lane, SparseBatch* out, int* out_slot) {
     }
 
     // Transition to CONSUMED
-    Slot& slot = lanes_[lane].slots[slot_idx];
-    slot.state = Slot::State::CONSUMED;
+    Ring::Slot& slot = lanes_[lane].slots[slot_idx];
+    slot.state = Ring::Slot::State::CONSUMED;
     lanes_[lane].ready_count--;
     lanes_[lane].stats.batches_consumed++;
 
@@ -561,13 +498,13 @@ void Ring::release_consumed(int lane, int slot_idx) {
 
     std::lock_guard<std::mutex> lock(mtx_);
 
-    Slot& slot = lanes_[lane].slots[slot_idx];
-    if (slot.state != Slot::State::CONSUMED) {
+    Ring::Slot& slot = lanes_[lane].slots[slot_idx];
+    if (slot.state != Ring::Slot::State::CONSUMED) {
         throw std::runtime_error("Ring::release_consumed: slot not in CONSUMED state");
     }
 
     // Transition to FREE
-    slot.state = Slot::State::FREE;
+    slot.state = Ring::Slot::State::FREE;
     lanes_[lane].free_count++;
 
     // Notify producer-side waiters
