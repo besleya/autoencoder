@@ -43,7 +43,8 @@ for chunk in 32 64 128; do
       echo "========================================"
       echo "=== chunk=$chunk ring=$ring dec=$dec ==="
       echo "========================================"
-      OUT=$(./bench_loader_latency --paths "$PATHS_FILE" --chunk-size $chunk --batch-size 512 --n-batches 500 --decode-threads $dec --ring-depth $ring --seed 42 2>&1)
+      ./bench_loader_latency --paths "$PATHS_FILE" --chunk-size $chunk --batch-size 512 --n-batches 500 --decode-threads $dec --ring-depth $ring --seed 42 2>&1 | tee /tmp/bench_loader_latency_${SLURM_JOB_ID}_chunk${chunk}_ring${ring}_dec${dec}.txt
+      OUT=$(cat /tmp/bench_loader_latency_${SLURM_JOB_ID}_chunk${chunk}_ring${ring}_dec${dec}.txt)
       echo "$OUT"
       SUMMARY=$(echo "$OUT" | grep '^# SUMMARY:' | head -1)
       # parse summary line: "# SUMMARY: chunk=64 ring=4 dec=16 min_step_ms=18.40 mean_step_ms=8.20 trainer_waits=0"

@@ -195,6 +195,7 @@ struct DataLoader::Impl {
     ~Impl() {
         stop = true;
         chunk_cv.notify_all();
+        if (ring) ring->shutdown();  // wake batch_builder_thread if blocked in Ring::acquire_free()
         if (t_cl.joinable()) t_cl.join();
         if (t_bb.joinable()) t_bb.join();
 

@@ -12,3 +12,4 @@ tests/validate/validate
 *.csv
 tests/validate/.compare_cache.npz
 bench_read_1pz
+bench_loader_latency
