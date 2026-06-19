@@ -10,3 +10,4 @@ nsys*.sqlite
 __pycache__
 tests/validate/validate
 *.csv
+tests/validate/.compare_cache.npz
