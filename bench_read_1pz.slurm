@@ -7,7 +7,6 @@
 #SBATCH --mem=64G
 #SBATCH --time=00:30:00
 #SBATCH --output=/mnt/home/besleya/autoencoder/slurm_logs/%x_%j.out
-#SBATCH --error=/mnt/home/besleya/autoencoder/slurm_logs/%x_%j.err
 
 set -euo pipefail
 
