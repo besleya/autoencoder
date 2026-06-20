@@ -264,7 +264,7 @@ void GpuAutoencoder::deallocate_buffers_() {
 }
 
 void GpuAutoencoder::forward(const SparseBatch& x, cudaStream_t stream) {
-    printf("[HANGDB] forward() start: batch_size=%d\n", x.B);
+    std::cout << "[HANGDB] forward() start: batch_size=" << x.B << std::endl;
     nvtxRangePushA("GpuAutoencoder::forward");
     GpuScopedTimer timer_total("ae.forward.total", stream);
     
@@ -291,12 +291,12 @@ void GpuAutoencoder::forward(const SparseBatch& x, cudaStream_t stream) {
         GpuScopedTimer timer_layer(layer_name, stream);
         output = layers_[i]->forward(output, x.B, stream);
     }
-    printf("[HANGDB] forward() end\n");
+    std::cout << "[HANGDB] forward() end" << std::endl;
     nvtxRangePop();
 }
 
 void GpuAutoencoder::backward_and_step(const SparseBatch& x, float lr, cudaStream_t stream) {
-    printf("[HANGDB] backward_and_step() start: batch_size=%d\n", x.B);
+    std::cout << "[HANGDB] backward_and_step() start: batch_size=" << x.B << std::endl;
     nvtxRangePushA("GpuAutoencoder::backward_and_step");
     GpuScopedTimer timer_total("ae.backward.total", stream);
     
@@ -387,14 +387,14 @@ void GpuAutoencoder::backward_and_step(const SparseBatch& x, float lr, cudaStrea
     }
     
     // Adam update on all layers
-    printf("[HANGDB] backward_and_step() before optimizer update\n");
+    std::cout << "[HANGDB] backward_and_step() before optimizer update" << std::endl;
     for (size_t i = 0; i < layers_.size(); ++i) {
         char timer_name[64];
         snprintf(timer_name, sizeof(timer_name), "ae.bwd.layer[%zu].update", i);
         GpuScopedTimer timer_update(timer_name, stream);
         layers_[i]->update(lr, stream);
     }
-    printf("[HANGDB] backward_and_step() end\n");
+    std::cout << "[HANGDB] backward_and_step() end" << std::endl;
     nvtxRangePop();
 }
 
@@ -403,11 +403,11 @@ void GpuAutoencoder::reset_epoch_loss() {
 }
 
 float GpuAutoencoder::read_epoch_loss(int num_batches) {
-    printf("[HANGDB] read_epoch_loss() start: num_batches=%d\n", num_batches);
+    std::cout << "[HANGDB] read_epoch_loss() start: num_batches=" << num_batches << std::endl;
     float epoch_sum = 0.0f;
     CUDA_CHECK(cudaMemcpy(&epoch_sum, d_epoch_loss_sum_, sizeof(float),
                           cudaMemcpyDeviceToHost));
-    printf("[HANGDB] read_epoch_loss() complete\n");
+    std::cout << "[HANGDB] read_epoch_loss() complete" << std::endl;
     return (num_batches > 0) ? epoch_sum / static_cast<float>(num_batches) : 0.0f;
 }
 
