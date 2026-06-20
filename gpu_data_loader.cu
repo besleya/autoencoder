@@ -562,7 +562,7 @@ static void batch_builder_thread(DataLoader::Impl* impl) {
                 }
 
                 col_idx += B;
-                std::cout << "[HANGDB] batch_builder_thread: batch built and published (B=" << B << ", nnz=" << batch_nnz << ", eof=" << eof_after << ")" << std::endl;
+                std::cout << "[HANGDB] batch_builder_thread: batch built and published (B=" << B << ", nnz=" << batch_nnz << ")" << std::endl;
 
                 // Issue H2D transfers
                 CUDA_CHECK(cudaMemcpyAsync(slot_view.d_col_ptr, slot_view.h_col_ptr,
