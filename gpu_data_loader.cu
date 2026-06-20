@@ -236,18 +236,31 @@ static void chunk_loader_thread(DataLoader::Impl* impl) {
                         // Signal T_BB that no more chunks are coming
                         impl->chunk_cv.notify_all();
                     }
-                    // Wait for next epoch
-                    std::unique_lock<std::mutex> lock2(impl->chunk_mtx);
-                    impl->chunk_cv.wait(lock2, [impl]() {
-                        return !impl->epoch_started || impl->stop;
-                    });
-                    continue;
+                    // BUG FIX #2: Release lock before acquiring lock2 to avoid double-lock deadlock
+                    // Fall through to re-acquire after scope ends
                 }
-
-                chunk_end = std::min(chunk_start + (size_t)impl->chunk_size,
-                                     impl->epoch_order.size());
-                is_last_chunk = (chunk_end >= impl->epoch_order.size());
             }
+            // Wait for next epoch (outside the previous lock scope)
+            {
+                std::unique_lock<std::mutex> lock(impl->chunk_mtx);
+                impl->chunk_cv.wait(lock, [impl]() {
+                    return !impl->epoch_started || impl->stop;
+                });
+                if (impl->stop) break;
+                
+                // After epoch is reset, loop back to check again
+                continue;
+            }
+
+            // Re-acquire lock to check state and proceed with loading
+            chunk_start = impl->chunk_cursor;
+            if (chunk_start >= impl->epoch_order.size()) {
+                continue;
+            }
+
+            chunk_end = std::min(chunk_start + (size_t)impl->chunk_size,
+                                 impl->epoch_order.size());
+            is_last_chunk = (chunk_end >= impl->epoch_order.size());
 
             // Load and decode files (OpenMP parallel)
             std::vector<singlet::pz::ReadResult> decoded_files;
@@ -394,19 +407,28 @@ static void batch_builder_thread(DataLoader::Impl* impl) {
             bool is_last_chunk = false;
             {
                 std::unique_lock<std::mutex> lock(impl->chunk_mtx);
+                // BUG FIX #3: Separate the predicate to avoid busy-spin when queue is empty and last_chunk_pushed is true
                 impl->chunk_cv.wait(lock, [impl]() {
-                    return !impl->chunk_queue.empty() || (impl->last_chunk_pushed && impl->chunk_queue.empty()) || impl->stop;
+                    return !impl->chunk_queue.empty() || impl->stop || (impl->epoch_eof);
                 });
                 if (impl->stop) break;
-
-                // If queue is empty AND we've pushed the last chunk, we're done with this epoch
-                if (impl->chunk_queue.empty()) {
-                    if (impl->last_chunk_pushed) {
-                        // Epoch complete; wait for next begin_epoch
-                        impl->epoch_eof = true;
-                        continue;
-                    }
+                if (impl->epoch_eof) {
+                    // Wait for next epoch instead of busy-spinning
+                    printf("[HANGDB] batch_builder_thread: waiting for next epoch\n");
+                    impl->chunk_cv.wait(lock, [impl]() {
+                        return !impl->epoch_eof || impl->stop;
+                    });
                     continue;
+                }
+
+                // If queue is empty, continue waiting (don't busy-spin)
+                if (impl->chunk_queue.empty()) {
+                    continue;
+                }
+
+                // Check if this is the last chunk in the queue
+                if (impl->last_chunk_pushed && impl->chunk_queue.size() == 1) {
+                    impl->epoch_eof = true;
                 }
 
                 chunk = std::move(impl->chunk_queue.front());
@@ -567,6 +589,15 @@ static void batch_builder_thread(DataLoader::Impl* impl) {
                 // Publish to Ring
                 impl->ring->publish_ready(impl->lane_id_, slot_idx, B, batch_nnz, eof_after);
             }
+
+            // BUG FIX #1: If we broke early due to drop-tail and is_last_chunk, publish EOF
+            if (is_last_chunk && col_idx < chunk->n_cols) {
+                printf("[HANGDB] batch_builder_thread: publishing EOF sentinel after drop-tail (col_idx=%d, n_cols=%d)\n", col_idx, chunk->n_cols);
+                int slot_idx = impl->ring->acquire_free(impl->lane_id_);
+                if (slot_idx >= 0) {
+                    impl->ring->publish_ready(impl->lane_id_, slot_idx, 0, 0, true);
+                }
+            }
         }
     } catch (const std::exception& e) {
         std::fprintf(stderr, "[DataLoader T_BB] FATAL: %s\n", e.what());
@@ -652,6 +683,8 @@ void DataLoader::begin_epoch() {
         impl_->last_chunk_pushed = false;
         impl_->epoch_eof = false;
         impl_->chunk_queue.clear();
+        // BUG FIX #4: Reset epoch_started to false before setting it to true for next epoch
+        impl_->epoch_started = false;
     }
 
     // Call Ring to reset this lane's epoch state
