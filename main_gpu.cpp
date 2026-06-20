@@ -185,14 +185,18 @@ int main(int argc, char** argv) {
         
         nvtxRangePushA("main:train_loop");
         auto t_train_total = std::chrono::steady_clock::now();
+        printf("[HANGDB] Starting training loop for %d epochs\n", opt.epochs);
         
         for (int epoch = 1; epoch <= opt.epochs; ++epoch) {
+            printf("[HANGDB] Epoch %d/%d: Starting\n", epoch, opt.epochs);
             char epoch_name[64];
             snprintf(epoch_name, sizeof(epoch_name), "epoch:%d", epoch);
             nvtxRangePushA(epoch_name);
             
             auto t_epoch = std::chrono::steady_clock::now();
+            printf("[HANGDB] Epoch %d: Calling loader.begin_epoch()\n", epoch);
             loader.begin_epoch();
+            printf("[HANGDB] Epoch %d: loader.begin_epoch() returned, resetting loss\n", epoch);
             net.reset_epoch_loss();
 
             int num_batches = 0;
@@ -211,7 +215,10 @@ int main(int argc, char** argv) {
                 time_acquire_ready += ms_since(t_batch_load);
                 nvtxRangePop();
                 
-                if (!has_batch) break;
+                if (!has_batch) {
+                    printf("[HANGDB] Epoch %d: No more batches, batch loop ending (num_batches=%d)\n", epoch, num_batches);
+                    break;
+                }
 
                 // GPU fence: wait for loader's H2D + lognorm to complete
                 CUDA_CHECK(cudaStreamWaitEvent(trainer_stream, batch.ready_event, 0));
@@ -231,8 +238,10 @@ int main(int argc, char** argv) {
                 
                 ++num_batches;
             }
+            printf("[HANGDB] Epoch %d: Batch loop complete, reading epoch loss\n", epoch);
 
             float mean_loss = net.read_epoch_loss(num_batches);
+            printf("[HANGDB] Epoch %d: Loss read (mean_loss=%.6f)\n", epoch, mean_loss);
             double epoch_ms = ms_since(t_epoch);
             
             // Flush GPU timers and report
@@ -255,6 +264,7 @@ int main(int argc, char** argv) {
         }
         
         double train_total_ms = ms_since(t_train_total);
+        printf("[HANGDB] Training loop completed, total_ms=%.1f\n", train_total_ms);
         std::cout << "Total training loop: " << train_total_ms << " ms" << std::endl;
         nvtxRangePop();
         
