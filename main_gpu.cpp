@@ -185,16 +185,16 @@ int main(int argc, char** argv) {
         
         nvtxRangePushA("main:train_loop");
         auto t_train_total = std::chrono::steady_clock::now();
-        printf("[HANGDB] Starting training loop for %d epochs\n", opt.epochs);
+        std::cout << "[HANGDB] Starting training loop for " << opt.epochs << " epochs" << std::endl;
         
         for (int epoch = 1; epoch <= opt.epochs; ++epoch) {
-            printf("[HANGDB] Epoch %d/%d: Starting\n", epoch, opt.epochs);
+            std::cout << "[HANGDB] Epoch " << epoch << "/" << opt.epochs << ": Starting" << std::endl;
             char epoch_name[64];
             snprintf(epoch_name, sizeof(epoch_name), "epoch:%d", epoch);
             nvtxRangePushA(epoch_name);
             
             auto t_epoch = std::chrono::steady_clock::now();
-            printf("[HANGDB] Epoch %d: Calling loader.begin_epoch()\n", epoch);
+            std::cout << "[HANGDB] Epoch " << epoch << ": Calling loader.begin_epoch()" << std::endl;
             loader.begin_epoch();
             printf("[HANGDB] Epoch %d: loader.begin_epoch() returned, resetting loss\n", epoch);
             net.reset_epoch_loss();
@@ -216,7 +216,7 @@ int main(int argc, char** argv) {
                 nvtxRangePop();
                 
                 if (!has_batch) {
-                    printf("[HANGDB] Epoch %d: No more batches, batch loop ending (num_batches=%d)\n", epoch, num_batches);
+                    std::cout << "[HANGDB] Epoch " << epoch << ": No more batches, batch loop ending (num_batches=" << num_batches << ")" << std::endl;
                     break;
                 }
 
@@ -238,10 +238,10 @@ int main(int argc, char** argv) {
                 
                 ++num_batches;
             }
-            printf("[HANGDB] Epoch %d: Batch loop complete, reading epoch loss\n", epoch);
+            std::cout << "[HANGDB] Epoch " << epoch << ": Batch loop complete, reading epoch loss" << std::endl;
 
             float mean_loss = net.read_epoch_loss(num_batches);
-            printf("[HANGDB] Epoch %d: Loss read (mean_loss=%.6f)\n", epoch, mean_loss);
+            std::cout << "[HANGDB] Epoch " << epoch << ": Loss read (mean_loss=" << mean_loss << ")" << std::endl;
             double epoch_ms = ms_since(t_epoch);
             
             // Flush GPU timers and report
