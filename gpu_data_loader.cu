@@ -380,7 +380,7 @@ static void chunk_loader_thread(DataLoader::Impl* impl) {
             }
 
             // Push to chunk queue
-            printf("[HANGDB] chunk_loader_thread: decoded and queuing chunk (start=%zu, end=%zu, is_last=%d, n_cols=%d)\n", chunk_start, chunk_end, is_last_chunk, chunk_data_ptr->n_cols);
+            std::cout << "[HANGDB] chunk_loader_thread: decoded and queuing chunk (start=" << chunk_start << ", end=" << chunk_end << ", is_last=" << is_last_chunk << ", n_cols=" << chunk_data_ptr->n_cols << ")" << std::endl;
             {
                 std::unique_lock<std::mutex> lock(impl->chunk_mtx);
                 impl->chunk_queue.push_back(std::move(chunk_data_ptr));
@@ -414,7 +414,7 @@ static void batch_builder_thread(DataLoader::Impl* impl) {
                 if (impl->stop) break;
                 if (impl->epoch_eof) {
                     // Wait for next epoch instead of busy-spinning
-                    printf("[HANGDB] batch_builder_thread: waiting for next epoch\n");
+                    std::cout << "[HANGDB] batch_builder_thread: waiting for next epoch" << std::endl;
                     impl->chunk_cv.wait(lock, [impl]() {
                         return !impl->epoch_eof || impl->stop;
                     });
@@ -462,7 +462,7 @@ static void batch_builder_thread(DataLoader::Impl* impl) {
             }
 
             // Build batches from this chunk
-            printf("[HANGDB] batch_builder_thread: building batches from chunk (n_cols=%d, is_last_chunk=%d)\n", chunk->n_cols, is_last_chunk);
+            std::cout << "[HANGDB] batch_builder_thread: building batches from chunk (n_cols=" << chunk->n_cols << ", is_last_chunk=" << is_last_chunk << ")" << std::endl;
             int col_idx = 0;
             while (col_idx < chunk->n_cols) {
                 // Check if this batch would be too small (drop tail)
@@ -562,7 +562,7 @@ static void batch_builder_thread(DataLoader::Impl* impl) {
                 }
 
                 col_idx += B;
-                printf("[HANGDB] batch_builder_thread: batch built and published (B=%d, nnz=%d, eof=%d)\n", B, batch_nnz, eof_after);
+                std::cout << "[HANGDB] batch_builder_thread: batch built and published (B=" << B << ", nnz=" << batch_nnz << ", eof=" << eof_after << ")" << std::endl;
 
                 // Issue H2D transfers
                 CUDA_CHECK(cudaMemcpyAsync(slot_view.d_col_ptr, slot_view.h_col_ptr,
@@ -592,7 +592,7 @@ static void batch_builder_thread(DataLoader::Impl* impl) {
 
             // BUG FIX #1: If we broke early due to drop-tail and is_last_chunk, publish EOF
             if (is_last_chunk && col_idx < chunk->n_cols) {
-                printf("[HANGDB] batch_builder_thread: publishing EOF sentinel after drop-tail (col_idx=%d, n_cols=%d)\n", col_idx, chunk->n_cols);
+                std::cout << "[HANGDB] batch_builder_thread: publishing EOF sentinel after drop-tail (col_idx=" << col_idx << ", n_cols=" << chunk->n_cols << ")" << std::endl;
                 int slot_idx = impl->ring->acquire_free(impl->lane_id_);
                 if (slot_idx >= 0) {
                     impl->ring->publish_ready(impl->lane_id_, slot_idx, 0, 0, true);
@@ -600,7 +600,7 @@ static void batch_builder_thread(DataLoader::Impl* impl) {
             }
         }
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "[DataLoader T_BB] FATAL: %s\n", e.what());
+        std::cerr << "[DataLoader T_BB] FATAL: " << e.what() << std::endl;
         std::terminate();
     }
 }
@@ -648,7 +648,7 @@ DataLoader::DataLoader(const std::vector<std::string>& paths,
         singlet::pz::ReadResult r = singlet::pz::read_1pz(paths[0]);
         impl_->m = r.m;
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "[DataLoader] FATAL: %s: %s\n", paths[0].c_str(), e.what());
+        std::cerr << "[DataLoader] FATAL: " << paths[0] << ": " << e.what() << std::endl;
         std::terminate();
     }
 
@@ -668,7 +668,7 @@ DataLoader::~DataLoader() {
 }
 
 void DataLoader::begin_epoch() {
-    printf("[HANGDB] DataLoader::begin_epoch() start\n");
+    std::cout << "[HANGDB] DataLoader::begin_epoch() start" << std::endl;
     // Shuffle file paths
     impl_->epoch_order = impl_->file_paths;
     std::shuffle(impl_->epoch_order.begin(), impl_->epoch_order.end(), impl_->rng);
@@ -696,7 +696,7 @@ void DataLoader::begin_epoch() {
         impl_->epoch_started = true;
         impl_->chunk_cv.notify_all();
     }
-    printf("[HANGDB] DataLoader::begin_epoch() complete\n");
+    std::cout << "[HANGDB] DataLoader::begin_epoch() complete" << std::endl;
 }
 
 int DataLoader::m() const {
