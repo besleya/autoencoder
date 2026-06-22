@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <iostream>
 #include <numeric>
 #include <sstream>
 #include <stdexcept>
@@ -123,7 +124,9 @@ int Ring::acquire_free(int lane) {
     auto t_start = std::chrono::steady_clock::now();
 
     if (!was_ready) {
+        std::cout << "[HANGDB] Ring::acquire_free(lane=" << lane << "): waiting for FREE slot" << std::endl;
         cv_.wait(lock, predicate);
+        std::cout << "[HANGDB] Ring::acquire_free(lane=" << lane << "): FREE slot acquired" << std::endl;
     }
 
     auto t_end = std::chrono::steady_clock::now();
@@ -261,6 +264,7 @@ void Ring::publish_ready(int lane, int slot_idx, int B, int nnz, bool eof_after)
     }
 
     // Notify trainer-side waiters
+    std::cout << "[HANGDB] Ring::publish_ready(lane=" << lane << ", slot=" << slot_idx << ", B=" << B << "): signaling ready, notifying waiters" << std::endl;
     cv_.notify_all();
 }
 
@@ -294,7 +298,9 @@ bool Ring::acquire_ready(SparseBatch* out, int* out_lane, int* out_slot) {
     auto t_start = std::chrono::steady_clock::now();
 
     if (!was_ready) {
+        std::cout << "[HANGDB] Ring::acquire_ready(): waiting for READY batch from any lane" << std::endl;
         cv_.wait(lock, predicate);
+        std::cout << "[HANGDB] Ring::acquire_ready(): READY batch available" << std::endl;
     }
 
     auto t_end = std::chrono::steady_clock::now();
@@ -360,9 +366,10 @@ bool Ring::acquire_ready(SparseBatch* out, int* out_lane, int* out_slot) {
         return false;
     }
 
-    // Find the first READY slot in chosen_lane
+    // Find the first READY slot in chosen_lane, starting from next_slot_idx with rotation
     int slot_idx = -1;
-    for (int i = 0; i < ring_depth_; ++i) {
+    for (int offset = 0; offset < ring_depth_; ++offset) {
+        int i = (lanes_[chosen_lane].next_slot_idx + offset) % ring_depth_;
         if (lanes_[chosen_lane].slots[i].state == Ring::Slot::State::READY) {
             slot_idx = i;
             break;
@@ -378,6 +385,7 @@ bool Ring::acquire_ready(SparseBatch* out, int* out_lane, int* out_slot) {
     slot.state = Ring::Slot::State::CONSUMED;
     lanes_[chosen_lane].ready_count--;
     lanes_[chosen_lane].stats.batches_consumed++;
+    lanes_[chosen_lane].next_slot_idx = (slot_idx + 1) % ring_depth_;  // Rotate to next slot
 
     // Track EOF consumption
     if (slot.eof_after) {
@@ -429,7 +437,9 @@ bool Ring::acquire_ready_from(int lane, SparseBatch* out, int* out_slot) {
     auto t_start = std::chrono::steady_clock::now();
 
     if (!was_ready) {
+        std::cout << "[HANGDB] Ring::acquire_ready_from(lane=" << lane << "): waiting for READY batch from lane " << lane << std::endl;
         cv_.wait(lock, predicate);
+        std::cout << "[HANGDB] Ring::acquire_ready_from(lane=" << lane << "): READY batch available from lane " << lane << std::endl;
     }
 
     auto t_end = std::chrono::steady_clock::now();
@@ -445,9 +455,10 @@ bool Ring::acquire_ready_from(int lane, SparseBatch* out, int* out_slot) {
         throw std::runtime_error("Ring::acquire_ready_from: no READY slot (logic error)");
     }
 
-    // Find the first READY slot in lane
+    // Find the first READY slot in lane, starting from next_slot_idx with rotation
     int slot_idx = -1;
-    for (int i = 0; i < ring_depth_; ++i) {
+    for (int offset = 0; offset < ring_depth_; ++offset) {
+        int i = (lanes_[lane].next_slot_idx + offset) % ring_depth_;
         if (lanes_[lane].slots[i].state == Ring::Slot::State::READY) {
             slot_idx = i;
             break;
@@ -463,6 +474,7 @@ bool Ring::acquire_ready_from(int lane, SparseBatch* out, int* out_slot) {
     slot.state = Ring::Slot::State::CONSUMED;
     lanes_[lane].ready_count--;
     lanes_[lane].stats.batches_consumed++;
+    lanes_[lane].next_slot_idx = (slot_idx + 1) % ring_depth_;  // Rotate to next slot
 
     // Track EOF consumption
     if (slot.eof_after) {
@@ -508,6 +520,7 @@ void Ring::release_consumed(int lane, int slot_idx) {
     lanes_[lane].free_count++;
 
     // Notify producer-side waiters
+    std::cout << "[HANGDB] Ring::release_consumed(lane=" << lane << ", slot=" << slot_idx << "): released to FREE, notifying waiters" << std::endl;
     cv_.notify_all();
 }
 
@@ -520,6 +533,7 @@ void Ring::begin_epoch(int lane) {
 
     lanes_[lane].eof_published = false;
     lanes_[lane].eof_consumed = false;
+    lanes_[lane].next_slot_idx = 0;  // Reset slot rotation at epoch start
 }
 
 Ring::Stats Ring::stats(int lane) const {

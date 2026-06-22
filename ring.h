@@ -264,6 +264,9 @@ public:
         // Weight for WEIGHTED policy
         double weight = 1.0;
 
+        // Rotating slot selection for READY slot acquisition
+        int next_slot_idx = 0;  // next slot index to try in this lane
+
         // Statistics
         Stats stats;
     };

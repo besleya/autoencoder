@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <iostream>
 #include <mutex>
 #include <numeric>
 #include <omp.h>
@@ -236,9 +237,8 @@ static void chunk_loader_thread(DataLoader::Impl* impl) {
                         // Signal T_BB that no more chunks are coming
                         impl->chunk_cv.notify_all();
                     }
-                    // Wait for next epoch
-                    std::unique_lock<std::mutex> lock2(impl->chunk_mtx);
-                    impl->chunk_cv.wait(lock2, [impl]() {
+                    // Wait for next epoch (reuse `lock` which already owns chunk_mtx)
+                    impl->chunk_cv.wait(lock, [impl]() {
                         return !impl->epoch_started || impl->stop;
                     });
                     continue;
@@ -389,6 +389,7 @@ static void chunk_loader_thread(DataLoader::Impl* impl) {
 static void batch_builder_thread(DataLoader::Impl* impl) {
     try {
         while (!impl->stop) {
+            std::cout << "[HANGDB] batch_builder_thread: getting next chunk" << std::endl;
             // Wait for a chunk from queue
             std::unique_ptr<ChunkData> chunk;
             bool is_last_chunk = false;
@@ -404,6 +405,7 @@ static void batch_builder_thread(DataLoader::Impl* impl) {
                     if (impl->last_chunk_pushed) {
                         // Epoch complete; wait for next begin_epoch
                         impl->epoch_eof = true;
+                        std::cout << "[HANGDB] batch_builder_thread: epoch complete, waiting for next begin_epoch" << std::endl;
                         continue;
                     }
                     continue;
@@ -445,6 +447,7 @@ static void batch_builder_thread(DataLoader::Impl* impl) {
             while (col_idx < chunk->n_cols) {
                 // Check if this batch would be too small (drop tail)
                 if (col_idx + impl->batch_size > chunk->n_cols) {
+                    std::cout << "[HANGDB] batch_builder_thread: dropping tail batch (col_idx=" << col_idx << ", n_cols=" << chunk->n_cols << ")" << std::endl;
                     break;
                 }
 
@@ -559,7 +562,9 @@ static void batch_builder_thread(DataLoader::Impl* impl) {
                                           impl->loader_stream);
 
                 // Record event on loader stream
+                std::cout << "[HANGDB] batch_builder_thread: recording ready_event for slot " << slot_idx << " (B=" << B << ", nnz=" << batch_nnz << ")" << std::endl;
                 CUDA_CHECK(cudaEventRecord(slot_view.ready_event, impl->loader_stream));
+                std::cout << "[HANGDB] batch_builder_thread: ready_event recorded for slot " << slot_idx << std::endl;
 
                 // Determine if this is the last batch of the epoch
                 bool eof_after = (col_idx >= chunk->n_cols) && is_last_chunk;
@@ -567,6 +572,7 @@ static void batch_builder_thread(DataLoader::Impl* impl) {
                 // Publish to Ring
                 impl->ring->publish_ready(impl->lane_id_, slot_idx, B, batch_nnz, eof_after);
             }
+            std::cout << "[HANGDB] batch_builder_thread: finished processing chunk (n_cols=" << chunk->n_cols << ", is_last_chunk=" << is_last_chunk << ")" << std::endl;
         }
     } catch (const std::exception& e) {
         std::fprintf(stderr, "[DataLoader T_BB] FATAL: %s\n", e.what());
@@ -638,6 +644,12 @@ DataLoader::~DataLoader() {
 
 void DataLoader::begin_epoch() {
     std::cout << "[HANGDB] DataLoader::begin_epoch() start" << std::endl;
+    // Signal end of previous epoch so chunk_loader_thread exits its inter-epoch wait
+    {
+        std::lock_guard<std::mutex> lk(impl_->chunk_mtx);
+        impl_->epoch_started = false;
+        impl_->chunk_cv.notify_all();
+    }
     // Shuffle file paths
     impl_->epoch_order = impl_->file_paths;
     std::shuffle(impl_->epoch_order.begin(), impl_->epoch_order.end(), impl_->rng);
