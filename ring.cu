@@ -48,7 +48,6 @@ Ring::Ring(int n_lanes, int ring_depth, AlternationPolicy policy)
 
     // Initialize lanes
     for (int i = 0; i < n_lanes; ++i) {
-        lanes_.emplace_back();
         lanes_[i].slots.resize(ring_depth);
         lanes_[i].free_count = ring_depth;
         lanes_[i].ready_count = 0;
