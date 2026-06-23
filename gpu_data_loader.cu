@@ -528,7 +528,6 @@ static void batch_builder_thread(DataLoader::Impl* impl) {
                 }
 
                 col_idx += B;
-                std::cout << "[HANGDB] batch_builder_thread: batch built (B=" << B << ", nnz=" << batch_nnz << ")" << std::endl;
 
                 // Issue H2D transfers
                 CUDA_CHECK(cudaMemcpyAsync(slot_view.d_col_ptr, slot_view.h_col_ptr,
@@ -547,9 +546,7 @@ static void batch_builder_thread(DataLoader::Impl* impl) {
                                           impl->loader_stream);
 
                 // Record event on loader stream
-                std::cout << "[HANGDB] batch_builder_thread: recording ready_event for slot " << slot_idx << " (B=" << B << ", nnz=" << batch_nnz << ")" << std::endl;
                 CUDA_CHECK(cudaEventRecord(slot_view.ready_event, impl->loader_stream));
-                std::cout << "[HANGDB] batch_builder_thread: ready_event recorded for slot " << slot_idx << std::endl;
 
                 // Set chunk_end = true if this is the last batch (or next batch would be dropped as tail)
                 bool chunk_end = (col_idx >= chunk->n_cols) || (col_idx + impl->batch_size > chunk->n_cols);

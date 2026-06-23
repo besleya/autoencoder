@@ -123,9 +123,7 @@ int Ring::acquire_free(int lane) {
     auto t_start = std::chrono::steady_clock::now();
 
     if (!was_ready) {
-        std::cout << "[HANGDB] Ring::acquire_free(lane=" << lane << "): waiting for FREE slot" << std::endl;
         cv_.wait(lock, predicate);
-        std::cout << "[HANGDB] Ring::acquire_free(lane=" << lane << "): FREE slot acquired" << std::endl;
     }
 
     auto t_end = std::chrono::steady_clock::now();
@@ -258,7 +256,6 @@ void Ring::publish_ready(int lane, int slot_idx, int B, int nnz, bool chunk_end)
     lanes_[lane].stats.batches_published++;
 
     // Notify trainer-side waiters
-    std::cout << "[HANGDB] Ring::publish_ready(lane=" << lane << ", slot=" << slot_idx << ", B=" << B << "): signaling ready, notifying waiters" << std::endl;
     cv_.notify_all();
 }
 
@@ -282,7 +279,7 @@ bool Ring::acquire_ready(SparseBatch* out, int* out_lane, int* out_slot) {
     auto t_start = std::chrono::steady_clock::now();
 
     if (!was_ready) {
-        std::cout << "[HANGDB] Ring::acquire_ready(): waiting for READY batch from any lane" << std::endl;
+        std::cout << "[HANGDB] WASN'T READY Ring::acquire_ready(): waiting for READY batch from any lane" << std::endl;
         cv_.wait(lock, predicate);
         std::cout << "[HANGDB] Ring::acquire_ready(): READY batch available" << std::endl;
     }
@@ -403,9 +400,8 @@ bool Ring::acquire_ready_from(int lane, SparseBatch* out, int* out_slot) {
     auto t_start = std::chrono::steady_clock::now();
 
     if (!was_ready) {
-        std::cout << "[HANGDB] Ring::acquire_ready_from(lane=" << lane << "): waiting for READY batch from lane " << lane << std::endl;
+        std::cout << "[HANGDB] WASN'T READY Ring::acquire_ready_from(lane=" << lane << "): waiting for READY batch from lane " << lane << std::endl;
         cv_.wait(lock, predicate);
-        std::cout << "[HANGDB] Ring::acquire_ready_from(lane=" << lane << "): READY batch available from lane " << lane << std::endl;
     }
 
     auto t_end = std::chrono::steady_clock::now();
@@ -476,7 +472,6 @@ void Ring::release_consumed(int lane, int slot_idx) {
     lanes_[lane].free_count++;
 
     // Notify producer-side waiters
-    std::cout << "[HANGDB] Ring::release_consumed(lane=" << lane << ", slot=" << slot_idx << "): released to FREE, notifying waiters" << std::endl;
     cv_.notify_all();
 }
 
