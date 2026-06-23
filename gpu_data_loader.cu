@@ -213,40 +213,35 @@ struct DataLoader::Impl {
 
 // T_CL: Chunk loader thread
 // Decodes files in parallel (OpenMP) and pushes decoded chunks to queue (2-deep).
+// When file list is exhausted, reshuffles and continues (auto-rolling).
 static void chunk_loader_thread(DataLoader::Impl* impl) {
     try {
-        while (!impl->stop) {
+        while (!impl->stop && !impl->ring->is_shutdown()) {
             // Wait for epoch to start AND queue has space
             size_t chunk_start;
             size_t chunk_end;
-            bool is_last_chunk;
             {
                 std::unique_lock<std::mutex> lock(impl->chunk_mtx);
                 impl->chunk_cv.wait(lock, [impl]() {
                     return (impl->epoch_started && impl->chunk_queue.size() < impl->kChunkQueueMaxSize) ||
                            impl->stop;
                 });
-                if (impl->stop) break;
+                if (impl->stop || impl->ring->is_shutdown()) break;
 
                 // Check if there are files to load
                 chunk_start = impl->chunk_cursor;
                 if (chunk_start >= impl->epoch_order.size()) {
-                    // No more files; if we haven't pushed sentinel yet, do so
-                    if (!impl->last_chunk_pushed) {
-                        impl->last_chunk_pushed = true;
-                        // Signal T_BB that no more chunks are coming
-                        impl->chunk_cv.notify_all();
-                    }
-                    // Wait for next epoch (reuse `lock` which already owns chunk_mtx)
-                    impl->chunk_cv.wait(lock, [impl]() {
-                        return !impl->epoch_started || impl->stop;
-                    });
-                    continue;
+                    // End of current pass: reshuffle, reset cursor, increment pass counter
+                    std::shuffle(impl->epoch_order.begin(), impl->epoch_order.end(), impl->rng);
+                    impl->chunk_sub_seed = impl->rng();
+                    impl->chunk_cursor = 0;
+                    impl->ring->increment_lane_pass(impl->lane_id_);
+                    // Continue to load the first chunk of the new pass
+                    chunk_start = 0;
                 }
 
                 chunk_end = std::min(chunk_start + (size_t)impl->chunk_size,
                                      impl->epoch_order.size());
-                is_last_chunk = (chunk_end >= impl->epoch_order.size());
             }
 
             // Load and decode files (OpenMP parallel)
@@ -367,14 +362,11 @@ static void chunk_loader_thread(DataLoader::Impl* impl) {
             }
 
             // Push to chunk queue
-            std::cout << "[HANGDB] chunk_loader_thread: decoded and queuing chunk (start=" << chunk_start << ", end=" << chunk_end << ", is_last=" << is_last_chunk << ", n_cols=" << chunk_data_ptr->n_cols << ")" << std::endl;
+            std::cout << "[HANGDB] chunk_loader_thread: decoded and queuing chunk (start=" << chunk_start << ", end=" << chunk_end << ", n_cols=" << chunk_data_ptr->n_cols << ")" << std::endl;
             {
                 std::unique_lock<std::mutex> lock(impl->chunk_mtx);
                 impl->chunk_queue.push_back(std::move(chunk_data_ptr));
                 impl->chunk_cursor = chunk_end;
-                if (is_last_chunk) {
-                    impl->last_chunk_pushed = true;
-                }
                 impl->chunk_cv.notify_all();
             }
         }
@@ -386,34 +378,27 @@ static void chunk_loader_thread(DataLoader::Impl* impl) {
 
 // T_BB: Batch builder thread
 // Pops chunks from queue, builds batches, publishes to Ring.
+// Marks chunk_end on the last batch of each decoded chunk.
 static void batch_builder_thread(DataLoader::Impl* impl) {
     try {
-        while (!impl->stop) {
+        while (!impl->stop && !impl->ring->is_shutdown()) {
             std::cout << "[HANGDB] batch_builder_thread: getting next chunk" << std::endl;
             // Wait for a chunk from queue
             std::unique_ptr<ChunkData> chunk;
-            bool is_last_chunk = false;
             {
                 std::unique_lock<std::mutex> lock(impl->chunk_mtx);
                 impl->chunk_cv.wait(lock, [impl]() {
-                    return !impl->chunk_queue.empty() || (impl->last_chunk_pushed && impl->chunk_queue.empty()) || impl->stop;
+                    return !impl->chunk_queue.empty() || impl->stop;
                 });
-                if (impl->stop) break;
+                if (impl->stop || impl->ring->is_shutdown()) break;
 
-                // If queue is empty AND we've pushed the last chunk, we're done with this epoch
+                // If queue is empty, keep waiting
                 if (impl->chunk_queue.empty()) {
-                    if (impl->last_chunk_pushed) {
-                        // Epoch complete; wait for next begin_epoch
-                        impl->epoch_eof = true;
-                        std::cout << "[HANGDB] batch_builder_thread: epoch complete, waiting for next begin_epoch" << std::endl;
-                        continue;
-                    }
                     continue;
                 }
 
                 chunk = std::move(impl->chunk_queue.front());
                 impl->chunk_queue.pop_front();
-                is_last_chunk = impl->last_chunk_pushed && impl->chunk_queue.empty();
 
                 // Notify T_CL that queue has space now
                 impl->chunk_cv.notify_all();
@@ -442,7 +427,7 @@ static void batch_builder_thread(DataLoader::Impl* impl) {
             }
 
             // Build batches from this chunk
-            std::cout << "[HANGDB] batch_builder_thread: building batches from chunk (n_cols=" << chunk->n_cols << ", is_last_chunk=" << is_last_chunk << ")" << std::endl;
+            std::cout << "[HANGDB] batch_builder_thread: building batches from chunk (n_cols=" << chunk->n_cols << ")" << std::endl;
             int col_idx = 0;
             while (col_idx < chunk->n_cols) {
                 // Check if this batch would be too small (drop tail)
@@ -543,7 +528,7 @@ static void batch_builder_thread(DataLoader::Impl* impl) {
                 }
 
                 col_idx += B;
-                std::cout << "[HANGDB] batch_builder_thread: batch built and published (B=" << B << ", nnz=" << batch_nnz << ")" << std::endl;
+                std::cout << "[HANGDB] batch_builder_thread: batch built (B=" << B << ", nnz=" << batch_nnz << ")" << std::endl;
 
                 // Issue H2D transfers
                 CUDA_CHECK(cudaMemcpyAsync(slot_view.d_col_ptr, slot_view.h_col_ptr,
@@ -566,13 +551,13 @@ static void batch_builder_thread(DataLoader::Impl* impl) {
                 CUDA_CHECK(cudaEventRecord(slot_view.ready_event, impl->loader_stream));
                 std::cout << "[HANGDB] batch_builder_thread: ready_event recorded for slot " << slot_idx << std::endl;
 
-                // Determine if this is the last batch of the epoch
-                bool eof_after = (col_idx >= chunk->n_cols) && is_last_chunk;
+                // Set chunk_end = true if this is the last batch (or next batch would be dropped as tail)
+                bool chunk_end = (col_idx >= chunk->n_cols) || (col_idx + impl->batch_size > chunk->n_cols);
 
                 // Publish to Ring
-                impl->ring->publish_ready(impl->lane_id_, slot_idx, B, batch_nnz, eof_after);
+                impl->ring->publish_ready(impl->lane_id_, slot_idx, B, batch_nnz, chunk_end);
             }
-            std::cout << "[HANGDB] batch_builder_thread: finished processing chunk (n_cols=" << chunk->n_cols << ", is_last_chunk=" << is_last_chunk << ")" << std::endl;
+            std::cout << "[HANGDB] batch_builder_thread: finished processing chunk (n_cols=" << chunk->n_cols << ")" << std::endl;
         }
     } catch (const std::exception& e) {
         std::fprintf(stderr, "[DataLoader T_BB] FATAL: %s\n", e.what());
@@ -642,22 +627,16 @@ DataLoader::~DataLoader() {
     // Impl destructor will handle cleanup
 }
 
-void DataLoader::begin_epoch() {
-    std::cout << "[HANGDB] DataLoader::begin_epoch() start" << std::endl;
-    // Signal end of previous epoch so chunk_loader_thread exits its inter-epoch wait
-    {
-        std::lock_guard<std::mutex> lk(impl_->chunk_mtx);
-        impl_->epoch_started = false;
-        impl_->chunk_cv.notify_all();
-    }
-    // Shuffle file paths
+void DataLoader::start() {
+    std::cout << "[HANGDB] DataLoader::start() start" << std::endl;
+    // Shuffle file paths once at startup
     impl_->epoch_order = impl_->file_paths;
     std::shuffle(impl_->epoch_order.begin(), impl_->epoch_order.end(), impl_->rng);
 
     // Draw chunk sub-seed for column permutation
     impl_->chunk_sub_seed = impl_->rng();
 
-    // Reset state
+    // Initialize state
     {
         std::lock_guard<std::mutex> lock(impl_->chunk_mtx);
         impl_->chunk_cursor = 0;
@@ -666,16 +645,13 @@ void DataLoader::begin_epoch() {
         impl_->chunk_queue.clear();
     }
 
-    // Call Ring to reset this lane's epoch state
-    impl_->ring->begin_epoch(impl_->lane_id_);
-
-    // Signal workers that epoch is starting
+    // Signal workers that they can start running
     {
         std::lock_guard<std::mutex> lock(impl_->chunk_mtx);
         impl_->epoch_started = true;
         impl_->chunk_cv.notify_all();
     }
-    std::cout << "[HANGDB] DataLoader::begin_epoch() complete" << std::endl;
+    std::cout << "[HANGDB] DataLoader::start() complete" << std::endl;
 }
 
 int DataLoader::m() const {

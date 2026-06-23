@@ -42,7 +42,7 @@ struct SparseBatch {
     const int32_t* d_row_idx;   // device, length nnz
     const float*   d_values;    // device, length nnz
     cudaEvent_t    ready_event; // signaled after H2D + lognorm; owned by slot
-    bool           eof_after;   // true on the last batch of epoch
+    bool           chunk_end;   // true on the last batch of a chunk
 };
 
 // ============================================================================
@@ -133,27 +133,26 @@ public:
     // Mark slot as READY. Updates slot state: BUILDING → READY. T_BB should have
     // already enqueued H2D transfers and lognorm kernel, and called
     // cudaEventRecord(slot.ready_event, loader_stream) before calling this.
-    // Parameters B, nnz, eof_after are copied into the slot's metadata.
+    // Parameters B, nnz, chunk_end are copied into the slot's metadata.
     // Notifies all consumer-side waiters in the condition variable.
-    void publish_ready(int lane, int slot_idx, int B, int nnz, bool eof_after);
+    void publish_ready(int lane, int slot_idx, int B, int nnz, bool chunk_end);
 
     // ========================================================================
     // Consumer API (called by trainer thread)
     // ========================================================================
 
-    // Block until SOME lane (per policy_) has a READY slot, OR all lanes have
-    // published EOF and their EOF batch has been consumed (end-of-epoch condition).
+    // Block until SOME lane (per policy_) has a READY slot, OR shutdown is called.
     // On success, fills *out with device pointers + event, sets *out_lane to the
     // lane id, and sets *out_slot to the slot index; returns true.
-    // On epoch end, returns false.
+    // On shutdown, returns false.
     // Updates slot state: READY → CONSUMED.
     // Increments trainer_waits + trainer_wait_ns_total if blocking was needed.
     bool acquire_ready(SparseBatch* out, int* out_lane, int* out_slot);
 
     // CALLER_CHOOSES variant: pull only from `lane`. Blocks waiting on that lane
-    // specifically until a READY slot is available OR that lane reaches epoch end.
+    // specifically until a READY slot is available OR shutdown is called.
     // On success, fills *out and sets *out_slot; returns true.
-    // Returns false if `lane` has no more batches (eof_after was consumed).
+    // Returns false on shutdown.
     bool acquire_ready_from(int lane, SparseBatch* out, int* out_slot);
 
     // Release the slot in `lane` so it can recycle to FREE state.
@@ -164,10 +163,20 @@ public:
     // Epoch lifecycle
     // ========================================================================
 
-    // Reset per-lane EOF state. Called at the start of each epoch to clear the
-    // eof_published and eof_consumed flags for `lane`. Allows the lane to
-    // produce and consume a new epoch's batches. Does NOT reset stats.
+    // Reset per-lane state for a new pass. Called when a lane begins a new pass.
+    // Does NOT reset stats. This function may be a no-op if no per-lane state needs resetting.
     void begin_epoch(int lane);
+
+    // Get the current pass counter for a lane. Lanes auto-increment this counter
+    // each time they wrap their file list and begin a new pass.
+    int lane_pass(int lane_id) const;
+
+    // Increment the pass counter for a lane. Called by the data loader when
+    // it reshuffles and begins a new pass over its file list.
+    void increment_lane_pass(int lane_id);
+
+    // Check if shutdown has been called.
+    bool is_shutdown() const;
 
     // ========================================================================
     // Statistics and configuration
@@ -234,7 +243,7 @@ public:
         // Current batch metadata
         int B = 0;
         int nnz = 0;
-        bool eof_after = false;
+        bool chunk_end = false;
 
         // State machine: FREE, BUILDING, READY, CONSUMED, FREE, ...
         enum class State { FREE, BUILDING, READY, CONSUMED };
@@ -257,9 +266,8 @@ public:
         int free_count = 0;
         int ready_count = 0;
 
-        // EOF handling
-        bool eof_published = false;    // producer has sent a batch with eof_after=true
-        bool eof_consumed = false;     // trainer has consumed the eof_after=true batch
+        // Pass counter: incremented each time this lane wraps its file list
+        std::atomic<int> pass_counter{0};
 
         // Weight for WEIGHTED policy
         double weight = 1.0;

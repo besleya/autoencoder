@@ -236,7 +236,7 @@ void Ring::ensure_capacity(int lane, int slot_idx,
     }
 }
 
-void Ring::publish_ready(int lane, int slot_idx, int B, int nnz, bool eof_after) {
+void Ring::publish_ready(int lane, int slot_idx, int B, int nnz, bool chunk_end) {
     if (lane < 0 || lane >= n_lanes_ || slot_idx < 0 || slot_idx >= ring_depth_) {
         throw std::runtime_error("Ring::publish_ready: invalid lane or slot_idx");
     }
@@ -251,17 +251,12 @@ void Ring::publish_ready(int lane, int slot_idx, int B, int nnz, bool eof_after)
     // Update metadata
     slot.B = B;
     slot.nnz = nnz;
-    slot.eof_after = eof_after;
+    slot.chunk_end = chunk_end;
 
     // Transition to READY
     slot.state = Ring::Slot::State::READY;
     lanes_[lane].ready_count++;
     lanes_[lane].stats.batches_published++;
-
-    // Track EOF
-    if (eof_after) {
-        lanes_[lane].eof_published = true;
-    }
 
     // Notify trainer-side waiters
     std::cout << "[HANGDB] Ring::publish_ready(lane=" << lane << ", slot=" << slot_idx << ", B=" << B << "): signaling ready, notifying waiters" << std::endl;
@@ -275,21 +270,11 @@ bool Ring::acquire_ready(SparseBatch* out, int* out_lane, int* out_slot) {
 
     std::unique_lock<std::mutex> lock(mtx_);
 
-    // Define the wait predicate
+    // Define the wait predicate: some lane has a READY slot OR shutdown
     auto predicate = [this] {
-        // Check if any lane has a READY slot
         for (int i = 0; i < n_lanes_; ++i) {
             if (lanes_[i].ready_count > 0) return true;
         }
-        // Check if all lanes are done (published EOF and consumed EOF)
-        bool all_done = true;
-        for (int i = 0; i < n_lanes_; ++i) {
-            if (!(lanes_[i].eof_published && lanes_[i].eof_consumed)) {
-                all_done = false;
-                break;
-            }
-        }
-        if (all_done) return true;
         return stopped_.load();
     };
 
@@ -306,18 +291,6 @@ bool Ring::acquire_ready(SparseBatch* out, int* out_lane, int* out_slot) {
     auto t_end = std::chrono::steady_clock::now();
 
     if (stopped_) return false;
-
-    // Check if all lanes are done (published EOF and consumed EOF)
-    bool all_done = true;
-    for (int i = 0; i < n_lanes_; ++i) {
-        if (!(lanes_[i].eof_published && lanes_[i].eof_consumed)) {
-            all_done = false;
-            break;
-        }
-    }
-    if (all_done) {
-        return false;  // End of epoch
-    }
 
     // Pick a lane according to policy
     int chosen_lane = -1;
@@ -387,11 +360,6 @@ bool Ring::acquire_ready(SparseBatch* out, int* out_lane, int* out_slot) {
     lanes_[chosen_lane].stats.batches_consumed++;
     lanes_[chosen_lane].next_slot_idx = (slot_idx + 1) % ring_depth_;  // Rotate to next slot
 
-    // Track EOF consumption
-    if (slot.eof_after) {
-        lanes_[chosen_lane].eof_consumed = true;
-    }
-
     // Update stats only if we actually waited
     if (!was_ready) {
         auto elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -408,7 +376,7 @@ bool Ring::acquire_ready(SparseBatch* out, int* out_lane, int* out_slot) {
     out->d_row_idx = slot.d_row_idx;
     out->d_values = slot.d_values;
     out->ready_event = slot.ready_event;
-    out->eof_after = slot.eof_after;
+    out->chunk_end = slot.chunk_end;
     *out_lane = chosen_lane;
     *out_slot = slot_idx;
 
@@ -425,10 +393,9 @@ bool Ring::acquire_ready_from(int lane, SparseBatch* out, int* out_slot) {
 
     std::unique_lock<std::mutex> lock(mtx_);
 
-    // Define the wait predicate
+    // Define the wait predicate: this lane has a READY slot OR shutdown
     auto predicate = [this, lane] {
         if (lanes_[lane].ready_count > 0) return true;
-        if (lanes_[lane].eof_consumed) return true;  // lane is done
         return stopped_.load();
     };
 
@@ -445,11 +412,6 @@ bool Ring::acquire_ready_from(int lane, SparseBatch* out, int* out_slot) {
     auto t_end = std::chrono::steady_clock::now();
 
     if (stopped_) return false;
-
-    // Check if this lane is EOF-consumed (done)
-    if (lanes_[lane].eof_consumed) {
-        return false;
-    }
 
     if (lanes_[lane].ready_count == 0) {
         throw std::runtime_error("Ring::acquire_ready_from: no READY slot (logic error)");
@@ -476,11 +438,6 @@ bool Ring::acquire_ready_from(int lane, SparseBatch* out, int* out_slot) {
     lanes_[lane].stats.batches_consumed++;
     lanes_[lane].next_slot_idx = (slot_idx + 1) % ring_depth_;  // Rotate to next slot
 
-    // Track EOF consumption
-    if (slot.eof_after) {
-        lanes_[lane].eof_consumed = true;
-    }
-
     // Update stats only if we actually waited
     if (!was_ready) {
         auto elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -497,7 +454,7 @@ bool Ring::acquire_ready_from(int lane, SparseBatch* out, int* out_slot) {
     out->d_row_idx = slot.d_row_idx;
     out->d_values = slot.d_values;
     out->ready_event = slot.ready_event;
-    out->eof_after = slot.eof_after;
+    out->chunk_end = slot.chunk_end;
     *out_slot = slot_idx;
 
     return true;
@@ -531,8 +488,6 @@ void Ring::begin_epoch(int lane) {
 
     std::lock_guard<std::mutex> lock(mtx_);
 
-    lanes_[lane].eof_published = false;
-    lanes_[lane].eof_consumed = false;
     lanes_[lane].next_slot_idx = 0;  // Reset slot rotation at epoch start
 }
 
@@ -605,4 +560,22 @@ void Ring::shutdown() {
         stopped_ = true;
     }
     cv_.notify_all();
+}
+
+int Ring::lane_pass(int lane_id) const {
+    if (lane_id < 0 || lane_id >= n_lanes_) {
+        throw std::runtime_error("Ring::lane_pass: invalid lane_id");
+    }
+    return lanes_[lane_id].pass_counter.load();
+}
+
+void Ring::increment_lane_pass(int lane_id) {
+    if (lane_id < 0 || lane_id >= n_lanes_) {
+        throw std::runtime_error("Ring::increment_lane_pass: invalid lane_id");
+    }
+    lanes_[lane_id].pass_counter.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool Ring::is_shutdown() const {
+    return stopped_.load();
 }

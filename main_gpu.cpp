@@ -177,7 +177,7 @@ int main(int argc, char** argv) {
                   << "  learning rate   : " << opt.lr << '\n'
                   << "  seed            : " << opt.seed << '\n' << std::endl;
 
-        std::vector<float> losses(opt.epochs, 0.0f);
+        std::vector<float> losses;
         
         // Create trainer stream for computation
         cudaStream_t trainer_stream;
@@ -187,103 +187,108 @@ int main(int argc, char** argv) {
         auto t_train_total = std::chrono::steady_clock::now();
         std::cout << "[HANGDB] Starting training loop for " << opt.epochs << " epochs" << std::endl;
         
-        for (int epoch = 1; epoch <= opt.epochs; ++epoch) {
-            std::cout << "[HANGDB] Epoch " << epoch << "/" << opt.epochs << ": Starting" << std::endl;
-            char epoch_name[64];
-            snprintf(epoch_name, sizeof(epoch_name), "epoch:%d", epoch);
-            nvtxRangePushA(epoch_name);
-            
-            auto t_epoch = std::chrono::steady_clock::now();
-            std::cout << "[HANGDB] Epoch " << epoch << ": Calling loader.begin_epoch()" << std::endl;
-            loader.begin_epoch();
-            std::cout << "[HANGDB] Epoch " << epoch << ": loader.begin_epoch() returned, resetting loss" << std::endl;
-            net.reset_epoch_loss();
+        // Start the loader once at the beginning
+        std::cout << "[HANGDB] Calling loader.start()" << std::endl;
+        loader.start();
+        std::cout << "[HANGDB] loader.start() returned, resetting loss" << std::endl;
+        net.reset_epoch_loss();
+        
+        // Track per-lane loss accumulation
+        std::vector<double> lane_loss_sum(1, 0.0);    // one lane for SINGLE policy
+        std::vector<int> lane_loss_count(1, 0);
 
-            int num_batches = 0;
-            SparseBatch batch;
-            int lane, slot;
+        int num_batches = 0;
+        SparseBatch batch;
+        int lane, slot;
+        int primary_lane = 0;  // Default to lane 0
 
-            // Accumulate timing per-epoch
-            double time_acquire_ready = 0.0;
-            double time_forward = 0.0;
-            double time_backward = 0.0;
+        // Accumulate timing across all passes
+        double time_acquire_ready = 0.0;
+        double time_forward = 0.0;
+        double time_backward = 0.0;
 
-            while (true) {
-                nvtxRangePushA("acquire_ready");
-                auto t_batch_load = std::chrono::steady_clock::now();
-                bool has_batch = ring.acquire_ready(&batch, &lane, &slot);
-                time_acquire_ready += ms_since(t_batch_load);
-                nvtxRangePop();
-                
-                if (!has_batch) {
-                    std::cout << "[HANGDB] Epoch " << epoch << ": No more batches, batch loop ending (num_batches=" << num_batches << ")" << std::endl;
-                    break;
-                }
-
-                // GPU fence: wait for loader's H2D + lognorm to complete
-                CUDA_CHECK(cudaStreamWaitEvent(trainer_stream, batch.ready_event, 0));
-
-                nvtxRangePushA("forward");
-                auto t_fwd = std::chrono::steady_clock::now();
-                net.forward(batch, trainer_stream);
-                time_forward += ms_since(t_fwd);
-                nvtxRangePop();
-
-                nvtxRangePushA("backward_and_step");
-                auto t_bwd = std::chrono::steady_clock::now();
-                net.backward_and_step(batch, opt.lr, trainer_stream);
-                time_backward += ms_since(t_bwd);
-                nvtxRangePop();
-                ring.release_consumed(lane, slot);
-                
-                ++num_batches;
+        while (true) {
+            // Check if primary lane has completed max passes
+            if (ring.lane_pass(primary_lane) >= opt.epochs) {
+                std::cout << "[HANGDB] Primary lane " << primary_lane << " has completed " 
+                          << ring.lane_pass(primary_lane) << " passes, stopping" << std::endl;
+                break;
             }
-            std::cout << "[HANGDB] Epoch " << epoch << ": Batch loop complete, reading epoch loss" << std::endl;
 
-            float mean_loss = net.read_epoch_loss(num_batches);
-            std::cout << "[HANGDB] Epoch " << epoch << ": Loss read (mean_loss=" << std::fixed << std::setprecision(6) << mean_loss << ")" << std::endl;
-            double epoch_ms = ms_since(t_epoch);
-            
-            // Flush GPU timers and report
-            gpu_timers().flush_and_accumulate();
-            
-            std::cout << "epoch " << epoch << "/" << opt.epochs
-                      << "  batches=" << num_batches
-                      << "  mean_recon_loss=" << mean_loss
-                      << "  cpu_launch_total=" << epoch_ms << " ms"
-                      << "  [cpu_launch_acquire_ready=" << time_acquire_ready << " ms"
-                      << ", cpu_launch_forward=" << time_forward << " ms"
-                      << ", cpu_launch_backward=" << time_backward << " ms]"
-                      << std::endl;
-            
-            gpu_timers().report(std::cout, std::string("epoch ") + std::to_string(epoch));
-            gpu_timers().reset_epoch();  // Reset per-epoch accumulators
-            losses[epoch - 1] = mean_loss;
-            
+            nvtxRangePushA("acquire_ready");
+            auto t_batch_load = std::chrono::steady_clock::now();
+            bool has_batch = ring.acquire_ready(&batch, &lane, &slot);
+            time_acquire_ready += ms_since(t_batch_load);
             nvtxRangePop();
+            
+            if (!has_batch) {
+                std::cout << "[HANGDB] No more batches, batch loop ending (num_batches=" << num_batches << ")" << std::endl;
+                break;
+            }
+
+            // GPU fence: wait for loader's H2D + lognorm to complete
+            CUDA_CHECK(cudaStreamWaitEvent(trainer_stream, batch.ready_event, 0));
+
+            nvtxRangePushA("forward");
+            auto t_fwd = std::chrono::steady_clock::now();
+            net.forward(batch, trainer_stream);
+            time_forward += ms_since(t_fwd);
+            nvtxRangePop();
+
+            nvtxRangePushA("backward_and_step");
+            auto t_bwd = std::chrono::steady_clock::now();
+            net.backward_and_step(batch, opt.lr, trainer_stream);
+            time_backward += ms_since(t_bwd);
+            nvtxRangePop();
+            ring.release_consumed(lane, slot);
+            
+            ++num_batches;
+            lane_loss_count[lane]++;
+
+            // On chunk end marker, read and report loss for this lane's chunk
+            if (batch.chunk_end) {
+                // Sync to read the accumulated loss
+                CUDA_CHECK(cudaStreamSynchronize(trainer_stream));
+                float chunk_mean_loss = net.read_epoch_loss(lane_loss_count[lane]);
+                
+                int current_pass = ring.lane_pass(lane);
+                std::cout << "[lane=" << lane << " pass=" << current_pass << "] mean_loss=" 
+                          << std::fixed << std::setprecision(6) << chunk_mean_loss
+                          << "  (chunk end, " << lane_loss_count[lane] << " batches)" << std::endl;
+                
+                // Reset accumulator for next chunk
+                net.reset_epoch_loss();
+                lane_loss_sum[lane] = 0.0;
+                lane_loss_count[lane] = 0;
+                
+                losses.push_back(chunk_mean_loss);
+            }
         }
+        
+        std::cout << "[HANGDB] Batch loop complete, calling ring.shutdown()" << std::endl;
+        ring.shutdown();
         
         double train_total_ms = ms_since(t_train_total);
         std::cout << "[HANGDB] Training loop completed, total_ms=" << std::fixed << std::setprecision(1) << train_total_ms << std::endl;
-        // std::cout << "Total training loop: " << train_total_ms << " ms" << std::endl;
         nvtxRangePop();
         
         // Clean up trainer stream
         CUDA_CHECK(cudaStreamDestroy(trainer_stream));
         
-        // Print grand total timings across all epochs
-        gpu_timers().report(std::cout, "All Epochs Grand Total", true);
+        // Print grand total timings across all passes
+        gpu_timers().report(std::cout, "All Passes Grand Total", true);
         
-        // Print a final summary of grand totals across all epochs
-        // (Requires maintaining cumulative totals; for now, just note training is complete)
+        // Print a final summary of grand totals across all passes
         std::cout << "\n=== Training Complete ===\n" << std::endl;
         
-        float scaler = 80.0f / losses[0];
-        int col;
-        for (float l : losses) {
-            col = static_cast<int>(std::lround(l * scaler));
-            if (col < 0) col = 0;
-            std::cout << std::string(col, ' ') << "|  " << l << '\n';
+        if (!losses.empty()) {
+            float scaler = 80.0f / losses[0];
+            int col;
+            for (float l : losses) {
+                col = static_cast<int>(std::lround(l * scaler));
+                if (col < 0) col = 0;
+                std::cout << std::string(col, ' ') << "|  " << l << '\n';
+            }
         }
 
         std::cout << "\nDone." << std::endl;

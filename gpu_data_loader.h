@@ -60,9 +60,9 @@ public:
     DataLoader(const DataLoader&) = delete;
     DataLoader& operator=(const DataLoader&) = delete;
 
-    // Begin a new epoch: shuffle file order, reset cursors, draw sub-seed,
-    // call ring->begin_epoch(lane_id), unblock workers. Returns immediately.
-    void begin_epoch();
+    // Start the data loader: shuffle file order once and unblock workers.
+    // Called once before the training loop. Returns immediately.
+    void start();
 
     // Number of features (peeked from first file in constructor).
     int m() const;
