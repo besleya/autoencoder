@@ -277,6 +277,33 @@ public:
 
         // Statistics
         Stats stats;
+
+        // Explicitly enable move semantics, disable copy
+        Lane() = default;
+        Lane(const Lane&) = delete;
+        Lane& operator=(const Lane&) = delete;
+        
+        Lane(Lane&& other) noexcept
+            : slots(std::move(other.slots)),
+              free_count(other.free_count),
+              ready_count(other.ready_count),
+              pass_counter(other.pass_counter.load()),
+              weight(other.weight),
+              next_slot_idx(other.next_slot_idx),
+              stats(std::move(other.stats)) {}
+        
+        Lane& operator=(Lane&& other) noexcept {
+            if (this != &other) {
+                slots = std::move(other.slots);
+                free_count = other.free_count;
+                ready_count = other.ready_count;
+                pass_counter.store(other.pass_counter.load());
+                weight = other.weight;
+                next_slot_idx = other.next_slot_idx;
+                stats = std::move(other.stats);
+            }
+            return *this;
+        }
     };
 
 private:
