@@ -38,7 +38,7 @@ static void rebuild_weighted_schedule_impl(std::vector<int>& schedule,
 // ============================================================================
 
 Ring::Ring(int n_lanes, int ring_depth, AlternationPolicy policy)
-    : n_lanes_(n_lanes), ring_depth_(ring_depth), policy_(policy) {
+    : n_lanes_(n_lanes), ring_depth_(ring_depth), policy_(policy), lanes_(n_lanes) {
     if (n_lanes <= 0 || ring_depth <= 0) {
         throw std::runtime_error("Ring: n_lanes and ring_depth must be > 0");
     }
@@ -47,7 +47,6 @@ Ring::Ring(int n_lanes, int ring_depth, AlternationPolicy policy)
     }
 
     // Initialize lanes
-    lanes_.resize(n_lanes);
     for (int i = 0; i < n_lanes; ++i) {
         lanes_[i].slots.resize(ring_depth);
         lanes_[i].free_count = ring_depth;
