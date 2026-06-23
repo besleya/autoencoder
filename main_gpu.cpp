@@ -215,11 +215,13 @@ int main(int argc, char** argv) {
                 break;
             }
 
+            std::cout << "[HANGDB] Calling ring.acquire_ready(): awaiting READY" << std::endl;
             nvtxRangePushA("acquire_ready");
             auto t_batch_load = std::chrono::steady_clock::now();
             bool has_batch = ring.acquire_ready(&batch, &lane, &slot);
             time_acquire_ready += ms_since(t_batch_load);
             nvtxRangePop();
+            std::cout << "[HANGDB] READY batch acquired" << std::endl;
             
             if (!has_batch) {
                 std::cout << "[HANGDB] No more batches, batch loop ending (num_batches=" << num_batches << ")" << std::endl;
