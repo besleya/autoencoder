@@ -151,7 +151,7 @@ int main() {
     batch.d_row_idx   = d_row_idx;
     batch.d_values    = d_values;
     batch.ready_event = nullptr;
-    batch.eof_after   = true;
+    batch.chunk_end   = true;
 
     // -----------------------------------------------------------------------
     // 6. Build autoencoder: [m, 128, m]

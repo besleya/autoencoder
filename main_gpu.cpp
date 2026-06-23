@@ -287,7 +287,7 @@ int main(int argc, char** argv) {
             for (float l : losses) {
                 col = static_cast<int>(std::lround(l * scaler));
                 if (col < 0) col = 0;
-                std::cout << std::string(col, ' ') << "|  " << l << '\n';
+                std::cout << std::string(col, ' ') << "|  " << std::setprecision(9) << l << '\n';
             }
         }
 
