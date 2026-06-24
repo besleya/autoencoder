@@ -1,11 +1,11 @@
 #!/bin/bash
 #SBATCH --job-name=validate
-#SBATCH --output=/mnt/home/besleya/autoencoder/tests/validate/output_%j.txt
+#SBATCH --output=/mnt/home/besleya/autoencoder/tests/validate/output_%j_%x.txt
 #SBATCH --time=00:30:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=12G
-#SBATCH --partition=short-gpu
+#SBATCH --partition=debug-gpu
 #SBATCH --gpus-per-node=nvidia_h100_nvl:1
 
 set -e
@@ -27,6 +27,6 @@ echo "C++ validator exited with code: $CPP_EXIT_CODE"
 
 # Run Python comparison
 echo "Running Python comparison..."
-/mnt/home/besleya/s3/bin/python3 /mnt/home/besleya/autoencoder/tests/validate/compare.py --recompute-cache
+/mnt/home/besleya/s3/bin/python3 /mnt/home/besleya/autoencoder/tests/validate/compare.py --use-cache #--recompute-cache
 
-echo "Job $SLURM_JOB_ID finished. See /mnt/home/besleya/autoencoder/tests/validate/output_$SLURM_JOB_ID.txt"
+echo "Job $SLURM_JOB_ID finished. See ~/autoencoder/tests/validate/output_${SLURM_JOB_ID}_${SLURM_JOB_NAME}.txt"

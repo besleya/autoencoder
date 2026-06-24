@@ -286,11 +286,11 @@ int main() {
 
         // --- Forward pass ---
         ae.forward(batch, stream);
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        // CUDA_CHECK(cudaStreamSynchronize(stream));
 
         // --- Backward + Adam step ---
         ae.backward_and_step(batch, LR, stream);
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        // CUDA_CHECK(cudaStreamSynchronize(stream));
 
         // --- Read epoch loss ---
         const float mse = ae.read_epoch_loss(1);  // num_batches=1

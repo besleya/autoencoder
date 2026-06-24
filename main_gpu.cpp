@@ -256,7 +256,7 @@ int main(int argc, char** argv) {
                 
                 int current_pass = ring.lane_pass(lane);
                 std::cout << "[lane=" << lane << " pass=" << current_pass << "] mean_loss=" 
-                          << std::fixed << std::setprecision(6) << chunk_mean_loss
+                          << std::fixed << std::setprecision(9) << chunk_mean_loss
                           << "  (chunk end, " << lane_loss_count[lane] << " batches)" << std::endl;
                 
                 // Reset accumulator for next chunk
