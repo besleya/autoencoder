@@ -3,11 +3,9 @@
 
 #include "gpu_autoencoder.h"
 #include "gpu_data_loader.h"
-#include "gpu_timer.h"
 #include "ring.h"
 
 #include <algorithm>
-#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
@@ -20,7 +18,6 @@
 #include <vector>
 
 #include <cuda_runtime.h>
-#include <nvtx3/nvToolsExt.h>
 
 // ============================================================================
 // CUDA error checking
@@ -106,24 +103,11 @@ static Options parse_args(int argc, char** argv) {
 }
 
 // ---------------------------------------------------------------------------
-// Timing helpers
-// ---------------------------------------------------------------------------
-
-namespace {
-    static double ms_since(std::chrono::steady_clock::time_point t0) {
-        auto t1 = std::chrono::steady_clock::now();
-        return std::chrono::duration<double, std::milli>(t1 - t0).count();
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 int main(int argc, char** argv) {
     try {
-        auto t_start = std::chrono::steady_clock::now();
         Options opt = parse_args(argc, argv);
-        std::cout << "Argument parsing: " << ms_since(t_start) << " ms" << std::endl;
 
         // Build full layer list: [m] + hidden + reverse(hidden[:-1]) + [m]
         // We'll get m from the loader after construction.
@@ -132,17 +116,12 @@ int main(int argc, char** argv) {
         
         // Construct RNG and initialize the autoencoder BEFORE the first epoch.
         // This ensures RNG is consumed in the same order as the CPU main.cpp.
-        nvtxRangePushA("main:init");
-        auto t_init = std::chrono::steady_clock::now();
         std::mt19937 rng(opt.seed);
         
         // Create the data loader. RNG is passed by reference; from now on,
         // begin_epoch() will consume RNG state for shuffling.
-        auto t_loader = std::chrono::steady_clock::now();
-        std::cout << "Constructing GPU data loader..." << std::endl;
         Ring ring(1, 4, AlternationPolicy::SINGLE);
         DataLoader loader(opt.files, opt.chunk_size, opt.batch_size, rng, &ring, /*lane_id=*/0);
-        std::cout << "Data loader construction: " << ms_since(t_loader) << " ms" << std::endl;
         
         // Peek the feature count from the loader
         const int m = loader.m();
@@ -160,8 +139,6 @@ int main(int argc, char** argv) {
 
         GpuAutoencoder net;
         net.init(layer_dims, rng);
-        std::cout << "Model initialization: " << ms_since(t_init) << " ms" << std::endl;
-        nvtxRangePop();
 
         std::cout << "\n=== Training summary ===\n"
                   << "  files           : " << opt.files.size() << '\n'
@@ -183,14 +160,8 @@ int main(int argc, char** argv) {
         cudaStream_t trainer_stream;
         CUDA_CHECK(cudaStreamCreateWithFlags(&trainer_stream, cudaStreamNonBlocking));
         
-        nvtxRangePushA("main:train_loop");
-        auto t_train_total = std::chrono::steady_clock::now();
-        std::cout << "[HANGDB] Starting training loop for " << opt.epochs << " epochs" << std::endl;
-        
         // Start the loader once at the beginning
-        std::cout << "[HANGDB] Calling loader.start()" << std::endl;
         loader.start();
-        std::cout << "[HANGDB] loader.start() returned, resetting loss" << std::endl;
         net.reset_epoch_loss();
         
         // Track per-lane loss accumulation
@@ -202,11 +173,6 @@ int main(int argc, char** argv) {
         int lane, slot;
         int primary_lane = 0;  // Default to lane 0
 
-        // Accumulate timing across all passes
-        double time_acquire_ready = 0.0;
-        double time_forward = 0.0;
-        double time_backward = 0.0;
-
         while (true) {
             // Check if primary lane has completed max passes
             if (ring.lane_pass(primary_lane) >= opt.epochs) {
@@ -215,11 +181,7 @@ int main(int argc, char** argv) {
                 break;
             }
 
-            nvtxRangePushA("acquire_ready");
-            auto t_batch_load = std::chrono::steady_clock::now();
             bool has_batch = ring.acquire_ready(&batch, &lane, &slot);
-            time_acquire_ready += ms_since(t_batch_load);
-            nvtxRangePop();
             
             if (!has_batch) {
                 std::cout << "[HANGDB] No more batches, batch loop ending (num_batches=" << num_batches << ")" << std::endl;
@@ -229,17 +191,8 @@ int main(int argc, char** argv) {
             // GPU fence: wait for loader's H2D + lognorm to complete
             CUDA_CHECK(cudaStreamWaitEvent(trainer_stream, batch.ready_event, 0));
 
-            nvtxRangePushA("forward");
-            auto t_fwd = std::chrono::steady_clock::now();
             net.forward(batch, trainer_stream);
-            time_forward += ms_since(t_fwd);
-            nvtxRangePop();
-
-            nvtxRangePushA("backward_and_step");
-            auto t_bwd = std::chrono::steady_clock::now();
             net.backward_and_step(batch, opt.lr, trainer_stream);
-            time_backward += ms_since(t_bwd);
-            nvtxRangePop();
             // Fence trainer_stream before returning the slot so the loader cannot
             // overwrite this slot's device buffers while our kernels are still reading them.
             CUDA_CHECK(cudaStreamSynchronize(trainer_stream));
@@ -268,18 +221,10 @@ int main(int argc, char** argv) {
             }
         }
         
-        std::cout << "[HANGDB] Batch loop complete, calling ring.shutdown()" << std::endl;
         ring.shutdown();
-        
-        double train_total_ms = ms_since(t_train_total);
-        std::cout << "[HANGDB] Training loop completed, total_ms=" << std::fixed << std::setprecision(1) << train_total_ms << std::endl;
-        nvtxRangePop();
         
         // Clean up trainer stream
         CUDA_CHECK(cudaStreamDestroy(trainer_stream));
-        
-        // Print grand total timings across all passes
-        gpu_timers().report(std::cout, "All Passes Grand Total", true);
         
         // Print a final summary of grand totals across all passes
         std::cout << "\n=== Training Complete ===\n" << std::endl;
