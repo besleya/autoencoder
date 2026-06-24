@@ -240,9 +240,6 @@ int main(int argc, char** argv) {
             net.backward_and_step(batch, opt.lr, trainer_stream);
             time_backward += ms_since(t_bwd);
             nvtxRangePop();
-            // Fence trainer_stream before returning the slot so the loader cannot
-            // overwrite this slot's device buffers while our kernels are still reading them.
-            CUDA_CHECK(cudaStreamSynchronize(trainer_stream));
             ring.release_consumed(lane, slot);
             
             ++num_batches;
