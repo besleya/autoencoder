@@ -6,11 +6,12 @@
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=12G
 #SBATCH --partition=debug-gpu
-#SBATCH --gpus-per-node=nvidia_h100_nvl:1
+#SBATCH --gpus-per-node=tesla_v100s:1
 
 set -e
 
 echo "Starting validation job $SLURM_JOB_ID"
+date
 
 # Build C++ validator
 cd /mnt/home/besleya/autoencoder
