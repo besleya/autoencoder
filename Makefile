@@ -20,45 +20,10 @@ SINGLET_INCLUDE := -I/mnt/home/besleya/singlet/include
 # NVCC flags for device code compilation
 NVCCFLAGS ?= -O3 -std=c++17 -x cu -dc --gpu-architecture=sm_90 -Xcompiler "-pthread -fopenmp"
 
-OBJS = main.o autoencoder.o data.o
-TARGET = main_ae
+.PHONY: all clean profile validate
 
-.PHONY: all clean test alt_obj version profile validate
-
-# Default target: build test only (main_ae is broken pending downstream
-# Dataset refactor to DeviceCSC)
-all: test
-
-# Legacy main_ae target (currently broken; main.cpp incompatible with new
-# DeviceCSC-based Dataset)
-$(TARGET): $(OBJS)
-	$(CXX) $(LDFLAGS) $(OBJS) -o $@ $(LDLIBS) $(CUDA_LIBS)
-
-main.o: main.cpp autoencoder.h data.h
-	$(CXX) $(CXXFLAGS) -c main.cpp -o $@
-
-autoencoder.o: autoencoder.cpp autoencoder.h
-	$(CXX) $(CXXFLAGS) -c autoencoder.cpp -o $@
-
-data.o: data.cpp data.h
-	$(NVCC) -O3 -std=c++17 -x cu --gpu-architecture=sm_90 $(CUDA_INCLUDE) $(SINGLET_INCLUDE) -c data.cpp -o $@
-
-# Test executable: loads dataset and inspects structure
-test: test.o
-	$(NVCC) test.o -o $@ -lzstd -L$(CUDA_HOME)/lib64 -lcudart -Xcompiler -fopenmp
-
-test.o: test.cpp
-	$(CXX) $(CXXFLAGS) $(CUDA_INCLUDE) $(SINGLET_INCLUDE) -c test.cpp -o $@
-
-# Alternative implementation (host-side concat): builds only, no link
-# (Removed: no longer part of new DataLoader architecture)
-
-# Version file (standalone executable showing build info)
-version: version.o
-	$(CXX) $(LDFLAGS) version.o -o $@ $(LDLIBS)
-
-version.o: version.cpp
-	$(CXX) $(CXXFLAGS) $(SINGLET_INCLUDE) -c version.cpp -o $@
+# Default target: build main_gpu and validate
+all: main_gpu validate
 
 # GPU autoencoder driver: mirrors main.cpp but uses GPU modules
 main_gpu: main_gpu.o gpu_autoencoder.o gpu_data_loader.o ring.o main_gpu.dlink.o layer.o
@@ -80,25 +45,7 @@ layer.o: layer.cu layer.h
 main_gpu.dlink.o: main_gpu.o gpu_autoencoder.o gpu_data_loader.o ring.o layer.o
 	$(NVCC) -dlink -o main_gpu.dlink.o main_gpu.o gpu_autoencoder.o gpu_data_loader.o ring.o layer.o --gpu-architecture=sm_90
 
-# bench_loader: standalone benchmark for DataLoader
-bench_loader: ring.o gpu_data_loader.o bench_loader.o bench_loader.dlink.o
-	$(CXX) -pthread -fopenmp $(LDFLAGS) ring.o gpu_data_loader.o bench_loader.o bench_loader.dlink.o -o $@ -Wl,--allow-multiple-definition $(CUDA_LIBS) -lcublas -lcusparse -lzstd
 
-bench_loader.o: bench_loader.cpp gpu_data_loader.h gpu_timer.h
-	$(NVCC) -O3 -std=c++17 -x cu -dc --gpu-architecture=sm_90 $(CUDA_INCLUDE) $(SINGLET_INCLUDE) -c bench_loader.cpp -o $@
-
-bench_loader.dlink.o: bench_loader.o ring.o gpu_data_loader.o
-	$(NVCC) -dlink -o bench_loader.dlink.o bench_loader.o ring.o gpu_data_loader.o --gpu-architecture=sm_90
-
-# bench_loader_latency: standalone benchmark for DataLoader latency
-bench_loader_latency: ring.o gpu_data_loader.o bench_loader_latency.o bench_loader_latency.dlink.o
-	$(CXX) -pthread -fopenmp $(LDFLAGS) ring.o gpu_data_loader.o bench_loader_latency.o bench_loader_latency.dlink.o -o $@ -Wl,--allow-multiple-definition $(CUDA_LIBS) -lcublas -lcusparse -lzstd
-
-bench_loader_latency.o: bench_loader_latency.cpp gpu_data_loader.h ring.h
-	$(NVCC) -O3 -std=c++17 -x cu -dc --gpu-architecture=sm_90 $(CUDA_INCLUDE) $(SINGLET_INCLUDE) -c bench_loader_latency.cpp -o $@
-
-bench_loader_latency.dlink.o: bench_loader_latency.o ring.o gpu_data_loader.o
-	$(NVCC) -dlink -o bench_loader_latency.dlink.o bench_loader_latency.o ring.o gpu_data_loader.o --gpu-architecture=sm_90
 # Validation binary: deterministic training check (writes CSVs; run on GPU node)
 validate: tests/validate/validate
 
@@ -118,10 +65,7 @@ tests/validate/validate.dlink.o: tests/validate/validate.o gpu_autoencoder.o gpu
 profile: main_gpu
 	nsys profile --force-overwrite=true --stats=true --trace=cuda,nvtx --sample=none --cpuctxsw=none -o $(NSYS_OUT) ./main_gpu $(ARGS)
 
-clean_bench_loader:
-	rm -f bench_loader_latency.o bench_loader_latency.dlink.o bench_loader_latency
-
 clean:
-	rm -f $(OBJS) $(TARGET) test.o test main_gpu.o gpu_autoencoder.o gpu_data_loader.o ring.o main_gpu.dlink.o main_gpu layer.o bench_loader.o bench_loader.dlink.o bench_loader bench_loader_latency.o bench_loader_latency.dlink.o bench_loader_latency
+	rm -f main_gpu.o gpu_autoencoder.o gpu_data_loader.o ring.o main_gpu.dlink.o main_gpu layer.o
 	rm -f tests/validate/validate.o tests/validate/validate.dlink.o tests/validate/validate
 
