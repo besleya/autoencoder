@@ -9,8 +9,8 @@
 // Run:    ./tests/validate/validate      (requires GPU)
 
 #include "gpu_autoencoder.h"
-#include "gpu_data_loader.h"
-#include "ring.h"
+// #include "gpu_data_loader.h"
+// #include "ring.h"
 #include "layer.h"
 
 #include <singlet/pileup/pz_reader.h>
