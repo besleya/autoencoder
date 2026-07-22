@@ -62,6 +62,8 @@ Concretely, Ring keeps a `next_consume_idx`. `next_ready_batch()`:
 
 Consumer signals the slot free via `Batch`'s consume/destruct path (see [batch.md](batch.md)).
 
+> **Bug to NOT reproduce.** The current Ring's round-robin mode *skips* a lane if it has no ready slot. That is a bug. The new `Ring::next_ready_batch()` must **block** on `loaders_[next_consume_idx]` until that specific loader has a ready slot. Never advance the cursor past a species that isn't ready. Strict rotation, always.
+
 ## Shutdown
 
 ```cpp
