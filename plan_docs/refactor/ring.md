@@ -6,7 +6,7 @@ Scheduler and thread-pool owner. Cycles DataLoaders, keeps prefetch queues warm,
 
 - Own the CPU thread pool.
 - Own (or hold refs to) the set of registered `DataLoader`s.
-- Decide **which DataLoader** to schedule next (MVP: strict round-robin).
+- Decide **which DataLoader** to schedule next (MVP: strict round-robin — never skip a lane; wait for it).
 - Enforce back-pressure: never submit a prepare-task to the pool if the target `DataLoader` has no free `Slot`.
 - Serve the trainer: `next_ready_batch()` returns the next completed `Batch` in scheduling order.
 
@@ -45,7 +45,9 @@ for loader in loaders (round-robin, forever):
 
 `loader.fill(slot)` is where all real work happens: chunk load (if needed), Batch construction, log-norm, H2D, event record. On completion the Slot transitions filling→ready.
 
-**Why block on the current loader rather than skip?** Simpler; and if any one loader is falling behind, throttling the others prevents unbounded queue growth in the pool. The alternative (skip and revisit) can be added later if profiling shows imbalance hurts throughput.
+**Strict rotation — never skip.** If the current loader has no free slot, the dispatcher **blocks** on it. It does not advance to the next loader. This is the opposite of the current Ring implementation, which skips empty lanes in round-robin mode — that behavior is a bug and must not be carried forward. Strict rotation is what guarantees the trainer receives species in a deterministic cycle.
+
+**Why block on the current loader rather than skip?** Simpler; and if any one loader is falling behind, throttling the others prevents unbounded queue growth in the pool.
 
 ## Trainer interface
 
@@ -59,6 +61,8 @@ Concretely, Ring keeps a `next_consume_idx`. `next_ready_batch()`:
 1. Waits on `loaders_[next_consume_idx]` for a ready slot.
 2. Constructs (or reveals) the `Batch` for that slot.
 3. Advances `next_consume_idx` (round-robin).
+
+Like the dispatcher, the consumer never skips. If the next-in-cycle loader has no ready slot yet, `next_ready_batch()` blocks on it — even if a later loader has a ready batch waiting.
 
 Consumer signals the slot free via `Batch`'s consume/destruct path (see [batch.md](batch.md)).
 
@@ -79,6 +83,7 @@ void shutdown();
 - **Back-pressure**: pool queue depth is bounded by `sum(slots per loader) − ready count`. Because dispatcher blocks on `has_free_slot()`, the pool never accumulates beyond the total slot budget.
 - **Fairness**: strict round-robin dispatch and strict round-robin consume mean each species gets exactly its share of batches. No lane is starved.
 - **Trainer never waits unnecessarily**: as long as prefetch is faster than consume, `next_ready_batch()` returns immediately.
+- **Strict cyclic order**: both dispatch and consume walk loaders in registration order with no skipping. The trainer sees species in a perfectly deterministic cycle regardless of per-species prep-time variance.
 
 ## Testability
 
