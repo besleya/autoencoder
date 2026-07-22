@@ -1,115 +1,222 @@
 // SPDX-License-Identifier: MIT
-// ring.cu — implementation of Ring buffer for multi-lane batch scheduling.
+// ring.cu — implementation of dispatcher and thread pool for strict round-robin batch scheduling.
 
 #include "ring.h"
+#include "data_loader.h"
+#include "batch.h"
 
-#include <algorithm>
-#include <atomic>
 #include <chrono>
-#include <cmath>
-#include <cstdio>
 #include <iostream>
-#include <numeric>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 
 // ============================================================================
-// CUDA error checking
+// Constructor and destructor
 // ============================================================================
 
-#define CUDA_CHECK(call) do { \
-    cudaError_t err = (call); \
-    if (err != cudaSuccess) { \
-        std::ostringstream oss; \
-        oss << "CUDA error at " << __FILE__ << ":" << __LINE__ << ": " \
-            << cudaGetErrorString(err); \
-        throw std::runtime_error(oss.str()); \
-    } \
-} while (0)
-
-// Internal structures Slot and Lane are defined in ring.h as private nested structs.
-
-// Forward declaration
-static void rebuild_weighted_schedule_impl(std::vector<int>& schedule,
-                                            const std::vector<Ring::Lane>& lanes);
-
-// ============================================================================
-// Ring implementation
-// ============================================================================
-
-Ring::Ring(int n_lanes, int ring_depth, AlternationPolicy policy)
-    : n_lanes_(n_lanes), ring_depth_(ring_depth), policy_(policy), lanes_(n_lanes) {
-    if (n_lanes <= 0 || ring_depth <= 0) {
-        throw std::runtime_error("Ring: n_lanes and ring_depth must be > 0");
-    }
-    if (policy == AlternationPolicy::SINGLE && n_lanes != 1) {
-        throw std::runtime_error("Ring: SINGLE policy requires n_lanes == 1");
+Ring::Ring(int n_worker_threads)
+    : loaders_(), started_(false), shutting_down_(false), shut_down_complete_(false) {
+    if (n_worker_threads <= 0) {
+        throw std::runtime_error("Ring: n_worker_threads must be > 0");
     }
 
-    // Initialize lanes
-    for (int i = 0; i < n_lanes; ++i) {
-        lanes_[i].slots.resize(ring_depth);
-        lanes_[i].free_count = ring_depth;
-        lanes_[i].ready_count = 0;
-
-        // Create CUDA events for each slot
-        for (int j = 0; j < ring_depth; ++j) {
-            CUDA_CHECK(cudaEventCreate(&lanes_[i].slots[j].ready_event,
-                                       cudaEventDisableTiming));
-        }
-    }
-
-    // Precompute weighted schedule if needed
-    if (policy == AlternationPolicy::WEIGHTED) {
-        rebuild_weighted_schedule_impl(weighted_schedule_, lanes_);
+    // Spawn worker threads
+    for (int i = 0; i < n_worker_threads; ++i) {
+        workers_.emplace_back([this] { pool_worker_loop(); });
     }
 }
+
 
 Ring::~Ring() {
-    shutdown();
-    for (int i = 0; i < n_lanes_; ++i) {
-        for (int j = 0; j < ring_depth_; ++j) {
-            lanes_[i].slots[j].destroy();
+    if (started_ && !shut_down_complete_) {
+        shutdown();
+    }
+}
+
+
+// ============================================================================
+// add_loader
+// ============================================================================
+
+void Ring::add_loader(DataLoader* loader) {
+    if (started_) {
+        throw std::runtime_error("Ring::add_loader: cannot add loader after start()");
+    }
+    if (!loader) {
+        throw std::runtime_error("Ring::add_loader: null loader");
+    }
+    loaders_.push_back(loader);
+}
+
+// ============================================================================
+// start
+// ============================================================================
+
+void Ring::start() {
+    if (loaders_.empty()) {
+        throw std::runtime_error("Ring::start: at least one loader required");
+    }
+    bool expected = false;
+    if (!started_.compare_exchange_strong(expected, true)) {
+        throw std::runtime_error("Ring::start: already started");
+    }
+
+    dispatcher_thread_ = std::thread([this] { dispatcher_loop(); });
+}
+
+// ============================================================================
+// shutdown
+// ============================================================================
+
+void Ring::shutdown() {
+    // Idempotent: exit early if already shut down
+    if (shut_down_complete_.exchange(true)) {
+        return;  // Already complete
+    }
+
+    shutting_down_ = true;
+
+    // Wake all workers
+    {
+        std::lock_guard<std::mutex> lock(pool_mtx_);
+        pool_cv_.notify_all();
+    }
+
+    // Join dispatcher
+    if (dispatcher_thread_.joinable()) {
+        dispatcher_thread_.join();
+    }
+
+    // Join workers
+    for (auto& w : workers_) {
+        if (w.joinable()) {
+            w.join();
         }
     }
 }
 
-// Rebuild the weighted schedule (called by constructor and set_weight).
-// For simplicity, creates a schedule of at most 64 repeats.
-static void rebuild_weighted_schedule_impl(std::vector<int>& schedule,
-                                            const std::vector<Ring::Lane>& lanes) {
-    schedule.clear();
-    if (lanes.empty()) return;
+// ============================================================================
+// next_ready_batch
+// ============================================================================
 
-    // Find LCM of n_lanes and limit schedule size
-    std::vector<double> weights;
-    for (const auto& lane : lanes) {
-        weights.push_back(lane.weight);
+std::unique_ptr<Batch> Ring::next_ready_batch() {
+    if (loaders_.empty()) {
+        throw std::runtime_error("Ring::next_ready_batch: no loaders registered");
     }
 
-    // Normalize weights to integers for scheduling
-    double min_w = *std::min_element(weights.begin(), weights.end());
-    if (min_w <= 0.0) min_w = 1.0;
-
-    std::vector<int> int_weights;
-    for (double w : weights) {
-        int_weights.push_back(std::max(1, static_cast<int>(std::round(w / min_w))));
+    // Strict round-robin: wait on the current loader
+    while (!shutting_down_) {
+        DataLoader* dl = loaders_[next_consume_idx_];
+        auto batch = dl->take_ready_batch();
+        if (!batch && shutting_down_) {
+            return nullptr;
+        }
+        if (batch) {
+            next_consume_idx_ = (next_consume_idx_ + 1) % loaders_.size();
+            return batch;
+        }
     }
 
-    int total = std::accumulate(int_weights.begin(), int_weights.end(), 0);
-    total = std::min(total, 64);  // cap schedule size
+    return nullptr;
+}
 
-    // Build simple round-robin schedule with weight repetition
-    for (int repeat = 0; repeat < total; ++repeat) {
-        int lane_id = repeat % lanes.size();
-        schedule.push_back(lane_id);
+// ============================================================================
+// Private: dispatcher_loop
+// ============================================================================
+
+void Ring::dispatcher_loop() {
+    while (!shutting_down_) {
+        if (loaders_.empty()) {
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+            continue;
+        }
+
+        DataLoader* dl = loaders_[next_dispatch_idx_];
+
+        // STRICT ROTATION: wait for THIS loader to have a free slot, never skip
+        Slot* slot = wait_for_free_slot(dl);
+        if (!slot) {
+            if (shutting_down_) break;
+            continue;
+        }
+
+        // Submit fill task to pool
+        submit_task([dl, slot] {
+            dl->fill(slot);
+        });
+
+        next_dispatch_idx_ = (next_dispatch_idx_ + 1) % loaders_.size();
     }
 }
 
-int Ring::acquire_free(int lane) {
-    if (lane < 0 || lane >= n_lanes_) {
-        throw std::runtime_error("Ring::acquire_free: invalid lane");
+// ============================================================================
+// Private: wait_for_free_slot (polling + sleep)
+// ============================================================================
+
+Slot* Ring::wait_for_free_slot(DataLoader* loader) {
+    // Poll until we get a free slot or shutdown is signaled.
+    // Since DataLoader doesn't expose a blocking reserve, we use polling.
+    // TODO: replace with blocking reserve_free_slot() when DataLoader exposes it.
+
+    while (!shutting_down_) {
+        Slot* slot = loader->reserve_free_slot();
+        if (slot) {
+            return slot;
+        }
+        // Poll every 50 microseconds to avoid burning CPU
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
     }
+
+    return nullptr;
+}
+
+// ============================================================================
+// Private: pool_worker_loop
+// ============================================================================
+
+void Ring::pool_worker_loop() {
+    while (true) {
+        std::function<void()> task;
+
+        {
+            std::unique_lock<std::mutex> lock(pool_mtx_);
+
+            // Wait for a task or shutdown signal
+            pool_cv_.wait(lock, [this] {
+                return !task_queue_.empty() || shutting_down_;
+            });
+
+            // Check for shutdown with empty queue
+            if (shutting_down_ && task_queue_.empty()) {
+                break;
+            }
+
+            // Dequeue if available
+            if (!task_queue_.empty()) {
+                task = std::move(task_queue_.front());
+                task_queue_.pop();
+            }
+        }
+
+        // Execute task outside lock
+        if (task) {
+            task();
+        }
+    }
+}
+
+// ============================================================================
+// Private: submit_task
+// ============================================================================
+
+void Ring::submit_task(std::function<void()> task) {
+    {
+        std::lock_guard<std::mutex> lock(pool_mtx_);
+        task_queue_.push(std::move(task));
+    }
+    pool_cv_.notify_one();
+}
 
     std::unique_lock<std::mutex> lock(mtx_);
 
