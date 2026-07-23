@@ -17,6 +17,7 @@
 // Forward declarations
 class DataLoader;
 class Batch;
+class Slot;
 
 // ============================================================================
 // SparseBatch — public contract for one mini-batch
