@@ -153,18 +153,10 @@ Batch::~Batch() {
 // Builds this batch's own col_ptr (prefix sum) into slot's pinned col_ptr buffer.
 // Returns total nnz.
 int Batch::layout() {
-    // Pass 1: sum up the nnz for each selected column
-    int total_nnz = 0;
-    for (int j = 0; j < B_; ++j) {
-        const int col_idx = column_indices_[j];
-        const uint32_t nnz_col = chunk_->col_ptr[col_idx + 1] - chunk_->col_ptr[col_idx];
-        total_nnz += nnz_col;
-    }
+    // Ensure slot has capacity for col_ptr (B_+1 entries); row/val sizes not yet known.
+    slot_->ensure_capacity(B_ + 1, 0, 0);
 
-    // Ensure slot has capacity
-    slot_->ensure_capacity(B_ + 1, total_nnz, total_nnz);
-
-    // Pass 2: write prefix sum into slot's pinned col_ptr buffer
+    // Single pass: write prefix sum directly into slot's pinned col_ptr buffer.
     int32_t* dst_col_ptr = slot_->pinned_col_ptr();
     dst_col_ptr[0] = 0;
     for (int j = 0; j < B_; ++j) {
@@ -172,6 +164,10 @@ int Batch::layout() {
         const uint32_t nnz_col = chunk_->col_ptr[col_idx + 1] - chunk_->col_ptr[col_idx];
         dst_col_ptr[j + 1] = dst_col_ptr[j] + static_cast<int32_t>(nnz_col);
     }
+    const int total_nnz = dst_col_ptr[B_];
+
+    // Now grow row_idx/values buffers to fit; col_ptr capacity already satisfied so it's untouched.
+    slot_->ensure_capacity(B_ + 1, total_nnz, total_nnz);
 
     return total_nnz;
 }
