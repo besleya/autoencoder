@@ -7,39 +7,49 @@
 #include <vector>
 #include <cuda_runtime.h>
 #include "slot.h"
-#include "ring.h"
 
 // Forward declaration
 class Slot;
+
+// Chunk — a concatenation of one or more singlet::pz::ReadResult objects along
+// columns (cells). DataLoader owns/produces this; Batch only ever reads from
+// it and assumes it remains valid for Batch's entire lifetime.
+struct Chunk {
+    int m = 0;                       // rows/features, same for the whole chunk
+    int n = 0;                       // total columns across concatenated files
+    std::vector<uint32_t> col_ptr;   // length n+1, cumulative nnz offsets (rebased across files)
+    std::vector<uint32_t> row_idx;   // length nnz, row/gene index per nonzero
+    std::vector<uint32_t> values;    // length nnz, raw widened counts (from read_1pz)
+};
+
+// SparseView — plain aggregate providing device pointers and shape for consumption.
+struct SparseView {
+    int m = 0, B = 0, nnz = 0;
+    const int32_t* d_col_ptr = nullptr;
+    const int32_t* d_row_idx = nullptr;
+    const float* d_values = nullptr;
+};
 
 // Transient abstraction of one training batch. Owns no memory;
 // borrows buffers and stream from a Slot. Move-only.
 class Batch {
 public:
-    // Constructor: takes ownership of a FILLING slot, metadata, and host-side CSC data.
-    // The caller must have already called slot->mark_filling() before constructing Batch.
-    // The CSC data (col_ptr, row_idx, values) is copied from host into the slot's
-    // pinned buffers during construction.
-    // 
+    // Constructor: cheap initialization. Stores references to chunk and slot; does not
+    // gather, allocate, or copy data. All heavy lifting deferred to prepare().
+    //
     // Arguments:
-    //   slot          - non-owning pointer to a Slot in FILLING state; slot must outlive prepare()
-    //   species_name  - human-readable species identifier
-    //   col_ptr       - host array of length B+1, CSC column pointers
-    //   row_idx       - host array of length nnz, CSC row indices
-    //   values        - host array of length nnz, CSC values
-    //   m             - number of rows (features) in the batch
-    //   B             - number of columns (batch size)
-    //   nnz           - number of nonzeros in the batch
-    //   chunk_end     - true if this is the last batch of a chunk
+    //   slot             - non-owning pointer to a Slot; must outlive Batch
+    //   species_name     - human-readable species identifier
+    //   chunk            - non-owning pointer to source Chunk; must remain valid
+    //   column_indices   - length B, column positions into chunk to gather
+    //   chunk_end        - true if this is the last batch of the chunk
+    //   scale            - scale factor for log-normalization (default 10000.0f)
     Batch(Slot* slot,
           std::string species_name,
-          const int32_t* col_ptr,
-          const int32_t* row_idx,
-          const float* values,
-          int m,
-          int B,
-          int nnz,
-          bool chunk_end);
+          const Chunk* chunk,
+          std::vector<int> column_indices,
+          bool chunk_end,
+          float scale = 10000.0f);
 
     // Destructor: marks the slot FREE if still bound (non-null).
     ~Batch();
@@ -50,8 +60,9 @@ public:
     Batch(const Batch&) = delete;
     Batch& operator=(const Batch&) = delete;
 
-    // Prepare the batch: copy CSC from pinned to device, launch log-normalize kernel,
-    // record ready event, and mark slot READY. Idempotent-safe (only call once per Batch).
+    // Gathers this batch's columns out of the chunk, casts types, CPU log-normalizes,
+    // ships to the GPU via slot's stream, and records slot's ready event.
+    // Called once, right after construction.
     void prepare();
 
     // Accessors
@@ -60,17 +71,24 @@ public:
     int                m() const;       // number of rows (features)
     int                B() const;       // number of columns (batch size)
     int                nnz() const;     // number of nonzeros
+    SparseView         sparse_view() const;
     cudaEvent_t        ready_event() const;
 
-    // Return a SparseBatch struct (from ring.h) populated with device pointers and shape.
-    // The SparseBatch::ready_event points to slot_->ready_event().
-    SparseBatch sparse_view() const;
-
 private:
-    Slot* slot_;                // non-owning, nullable after move
-    std::string species_name_;  // human-readable species identifier
-    int m_;                     // number of rows (features)
-    int B_;                     // number of columns (batch size)
-    int nnz_;                   // number of nonzeros
-    bool chunk_end_;            // true if last batch of chunk
+    Slot* slot_;                       // non-owning, nullable after move
+    std::string species_name_;         // human-readable species identifier
+    const Chunk* chunk_;               // non-owning, reference to source data
+    std::vector<int> column_indices_;  // length B_, column positions into chunk_
+    int m_ = 0;                        // number of rows (features)
+    int B_ = 0;                        // number of columns (batch size)
+    int nnz_ = 0;                      // number of nonzeros (computed in layout())
+    bool chunk_end_;                   // true if last batch of chunk
+    float scale_;                      // scale factor for log-normalization
+
+    // Builds this batch's own col_ptr (prefix sum) into slot's pinned col_ptr buffer;
+    // returns total nnz. Does NOT copy row_idx/values yet.
+    int layout();
+
+    // Copies col_ptr, row_idx, values to device via cudaMemcpyAsync and records ready event.
+    void to_device();
 };

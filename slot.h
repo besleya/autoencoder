@@ -69,6 +69,40 @@ public:
     // Ready event: recorded at end of Batch::prepare().
     cudaEvent_t ready_event() const;
 
+    // ========================================================================
+    // FUTURE: await_ready() blocking synchronization
+    // ========================================================================
+    //
+    // DESIGN NOTE (not yet implemented):
+    //
+    // A future public method await_ready() will provide a trainer-friendly way to
+    // block until this Slot's Batch is fully materialized and ready to consume.
+    // HOWEVER, it CANNOT be naively implemented as a simple cudaEventSynchronize()
+    // or cudaStreamWaitEvent() on ready_event_, because that event object is
+    // REUSED across Batch cycles.
+    //
+    // The problem: when a new Batch is bound to this Slot (the Batch is newly
+    // constructed/attached), the ready_event_ will still READ as "already
+    // completed" from its PREVIOUS cycle. This is dangerous — the trainer might
+    // incorrectly think the new Batch is ready when it is not. The event only
+    // becomes valid again when cudaEventRecord() is called at the very end of
+    // Batch::prepare() — after all the substantial CPU work: gathering columns,
+    // type-casting, log-normalizing, and issuing the H2D cudaMemcpyAsync calls.
+    //
+    // The solution: when a new Batch is bound (at Batch construction/attachment,
+    // before any CPU prep work starts), the Slot MUST be told explicitly that it
+    // is now in a "FILLING" state via a CPU-visible flag — NOT by waiting on the
+    // CUDA event. This flag can be set atomically or via condition variable.
+    //
+    // The future await_ready() will:
+    //   1. Wait for that flag to leave "FILLING" state (i.e. once the Batch's
+    //      prepare() has recorded the event)
+    //   2. Only THEN call cudaEventSynchronize() on the event to ensure all
+    //      H2D transfers and GPU work are complete.
+    //
+    // This prevents naive implementations that would incorrectly sync on a stale
+    // event from a previous Batch cycle.
+
 private:
     std::atomic<State> state_;
 

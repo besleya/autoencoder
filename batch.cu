@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: MIT
-// batch.cu — Implementation of Batch class. Handles H2D transfer, log-norm, and event recording.
+// batch.cu — Implementation of Batch class. Handles gathering, type-casting, log-norm, and H2D transfer.
 
 #include "batch.h"
 
 #include <cuda_runtime.h>
+#include <cmath>
 #include <cstring>
+#include <omp.h>
 #include <utility>
 #include <sstream>
 #include <stdexcept>
@@ -24,41 +26,54 @@
 } while (0)
 
 // ============================================================================
-// Log-normalization kernel (copied from gpu_data_loader.cu)
+// CPU gather+normalize function: fused type-cast and log-normalization
 // ============================================================================
 
-static constexpr float kBatchLogNormScaler = 10000.0f;
+namespace {
 
-__global__ void batch_log_normalize_columns_kernel(int n_cols,
-                                                    float scaler,
-                                                    const int32_t* __restrict__ col_ptr,
-                                                    float* __restrict__ values) {
-    int col = blockIdx.x;
-    if (col >= n_cols) return;
+static void gather_normalize(
+    const uint32_t* src_col_ptr,
+    const uint32_t* src_row_idx,
+    const uint32_t* src_values,
+    const std::vector<int>& column_indices,
+    int32_t* dst_col_ptr,
+    int32_t* dst_row_idx,
+    float* dst_values,
+    float scale) {
 
-    int start = col_ptr[col];
-    int end   = col_ptr[col + 1];
+    const int B = static_cast<int>(column_indices.size());
 
-    __shared__ float s_sum;
-    if (threadIdx.x == 0) s_sum = 0.0f;
-    __syncthreads();
+    #pragma omp parallel for schedule(static)
+    for (int j = 0; j < B; ++j) {
+        const uint32_t col_idx = column_indices[j];
+        const uint32_t src_start = src_col_ptr[col_idx];
+        const uint32_t src_end = src_col_ptr[col_idx + 1];
+        const int32_t dst_start = dst_col_ptr[j];
+        const int32_t dst_end = dst_col_ptr[j + 1];
 
-    // Phase 1: column sum via block-shared atomicAdd
-    float thread_sum = 0.0f;
-    for (int k = start + threadIdx.x; k < end; k += blockDim.x) {
-        thread_sum += values[k];
-    }
-    if (thread_sum != 0.0f) atomicAdd(&s_sum, thread_sum);
-    __syncthreads();
+        float col_sum = 0.0f;
 
-    float sum = s_sum;
-    if (sum > 0.0f) {
-        float inv = scaler / sum;
-        for (int k = start + threadIdx.x; k < end; k += blockDim.x) {
-            values[k] = log1pf(values[k] * inv);
+        // First pass: cast+copy and accumulate sum
+        for (uint32_t src_k = src_start, dst_k = dst_start; src_k < src_end; ++src_k, ++dst_k) {
+            dst_row_idx[dst_k] = static_cast<int32_t>(src_row_idx[src_k]);
+            float val = static_cast<float>(src_values[src_k]);
+            dst_values[dst_k] = val;
+            col_sum += val;
+        }
+
+        // Avoid division by zero; if sum is zero, leave values as-is
+        if (col_sum > 0.0f) {
+            float mult = scale / col_sum;
+
+            // Second pass: apply log1p transformation in place
+            for (int32_t dst_k = dst_start; dst_k < dst_end; ++dst_k) {
+                dst_values[dst_k] = std::log1p(dst_values[dst_k] * mult);
+            }
         }
     }
 }
+
+}  // namespace
 
 // ============================================================================
 // Batch implementation
@@ -66,42 +81,43 @@ __global__ void batch_log_normalize_columns_kernel(int n_cols,
 
 Batch::Batch(Slot* slot,
              std::string species_name,
-             const int32_t* col_ptr,
-             const int32_t* row_idx,
-             const float* values,
-             int m,
-             int B,
-             int nnz,
-             bool chunk_end)
+             const Chunk* chunk,
+             std::vector<int> column_indices,
+             bool chunk_end,
+             float scale)
     : slot_(slot),
       species_name_(std::move(species_name)),
-      m_(m),
-      B_(B),
-      nnz_(nnz),
-      chunk_end_(chunk_end) {
+      chunk_(chunk),
+      column_indices_(std::move(column_indices)),
+      B_(static_cast<int>(column_indices_.size())),
+      chunk_end_(chunk_end),
+      scale_(scale) {
     
     if (!slot_) {
         throw std::runtime_error("Batch constructor: slot must not be null");
     }
 
-    // Ensure slot has capacity for this batch
-    slot_->ensure_capacity(B + 1, nnz, nnz);
+    if (!chunk_) {
+        throw std::runtime_error("Batch constructor: chunk must not be null");
+    }
 
-    // Copy CSC data from host into slot's pinned buffers
-    std::memcpy(slot_->pinned_col_ptr(), col_ptr, sizeof(int32_t) * (B + 1));
-    std::memcpy(slot_->pinned_row_idx(), row_idx, sizeof(int32_t) * nnz);
-    std::memcpy(slot_->pinned_values(), values, sizeof(float) * nnz);
+    m_ = chunk_->m;
+    slot_->mark_filling();
 }
 
 // Move constructor
 Batch::Batch(Batch&& other) noexcept
     : slot_(other.slot_),
       species_name_(std::move(other.species_name_)),
+      chunk_(other.chunk_),
+      column_indices_(std::move(other.column_indices_)),
       m_(other.m_),
       B_(other.B_),
       nnz_(other.nnz_),
-      chunk_end_(other.chunk_end_) {
+      chunk_end_(other.chunk_end_),
+      scale_(other.scale_) {
     other.slot_ = nullptr;
+    other.chunk_ = nullptr;
 }
 
 // Move assignment
@@ -114,11 +130,15 @@ Batch& Batch::operator=(Batch&& other) noexcept {
         // Transfer ownership
         slot_ = other.slot_;
         species_name_ = std::move(other.species_name_);
+        chunk_ = other.chunk_;
+        column_indices_ = std::move(other.column_indices_);
         m_ = other.m_;
         B_ = other.B_;
         nnz_ = other.nnz_;
         chunk_end_ = other.chunk_end_;
+        scale_ = other.scale_;
         other.slot_ = nullptr;
+        other.chunk_ = nullptr;
     }
     return *this;
 }
@@ -130,13 +150,34 @@ Batch::~Batch() {
     }
 }
 
-// Prepare: ship to GPU, log-normalize, record event, mark ready
-void Batch::prepare() {
-    if (!slot_) {
-        throw std::runtime_error("Batch::prepare: batch is not bound (may have been moved)");
+// Builds this batch's own col_ptr (prefix sum) into slot's pinned col_ptr buffer.
+// Returns total nnz.
+int Batch::layout() {
+    // Pass 1: sum up the nnz for each selected column
+    int total_nnz = 0;
+    for (int j = 0; j < B_; ++j) {
+        const int col_idx = column_indices_[j];
+        const uint32_t nnz_col = chunk_->col_ptr[col_idx + 1] - chunk_->col_ptr[col_idx];
+        total_nnz += nnz_col;
     }
 
-    // Issue H2D transfers on the slot's stream
+    // Ensure slot has capacity
+    slot_->ensure_capacity(B_ + 1, total_nnz, total_nnz);
+
+    // Pass 2: write prefix sum into slot's pinned col_ptr buffer
+    int32_t* dst_col_ptr = slot_->pinned_col_ptr();
+    dst_col_ptr[0] = 0;
+    for (int j = 0; j < B_; ++j) {
+        const int col_idx = column_indices_[j];
+        const uint32_t nnz_col = chunk_->col_ptr[col_idx + 1] - chunk_->col_ptr[col_idx];
+        dst_col_ptr[j + 1] = dst_col_ptr[j] + static_cast<int32_t>(nnz_col);
+    }
+
+    return total_nnz;
+}
+
+// Copies col_ptr, row_idx, values to device and records ready event.
+void Batch::to_device() {
     BATCH_CUDA_CHECK(cudaMemcpyAsync(
         slot_->device_col_ptr(),
         slot_->pinned_col_ptr(),
@@ -161,19 +202,27 @@ void Batch::prepare() {
         slot_->stream()
     ));
 
-    // Launch log-normalize kernel on the slot's stream
-    // One block per column; each block computes the sum and applies the transform
-    batch_log_normalize_columns_kernel<<<B_, 256, 0, slot_->stream()>>>(
-        B_,
-        kBatchLogNormScaler,
-        slot_->device_col_ptr(),
-        slot_->device_values()
-    );
-
-    // Record the ready event on the slot's stream
     BATCH_CUDA_CHECK(cudaEventRecord(slot_->ready_event(), slot_->stream()));
+}
 
-    // Mark the slot READY (atomic state transition)
+// Prepare: gather, normalize, and ship to device.
+void Batch::prepare() {
+    if (!slot_) {
+        throw std::runtime_error("Batch::prepare: batch is not bound (may have been moved)");
+    }
+
+    if (!chunk_) {
+        throw std::runtime_error("Batch::prepare: chunk is not bound");
+    }
+
+    nnz_ = layout();
+
+    gather_normalize(chunk_->col_ptr.data(), chunk_->row_idx.data(), chunk_->values.data(),
+                     column_indices_, slot_->pinned_col_ptr(), slot_->pinned_row_idx(),
+                     slot_->pinned_values(), scale_);
+
+    to_device();
+
     slot_->mark_ready();
 }
 
@@ -205,20 +254,17 @@ cudaEvent_t Batch::ready_event() const {
     return slot_->ready_event();
 }
 
-// Build and return a SparseBatch struct for downstream consumers
-SparseBatch Batch::sparse_view() const {
+SparseView Batch::sparse_view() const {
     if (!slot_) {
         throw std::runtime_error("Batch::sparse_view: batch is not bound (may have been moved)");
     }
 
-    return SparseBatch{
+    return SparseView{
         m_,
         B_,
         nnz_,
         slot_->device_col_ptr(),
         slot_->device_row_idx(),
-        slot_->device_values(),
-        slot_->ready_event(),
-        chunk_end_
+        slot_->device_values()
     };
 }
