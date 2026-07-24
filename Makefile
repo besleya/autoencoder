@@ -27,8 +27,8 @@ NVCCFLAGS ?= -O3 -std=c++17 -x cu -dc --gpu-architecture=sm_90 -Xcompiler "-pthr
 all: main_gpu
 
 # GPU autoencoder driver: multi-species training with shared layers
-main_gpu: main_gpu.o gpu_autoencoder.o translator.o slot.o batch.o data_loader.o ring.o layer.o main_gpu.dlink.o
-	$(CXX) -pthread -fopenmp $(LDFLAGS) main_gpu.o gpu_autoencoder.o translator.o slot.o batch.o data_loader.o ring.o layer.o main_gpu.dlink.o -o $@ -Wl,--allow-multiple-definition $(CUDA_LIBS) -lcublas -lcusparse -lnvToolsExt -lzstd
+main_gpu: main_gpu.o gpu_autoencoder.o translator.o slot.o batch.o data_loader.o ring.o layer.o validate_1pz.o main_gpu.dlink.o
+	$(CXX) -pthread -fopenmp $(LDFLAGS) main_gpu.o gpu_autoencoder.o translator.o slot.o batch.o data_loader.o ring.o layer.o validate_1pz.o main_gpu.dlink.o -o $@ -Wl,--allow-multiple-definition $(CUDA_LIBS) -lcublas -lcusparse -lnvToolsExt -lzstd
 
 main_gpu.o: main_gpu.cpp translator.h ring.h data_loader.h batch.h gpu_autoencoder.h gpu_timer.h
 	$(NVCC) -O3 -lineinfo -std=c++17 -x cu -dc --gpu-architecture=sm_90 $(CUDA_INCLUDE) $(SINGLET_INCLUDE) -c main_gpu.cpp -o $@
@@ -45,7 +45,7 @@ slot.o: slot.cu slot.h
 batch.o: batch.cu batch.h slot.h ring.h
 	$(NVCC) -O3 -lineinfo -std=c++17 -x cu -rdc=true --gpu-architecture=sm_90 $(CUDA_INCLUDE) $(SINGLET_INCLUDE) -c batch.cu -o $@
 
-data_loader.o: data_loader.cu data_loader.h slot.h batch.h
+data_loader.o: data_loader.cu data_loader.h slot.h batch.h validate_1pz.h
 	$(NVCC) -O3 -lineinfo -std=c++17 -x cu -rdc=true --gpu-architecture=sm_90 $(CUDA_INCLUDE) $(SINGLET_INCLUDE) -c data_loader.cu -o $@
 
 ring.o: ring.cu ring.h
@@ -53,6 +53,9 @@ ring.o: ring.cu ring.h
 
 layer.o: layer.cu layer.h
 	$(NVCC) -O3 -lineinfo -std=c++17 -x cu -rdc=true --gpu-architecture=sm_90 $(CUDA_INCLUDE) $(SINGLET_INCLUDE) -c layer.cu -o $@
+
+validate_1pz.o: validate_1pz.cpp validate_1pz.h
+	$(CXX) -O3 -std=c++17 -pthread -fopenmp $(CUDA_INCLUDE) $(SINGLET_INCLUDE) -c validate_1pz.cpp -o $@
 
 main_gpu.dlink.o: main_gpu.o gpu_autoencoder.o translator.o slot.o batch.o data_loader.o ring.o layer.o
 	$(NVCC) -dlink -o main_gpu.dlink.o main_gpu.o gpu_autoencoder.o translator.o slot.o batch.o data_loader.o ring.o layer.o --gpu-architecture=sm_90
@@ -81,6 +84,6 @@ profile: main_gpu
 	nsys profile --force-overwrite=true --stats=true --trace=cuda,nvtx --sample=none --cpuctxsw=none -o $(NSYS_OUT) ./main_gpu $(ARGS)
 
 clean:
-	rm -f main_gpu.o gpu_autoencoder.o translator.o slot.o batch.o data_loader.o ring.o main_gpu.dlink.o main_gpu layer.o
+	rm -f main_gpu.o gpu_autoencoder.o translator.o slot.o batch.o data_loader.o ring.o main_gpu.dlink.o main_gpu layer.o validate_1pz.o
 	rm -f tests/validate/validate.o tests/validate/validate.dlink.o tests/validate/validate
 

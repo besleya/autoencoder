@@ -4,6 +4,7 @@
 #include "data_loader.h"
 #include "batch.h"
 #include "slot.h"
+#include "validate_1pz.h"
 
 #include <singlet/pileup/pz_reader.h>
 #include <singlet/gpu/core/types.h>
@@ -121,8 +122,8 @@ DataLoader::~DataLoader() {
 void DataLoader::start() {
     // Peek first file for feature count
     try {
-        singlet::pz::ReadResult r = singlet::pz::read_1pz(file_paths_[0]);
-        m_ = r.m;
+        PZHeader hdr = validate_1pz(file_paths_[0]);
+        m_ = hdr.m;
     } catch (const std::exception& e) {
         std::ostringstream oss;
         oss << file_paths_[0] << ": " << e.what();
