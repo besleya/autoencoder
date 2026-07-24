@@ -1,10 +1,10 @@
-# Slot — Design & Implementation Spec (superseding all prior drafts)
+# Slot — Design & Implementation Spec (v2, supersedes v1 below in history)
 
-> Status: **SPEC — not yet implemented.** This supersedes the previous
-> FREE/FILLING/READY draft below it in history. Do not rely on `slot.h`/`slot.cu`
-> as currently checked in — they implement the old, incomplete design (single
-> event, six capacity fields, no overwrite-hazard protection). This document is
-> the source of truth going forward. `HANDOFF.md` is a hint only and may be stale.
+> Status: **SPEC — approved, ready for implementation.** This supersedes the
+> checked-in `slot.h`/`slot.cu` (old FREE/FILLING/READY, single event, six
+> capacity fields) and the v1 draft of this document. `HANDOFF.md` is a hint
+> only and may be stale. `batch.md` is not modified by this doc, but this doc
+> does authorize small edits to `batch.h`/`batch.cu` (see "Batch changes").
 
 One prefetch buffer. Owns reusable pinned-host and device buffers sized to hold
 a cuSPARSE CSC object (`col_ptr`, `row_idx`, `values`). Tracks its own state and
@@ -22,21 +22,24 @@ empty → filling → full → empty → filling → full → ...
 
 - **empty**: no active batch. Free to be loaded with the next batch. Slots
   start here.
-- **filling**: Slot has an assigned `Batch`. Reached **immediately** when the
-  Ring/DataLoader issues a request to fill the slot — even if no worker thread
-  is available yet to actually prepare the batch, the slot sits in `filling`
-  for as long as it takes for a thread to pick up the work. This is a
-  CPU-visible flag, not tied to any GPU completion.
-- **full**: the batch has been completely prepared and its `cudaMemcpyAsync`
-  calls to the GPU have all been **issued** (enqueued) on the slot's stream.
-  This transition is also CPU-visible and does **not** imply the copies have
-  *finished* on the GPU — only that the CPU-side prep work is done and the
-  work is queued. The trainer must wait on `filled_event_` before it is safe
-  to read device buffers.
+- **filling**: slot has an assigned `Batch`. Reached **immediately** (CPU-
+  instant) when the producer decides to fill this slot — even before any
+  worker thread starts real work, and stays here for the whole gather/
+  normalize/H2D-issue sequence.
+- **full**: **not** reached until the batch's `cudaMemcpyAsync` calls have
+  actually **completed** on the GPU. `ready_event` is signaled at exactly
+  this point. `state()` reflects `kFull` once `ready_event` is observed
+  signaled — i.e. `full` is a true completion signal, not just "copies were
+  issued."
 
-Both transitions are driven by CPU-visible atomic state (matching the existing
-"immediate FILLING" behavior already documented for the old design) — GPU
-completion is tracked separately via the two events below.
+`empty` is reached again once the trainer has consumed the active `Batch` —
+concretely, once the `Batch` is discarded. `empty_event` is issued
+(recorded) at that point, on the consumer's stream.
+
+So `filling → empty` transitions are CPU-instant, driven directly by producer/
+consumer code. The `filling → full` transition is different: it is only ever
+*observed* to have happened by polling/waiting on `ready_event`; nothing sets
+it eagerly.
 
 ## Owned resources
 
@@ -51,33 +54,42 @@ completion is tracked separately via the two events below.
   H2D copies issued while filling. Owning one stream per slot is what lets
   multiple slots' prep work overlap on the GPU.
 - Two events, each reused across every fill/drain cycle of this slot:
-  - `cudaEvent_t filled_event_` — recorded on `stream_` at the moment the slot
-    transitions `filling → full`. The trainer waits on this before reading
-    device buffers.
-  - `cudaEvent_t empty_event_` — recorded on the **consumer's** stream at the
-    moment the slot transitions `full → empty`. The next producer waits on
-    this before overwriting device buffers, and `ensure_capacity()` waits on
-    it before freeing them.
+  - `cudaEvent_t ready_event_` — recorded on `stream_`, right after the last
+    H2D `cudaMemcpyAsync` for the current batch. Signals `full`.
+  - `cudaEvent_t empty_event_` — recorded on the **consumer-supplied**
+    stream when the batch is discarded. Signals `empty` is safe to build on
+    (device buffers no longer being read).
 
-### Why `empty_event_` exists (bug fixed vs. the old design)
+### Why two events, and why `full` needs a real completion signal
 
-The old single-event design let a new `Batch` immediately start overwriting a
-slot's device buffers as soon as it was marked `FILLING`, with no guarantee
-that a **previous** trainer read of those same buffers (e.g. a kernel still
-running on the trainer's own stream) had finished. `empty_event_` closes that
-race: it is recorded, by the consumer, on the consumer's stream when it is
-done with the batch, and the producer's stream is told to wait on it
-(`cudaStreamWaitEvent`) before any H2D copy touches the buffers again. Because
-`cudaStreamWaitEvent` is a cheap async enqueue, this costs nothing when the
-consumer is already done, and correctly stalls the producer stream (without
-blocking any CPU thread) when it isn't.
+`empty_event_` protects the **device** buffer: a new H2D copy must not start
+until the previous consumer's reads of that device memory (kernels enqueued
+on the consumer's own stream) have actually finished. The producer enqueues
+`cudaStreamWaitEvent(stream_, empty_event_)` before its own H2D copies so the
+GPU — not the CPU — enforces the order; this costs nothing when the consumer
+is already done and correctly stalls the producer stream (no CPU thread ever
+blocks) when it isn't.
 
-This also fixes a latent bug in the current `slot.cu`: `ensure_capacity()`
-calls `cudaFree`/`cudaFreeHost` unconditionally when growing, with nothing
-guaranteeing the GPU has actually finished reading the old device buffer.
+`ready_event_`/`full` protects the **host pinned** buffer: while a
+`cudaMemcpyAsync` H2D copy is in flight, the pinned source buffer it reads
+from must not be overwritten. If `full` became true the instant the copies
+were *issued* (the old design), nothing would stop a subsequent producer
+from starting to gather/normalize a new batch into the same pinned memory
+before the in-flight copy had actually finished reading it. Because the
+whole cycle is `filling → full → empty → filling`, and `full`/`empty` can
+only be reached in that order, requiring `full` to mean "copy actually
+complete" transitively guarantees that whenever a new `filling` phase begins
+writing to the pinned buffer, the previous copy from that same buffer is
+long since finished. This is why `full` must be a genuine completion signal
+and not a CPU-issued flag.
+
+This also fixes a latent bug in the currently checked-in `slot.cu`:
+`ensure_capacity()` calls `cudaFree`/`cudaFreeHost` unconditionally when
+growing, with no guarantee the GPU has finished touching the old buffers.
 `cudaStreamWaitEvent` only orders *stream operations*, not host-issued
-`cudaFree` calls, so the new spec requires `ensure_capacity()` to
-`cudaEventSynchronize(empty_event_)` before freeing anything (see below).
+`cudaFree` calls, so `ensure_capacity()` must `cudaEventSynchronize()` on the
+relevant event before freeing anything it isn't certain is idle (see
+interface below).
 
 ## Interface
 
@@ -87,9 +99,9 @@ public:
     enum class State { kEmpty, kFilling, kFull };
 
     // Allocates pinned + device buffers at the given capacities, creates the
-    // stream and both events (empty_event_ starts in an "already recorded/
-    // completed" state so the first fill never blocks). Initial state: kEmpty.
-    Slot(int col_capacity, int nnz_capacity);
+    // stream and both events. empty_event_ is recorded once, up front, so
+    // the very first fill never has to wait. Initial state: kEmpty.
+    Slot(int col_cap, int nnz_cap);
 
     ~Slot();  // frees device + pinned buffers, destroys stream + both events
 
@@ -99,33 +111,41 @@ public:
     Slot& operator=(Slot&&) = delete;
 
     // ---- State ----
-    State state() const;  // atomic load, memory_order_acquire
+    // Lazily upgrades kFilling -> kFull by polling ready_event_ (cheap,
+    // non-blocking cudaEventQuery). Never blocks. kEmpty/kFull are read as-is.
+    State state() const;
 
-    // empty -> filling. Asserts prior state == kEmpty.
-    // Also enqueues cudaStreamWaitEvent(stream_, empty_event_) on stream_ so
-    // that any producer work queued afterwards (memcpys) cannot start on the
-    // GPU until the previous consumer's reads have completed. Safe/cheap to
-    // call even when nothing needs waiting for.
-    void mark_filling();
+    // kEmpty -> kFilling. No assert (Batch already validated via throw —
+    // see "Batch changes"); Slot itself does not enforce 1:1.
+    void fill();
 
-    // filling -> full. Asserts prior state == kFilling.
-    // Records filled_event_ on stream_ (this must be called AFTER all H2D
-    // cudaMemcpyAsync calls for this batch have been issued on stream_, so
-    // that filled_event_ only completes once they have).
-    void mark_full();
+    // Records ready_event_ on stream_. Call this after issuing the last H2D
+    // cudaMemcpyAsync for the batch. Does not touch state_ directly — state()
+    // observes completion lazily (see above).
+    void mark_ready();
 
-    // full -> empty. Asserts prior state == kFull.
-    // Records empty_event_ on the CALLER-SUPPLIED consumer_stream (the
-    // trainer's own stream) — this must be called AFTER the consumer has
-    // issued all its reads of the device buffers on that stream.
+    // Records empty_event_ on the caller-supplied consumer stream, then sets
+    // state_ = kEmpty immediately (CPU-instant). Call this when discarding
+    // the batch, after issuing (not necessarily completing) all reads of
+    // device buffers on consumer_stream.
     void mark_empty(cudaStream_t consumer_stream);
+
+    // ---- Waiting ----
+    // CPU-blocking: cudaEventSynchronize. GPU-ordering: cudaStreamWaitEvent
+    // (enqueues a wait on the given stream; never blocks the calling thread).
+    void await_full();
+    void await_full(cudaStream_t stream);
+    void await_empty();
+    void await_empty(cudaStream_t stream);
 
     // ---- Buffer management ----
     // Grows pinned+device buffers if requested capacities exceed current
-    // ones; no-op otherwise. Only valid to call while state() == kFilling
-    // (asserts). If it needs to grow, synchronizes on empty_event_ before
-    // freeing old buffers (see hazard note above).
-    void ensure_capacity(int new_col_capacity, int new_nnz_capacity);
+    // ones; no-op otherwise. Only valid while state() != kEmpty (i.e. during
+    // an active fill). If growth is needed, synchronizes on empty_event_
+    // before freeing old buffers (see hazard note above). Branches are
+    // ordered/annotated so growth is the unlikely path (see "Optimization
+    // notes" below) — col growth is expected almost never, nnz growth rarely.
+    void grow(int col_cap, int nnz_cap);
 
     int col_capacity() const;
     int nnz_capacity() const;
@@ -139,9 +159,9 @@ public:
     float*   device_values()  const;
 
     // ---- CUDA resource accessors ----
-    cudaStream_t stream() const;        // slot's own stream (producer side)
-    cudaEvent_t  filled_event() const;  // wait on this before reading device buffers
-    cudaEvent_t  empty_event() const;   // recorded by consumer; do not record elsewhere
+    cudaStream_t stream() const;       // slot's own stream (producer side)
+    cudaEvent_t  ready_event() const;
+    cudaEvent_t  empty_event() const;
 
 private:
     std::atomic<State> state_;
@@ -157,132 +177,232 @@ private:
     int nnz_capacity_ = 0;
 
     cudaStream_t stream_ = nullptr;
-    cudaEvent_t  filled_event_ = nullptr;
-    cudaEvent_t  empty_event_  = nullptr;
+    cudaEvent_t  ready_event_ = nullptr;
+    cudaEvent_t  empty_event_ = nullptr;
 };
 ```
 
-## Usage protocol (who calls what, and when)
+### Debug-only write guard (recommendation, not enforced in release)
 
-Producer side (whatever code fills the slot — currently `Batch`, see
-[batch.md](batch.md)):
+Per the invariant "buffers are only written by the active batch, and only
+during `filling`": rather than adding runtime cost in release builds,
+recommend wrapping the four pinned/device *mutable* accessors' precondition
+in an `assert(state() != State::kEmpty)` compiled only under `!defined(NDEBUG)`.
+This catches misuse in debug/test builds (including the SLURM-run unit
+tests) at negligible cost, without slowing down the release path. It cannot
+catch every misuse (e.g. it won't distinguish `filling` from a stale `full`
+that a caller forgot to re-check), but it catches the most common mistake
+(writing to a slot nobody has called `fill()` on yet).
 
-1. Ring/DataLoader decides to fill this slot → calls `slot->mark_filling()`.
-   This is CPU-instant; the slot may sit in `kFilling` indefinitely before a
-   worker thread is free.
+## Batch changes (small, within `batch.h`/`batch.cu`)
+
+- `Batch`'s constructor must check `slot->state() == Slot::State::kEmpty`
+  and `throw std::runtime_error(...)` (or a small dedicated exception type)
+  if not — this replaces relying on `Slot` to assert. `Slot` does not
+  enforce 1:1 binding itself.
+- After the throw-check passes, `Batch`'s constructor calls `slot->fill()`
+  (renamed from `mark_filling()`).
+- `Batch::to_device()`: before issuing the 3 `cudaMemcpyAsync` calls, add
+  `slot->await_empty(slot->stream())` (GPU-side, non-blocking) so the H2D
+  copies are ordered after the previous consumer's reads. After issuing the
+  3 copies, call `slot->mark_ready()` (renamed from `mark_full()`) instead
+  of recording the event itself.
+- `Batch`'s destructor: call `slot->mark_empty(<consumer stream>)` instead
+  of `mark_free()`. The consumer stream is whatever stream the trainer reads
+  device buffers on — needs to be threaded into `Batch` (constructor
+  parameter or setter) if not already available; check current `Batch`
+  fields for a trainer/consumer stream before adding a new one.
+- These are the only changes needed; the rest of `Batch` (layout, gather,
+  normalize, move semantics) is unaffected.
+
+## Usage protocol
+
+Producer side (`Batch`):
+
+1. `Batch` ctor: check `slot->state() == kEmpty`, throw if not, else call
+   `slot->fill()`. CPU-instant; slot may sit in `kFilling` indefinitely
+   before a worker thread is free to do the real work.
 2. Worker thread does CPU gather/log-norm into pinned buffers, calling
-   `slot->ensure_capacity(...)` first if the batch is larger than current
-   capacity.
-3. Worker thread issues the 3 `cudaMemcpyAsync` H2D copies on `slot->stream()`.
-4. Worker thread calls `slot->mark_full()`. (This records `filled_event_` on
-   `stream_` internally — callers never call `cudaEventRecord` directly.)
+   `slot->grow(...)` first if the batch exceeds current capacity.
+3. `to_device()`: `slot->await_empty(slot->stream())`, then issue the 3
+   `cudaMemcpyAsync` H2D copies on `slot->stream()`, then `slot->mark_ready()`.
 
-Consumer side (trainer / Ring):
+Consumer side (trainer/Ring):
 
-5. Trainer checks `slot->state() == kFull` (CPU-visible) before trusting the
-   event at all — mirrors the "check FILLING flag before trusting a possibly
-   stale event" rule from the original design notes.
-6. Trainer does `cudaStreamWaitEvent(trainer_stream, slot->filled_event())` (or
-   `cudaEventSynchronize` if it needs a CPU-side block) before touching device
-   buffers, then reads them (kernels on `trainer_stream`).
-7. When done issuing all its reads, trainer calls
-   `slot->mark_empty(trainer_stream)`. (This records `empty_event_` on
-   `trainer_stream` internally.)
-
-This makes the full cycle symmetric: two CPU-instant state flags
-(`mark_filling`/`mark_full`/`mark_empty` all transition state immediately) and
-two GPU-side completion events (`filled_event_`, `empty_event_`) that gate the
-*next* stage's async GPU work without ever blocking a CPU thread in the common
-case.
+4. Poll/block on `slot->state() == kFull` (this is a true completion signal
+   — no separate event wait is required just to trust it), or call
+   `slot->await_full()`/`slot->await_full(stream)` directly if blocking or
+   ordering is preferred over polling.
+5. Read device buffers via kernels on the consumer's own stream.
+6. When done issuing all reads (not necessarily their completion), discard
+   the `Batch`; its destructor calls `slot->mark_empty(consumer_stream)`.
 
 ## Invariants
 
-- State transitions are strictly ordered: `kEmpty → kFilling → kFull → kEmpty`.
-  Any other transition asserts.
-- Only one `Batch` (or equivalent driver) is bound to a slot at a time.
+- State transitions occur only in the order `kEmpty → kFilling → kFull →
+  kEmpty`. `kFilling → kFull` is observed (via `ready_event_`), never
+  set directly; `kFull → kEmpty`/`kEmpty → kFilling` are CPU-instant.
+- Buffers are only written while `state() != kEmpty` (ideally exactly
+  `kFilling`) — see debug-only write guard above.
 - Device/pinned buffers are never freed while a GPU operation might still be
-  reading/writing them — enforced by synchronizing on `empty_event_` inside
-  `ensure_capacity()` before any `cudaFree`/`cudaFreeHost`.
-- `filled_event_` is only ever recorded on `stream_`, only from
-  `mark_full()`.
-- `empty_event_` is only ever recorded on the consumer-supplied stream, only
+  reading/writing them — `grow()` synchronizes on `empty_event_` before any
+  `cudaFree`/`cudaFreeHost`.
+- `ready_event_` is only ever recorded on `stream_`, only from
+  `mark_ready()`.
+- `empty_event_` is only ever recorded on the caller-supplied stream, only
   from `mark_empty()`.
-- `ensure_capacity()` may only be called while `state() == kFilling`.
+- `grow()` may only be called while `state() != kEmpty`.
+- `Slot` does not enforce single-ownership of a `Batch`; `Batch` enforces it
+  by throwing in its constructor.
 
-## Changelog vs. previous `slot.h`/`slot.cu` (currently checked in)
+## Optimization notes (`grow()`)
 
-| Old | New |
-|---|---|
-| States `FREE/FILLING/READY` | States `kEmpty/kFilling/kFull` |
-| One event (`ready_event_`) | Two events (`filled_event_`, `empty_event_`) |
-| Six capacity ints (`h_col_capacity_`, `h_row_capacity_`, `h_val_capacity_`, `d_col_capacity_`, `d_row_capacity_`, `d_val_capacity_`) | Two (`col_capacity_`, `nnz_capacity_`) |
-| No protection against overwriting device buffers still being read by a lagging consumer | `mark_filling()` enqueues `cudaStreamWaitEvent` on `empty_event_` |
-| `ensure_capacity()` frees buffers with no GPU-completion guarantee (latent bug) | `ensure_capacity()` syncs on `empty_event_` before freeing |
-| Constructor took `(m, batch_size, max_nnz_estimate)` | Constructor takes `(col_capacity, nnz_capacity)` — caller computes `batch_size + 1` |
-| `mark_ready()`/`mark_free()` were bare state setters; `Batch` called `cudaEventRecord` separately | `mark_full()`/`mark_empty()` do the state transition **and** the event record together, removing a foot-gun (impossible to mark full/empty without recording) |
+Given: column-capacity growth is expected **almost never**; nnz-capacity
+growth is expected **seldom** (both after the first few batches settle into
+steady state). `grow()` should be written so the compiler's branch layout
+favors the no-growth path:
+
+- Use `if (col_cap > col_capacity_) [[unlikely]] { ... }` and
+  `if (nnz_cap > nnz_capacity_) [[unlikely]] { ... }` (C++20 attribute; this
+  repo builds with `-std=c++17` via nvcc/g++, so use
+  `__builtin_expect(cond, 0)` instead, wrapped in a small local helper, or
+  confirm `[[unlikely]]` is accepted by the pinned nvcc version before using
+  it — flag this as a build-verification step).
+- Keep the common (no-growth) path as a couple of cheap integer comparisons
+  and nothing else — no function calls, no loops — so it inlines trivially.
+- Isolate the actual realloc logic (event sync + free + alloc, for both the
+  col arrays and the nnz-sized arrays) into two small helper functions
+  (`grow_col()`, `grow_nnz()`) called only from the unlikely branches, per
+  the "functions should do one thing" rule — keeps `grow()` itself a short
+  dispatcher.
+
+## Q&A
+
+**Why one stream per slot (vs. one per DataLoader, vs. a single shared
+transfer stream)?**
+
+- **Per-slot stream (chosen)**: lets N slots' H2D copies (and any future
+  per-slot GPU prep work) issue and progress concurrently/out-of-order with
+  respect to each other — the GPU scheduler can overlap them subject to
+  actual hardware queue/copy-engine limits. This maximizes overlap between
+  "slot A's copy is in flight" and "slot B is layout()-ing on CPU and about
+  to issue its own copy." Cost: one stream + two events per slot (cheap;
+  streams/events are lightweight CUDA objects), and `cudaStreamWaitEvent`
+  cross-stream bookkeeping (also cheap).
+- **Per-DataLoader stream**: would serialize all of a species' slots onto
+  one stream — slot B's copy could not start until slot A's prior work
+  issued on that same stream is done being *enqueued* in order, reducing
+  the achievable overlap between a loader's own slots, defeating a chunk of
+  the reason to have multiple prefetch slots per loader in the first place.
+- **Single global transfer stream**: serializes *all* species' transfers
+  through one queue — simplest, lowest resource usage, but removes overlap
+  entirely and makes one slow prep (e.g. a big batch needing `grow()`) a
+  head-of-line blocker for every other loader's H2D copy. Given H2D copies
+  themselves are typically bandwidth-bound on a shared PCIe/NVLink path
+  regardless of how many streams issue them, the main loss here vs.
+  per-slot streams is really about CPU-side issue-order serialization, not
+  GPU copy-engine parallelism — but per-slot is still preferred since it's
+  cheap and removes a class of false CPU-side dependencies for zero cost.
+- Net: per-slot is the right default given slots are few (single digits per
+  loader) and streams/events are cheap; recommend keeping it.
+
+**Unit test framework?**
+
+No Catch2/GoogleTest in this repo; existing convention
+(`kernel_bench/*/test_accuracy.cu`, `tests/validate/validate.cpp`) is
+hand-rolled: plain functions, `CUDA_CHECK`-style macros, `fprintf(stderr, ...)`
++ `exit(1)` on failure. Recommend continuing that convention rather than
+introducing a new dependency (nothing to `apt`/`pip` install on the cluster,
+no build-system changes): a small `tests/slot/test_slot.cu` with one function
+per test case, each returning `bool`/printing `[PASS]`/`[FAIL] <reason>` with
+the test name, and a `main()` that runs them all, counts failures, and
+returns nonzero if any failed — mirroring `test_accuracy.cu`'s pass/fail line
+format so log-grepping tools already used in this repo (e.g. `run_tests.sh`,
+the `grep` in `validate_race_fix.slurm`) keep working unmodified.
 
 ## Unit test plan
 
-All tests require a CUDA device, so they run only via SLURM on the GPU
-cluster (never locally). Proposed home: `tests/slot/test_slot.cu`, built and
-run by a new `validate_slot.slurm` (modeled on the existing
-`validate_race_fix.slurm`). Tests to implement:
+All tests require a CUDA device — run only via SLURM (never locally). Home:
+`tests/slot/test_slot.cu`, driven by `tests/slot/run_tests.sh` (mirrors
+`kernel_bench/*/run_tests.sh`), launched from a new **`validate_slot.sh`**
+SLURM script (`.sh` extension per convention — modeled on
+`validate_race_fix.slurm`'s structure, just renamed/adapted).
 
 1. **Initial state** — construct a `Slot`; assert `state() == kEmpty`.
-2. **Happy-path cycle** — `mark_filling()` → `mark_full()` →
-   `mark_empty(stream)` → back to `kEmpty`; assert state after each call;
-   repeat for several cycles (catches any accidental one-shot/stale-flag bug).
-3. **Illegal transitions assert/abort** — e.g. calling `mark_full()` from
-   `kEmpty`, or `mark_empty()` from `kFilling`. Run as a death test (expect
-   process abort via `assert`), one case per illegal edge.
-4. **`ensure_capacity` no-op when sufficient** — capture buffer pointers,
-   call `ensure_capacity()` with capacities ≤ current, assert pointers
-   unchanged.
-5. **`ensure_capacity` grows when needed** — call with larger capacities,
-   assert `col_capacity()`/`nnz_capacity()` updated and pointers changed
-   (new allocation), and that previously written data is not required to
-   survive (grow is destructive, batch will re-`layout()`).
-6. **`ensure_capacity` only legal while filling** — assert/abort if called
-   while `kEmpty` or `kFull`.
-7. **End-to-end data integrity** — write known CSC data into pinned buffers,
-   run through the full fill sequence (`mark_filling` → memcpy H2D →
-   `mark_full`), wait on `filled_event()`, copy device buffers back to host,
-   compare against the source data.
-8. **Overwrite-hazard regression test** — the test that matters most for the
-   new design: launch a long-running dummy kernel on a *consumer* stream that
-   reads the slot's current device buffer (busy-loop kernel, e.g. spins
-   ~50ms), call `mark_empty(consumer_stream)` immediately after launching it
-   (event recorded right after the kernel, so it won't complete until the
-   kernel does), then immediately start a new fill cycle
-   (`mark_filling()` → H2D copies on `stream_` → `mark_full()`). Verify via a
-   value written by the "reader" kernel (e.g. into a small canary device
-   buffer) that the reader kernel's read happened *before* the new H2D copy
-   landed — e.g. by having the reader kernel record what it read and
-   comparing against the pre-overwrite value. This directly exercises the
-   `cudaStreamWaitEvent(stream_, empty_event_)` protection added in
-   `mark_filling()`.
-9. **`ensure_capacity` does not free while consumer still reading** —
-   companion to #8: start a slow reader kernel on a consumer stream, call
-   `mark_empty()` right after launch, then trigger a fill cycle whose batch
-   is bigger than current capacity (forcing `ensure_capacity` to grow, i.e.
-   free+realloc). Should not crash / should not trip
-   `compute-sanitizer`/`cuda-memcheck` use-after-free — verified by running
-   the test binary under `compute-sanitizer` in the SLURM job.
-10. **Destructor safety** — destroy a `Slot` immediately after construction
-    (never filled) and after a full cycle; both should clean up without
-    leaks (verified via `compute-sanitizer --leak-check=full` in the SLURM
-    job).
+2. **Happy-path cycle** — `fill()` → issue dummy H2D copies → `mark_ready()`
+   → poll `state()` until `kFull` (bounded retry loop) → `mark_empty(stream)`
+   → back to `kEmpty`. Repeat for several cycles (catches stale-flag bugs).
+3. **`full` requires real completion, not just issue** — issue a slow
+   (~50ms) dummy `cudaMemcpyAsync` (e.g. large buffer) immediately followed
+   by `mark_ready()`; assert `state()` is **not yet** `kFull` right after
+   `mark_ready()` returns (still `kFilling`), then assert it becomes `kFull`
+   only after the copy actually finishes (poll or `await_full()`).
+4. **`grow()` no-op when sufficient** — capture buffer pointers, call
+   `grow()` with capacities ≤ current, assert pointers unchanged.
+5. **`grow()` grows when needed** — call with larger capacities, assert
+   `col_capacity()`/`nnz_capacity()` updated and pointers changed.
+6. **`grow()` only legal while non-empty** — assert/abort if called while
+   `kEmpty`.
+7. **End-to-end data integrity** — write known CSC data into pinned buffers
+   during `filling`, run the full fill sequence, wait for `kFull`, copy
+   device buffers back to host, compare against source data.
+8. **Overwrite-hazard test — device buffer** — launch a slow reader kernel
+   on a consumer stream that reads the slot's current device buffer into a
+   canary location, call `mark_empty(consumer_stream)` immediately after
+   launching it, then immediately start a new fill cycle including its H2D
+   copies. Verify the canary shows the *old* data (i.e. the reader read
+   before the new copy landed), exercising `await_empty()` inside
+   `to_device()`.
+9. **Overwrite-hazard test — host buffer** — the one explicitly requested:
+   issue a slow H2D copy from the pinned buffer, call `mark_ready()`, then
+   — while `state()` is still `kFilling` (not yet `kFull`) — attempt to
+   write new data into the pinned buffer from a second simulated "producer"
+   and confirm (in a debug build, via the write-guard assert) that this is
+   caught, or, if choosing not to exercise the assert path, confirm via a
+   canary value that the in-flight copy transferred the *original* data,
+   not data written after `mark_ready()`. Should also verify that once
+   `state() == kFull`, buffers are not written again until a full
+   `empty → filling` cycle has occurred.
+10. **`grow()` does not free while consumer still reading** — start a slow
+    reader kernel on a consumer stream, `mark_empty()` right after launch,
+    then trigger a fill cycle whose batch is bigger than current capacity
+    (forcing `grow()` to realloc). Must not crash and must be clean under
+    `compute-sanitizer` (run as part of the SLURM job).
+11. **Constructor throw on double-fill (in `Batch`, not `Slot`)** — construct
+    a `Batch` bound to a slot already in `kFilling`/`kFull`; assert it
+    throws. This is a `Batch`-level test but belongs alongside the Slot
+    suite since it validates the contract described in "Batch changes."
+12. **Destructor safety** — destroy a `Slot` immediately after construction
+    (never filled) and after a full cycle; both clean up without leaks
+    (`compute-sanitizer --leak-check=full`).
 
-## Open questions / assumptions made (flag if wrong)
+## Changelog vs. previous `slot.h`/`slot.cu` and vs. v1 of this doc
 
-- Assumed the consumer (trainer/Ring) always has its own dedicated stream to
-  pass into `mark_empty()`. If the trainer instead uses the default stream or
-  no stream at all, `mark_empty()`'s signature/semantics need revisiting.
-- Assumed `Batch` (not `Slot`) still owns the actual `cudaMemcpyAsync` calls
-  and `layout()`/`gather_normalize()` CPU work, per `batch.md`'s existing
-  ownership split. `Slot` only exposes buffers/stream/events and manages
-  state + capacity.
-- Assumed row_idx and values always grow together (single `nnz_capacity_`)
-  since they are always the same length (`nnz`) — confirmed by both
-  `batch.cu`'s `layout()` (writes both at same indices) and the CSC format
-  itself.
+| Old (`slot.h`/`slot.cu`) | v1 of this doc | v2 (this version) |
+|---|---|---|
+| States `FREE/FILLING/READY` | `kEmpty/kFilling/kFull`, CPU-instant | `kEmpty/kFilling/kFull`; `kFull` is a real GPU-completion signal, not CPU-instant |
+| One event (`ready_event_`) | Two events (`filled_event_`, `empty_event_`) | Two events, renamed back to `ready_event_`/`empty_event_` |
+| Six capacity ints | Two (`col_capacity_`, `nnz_capacity_`) | Same |
+| No device-overwrite protection | `mark_filling()` enqueues the wait | `await_empty(stream)` called explicitly by `Batch::to_device()`, not hidden inside `fill()` |
+| No host-buffer-overwrite protection | Not addressed | Addressed by making `full` a true completion signal (see rationale above) |
+| `ensure_capacity()` frees with no completion guarantee | Same fix (sync before free) | Same, renamed `grow()`, with `[[unlikely]]`-style branch hints |
+| `mark_ready()`/`mark_free()` bare setters, `Batch` recorded events separately | `mark_full()`/`mark_empty()` bundle record + transition | `mark_ready()` only records (no state mutation — `full` is observed, not set); `mark_empty()` still bundles record + CPU-instant transition |
+| Slot asserts on illegal `Batch` binding | Same | `Slot` does **not** enforce 1:1; `Batch` throws instead |
+
+## Open questions — resolved
+
+- Consumer always has its own dedicated stream, passed into `mark_empty()`/
+  `await_empty(stream)`. **Confirmed.**
+- `Batch` still owns the actual `cudaMemcpyAsync` calls. **Confirmed** — see
+  "Batch changes" for the small additions needed on top of that.
+- Single `nnz_capacity_` shared by `row_idx`/`values` is sufficient.
+  **Confirmed.**
+
+## Remaining open item
+
+- `[[unlikely]]` is a C++20 attribute; this repo builds with `-std=c++17`.
+  Need to verify during implementation whether the pinned `nvcc`/host
+  compiler accepts it anyway (many compilers accept it as an extension pre-
+  C++20) or whether to fall back to `__builtin_expect`. Flagging this now so
+  Haiku doesn't have to guess — if it doesn't compile, fall back silently to
+  `__builtin_expect(condition, 0)`.

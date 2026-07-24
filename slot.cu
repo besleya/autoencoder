@@ -3,7 +3,6 @@
 
 #include "slot.h"
 
-#include <iostream>
 #include <sstream>
 #include <stdexcept>
 
@@ -22,40 +21,44 @@
 } while (0)
 
 // ============================================================================
+// Helper: likely/unlikely for branch hints
+// ============================================================================
+
+// Wrap __builtin_expect for readability; growth is the unlikely path.
+inline bool unlikely(bool cond) {
+    return __builtin_expect(cond, 0);
+}
+
+// ============================================================================
 // Constructor
 // ============================================================================
 
-Slot::Slot(int m, int batch_size, int max_nnz_estimate)
-    : m_(m), state_(State::FREE) {
+Slot::Slot(int col_cap, int nnz_cap)
+    : state_(State::kEmpty) {
     
-    // Initial capacities
-    int col_capacity = batch_size + 1;
-    int row_capacity = max_nnz_estimate;
-    int val_capacity = max_nnz_estimate;
+    col_capacity_ = col_cap;
+    nnz_capacity_ = nnz_cap;
 
     // Allocate pinned (host) buffers
-    SLOT_CUDA_CHECK(cudaMallocHost(&h_col_ptr_, col_capacity * sizeof(int32_t)));
-    SLOT_CUDA_CHECK(cudaMallocHost(&h_row_idx_, row_capacity * sizeof(int32_t)));
-    SLOT_CUDA_CHECK(cudaMallocHost(&h_values_, val_capacity * sizeof(float)));
-
-    h_col_capacity_ = col_capacity;
-    h_row_capacity_ = row_capacity;
-    h_val_capacity_ = val_capacity;
+    SLOT_CUDA_CHECK(cudaMallocHost(&h_col_ptr_, col_cap * sizeof(int32_t)));
+    SLOT_CUDA_CHECK(cudaMallocHost(&h_row_idx_, nnz_cap * sizeof(int32_t)));
+    SLOT_CUDA_CHECK(cudaMallocHost(&h_values_, nnz_cap * sizeof(float)));
 
     // Allocate device buffers
-    SLOT_CUDA_CHECK(cudaMalloc(&d_col_ptr_, col_capacity * sizeof(int32_t)));
-    SLOT_CUDA_CHECK(cudaMalloc(&d_row_idx_, row_capacity * sizeof(int32_t)));
-    SLOT_CUDA_CHECK(cudaMalloc(&d_values_, val_capacity * sizeof(float)));
-
-    d_col_capacity_ = col_capacity;
-    d_row_capacity_ = row_capacity;
-    d_val_capacity_ = val_capacity;
+    SLOT_CUDA_CHECK(cudaMalloc(&d_col_ptr_, col_cap * sizeof(int32_t)));
+    SLOT_CUDA_CHECK(cudaMalloc(&d_row_idx_, nnz_cap * sizeof(int32_t)));
+    SLOT_CUDA_CHECK(cudaMalloc(&d_values_, nnz_cap * sizeof(float)));
 
     // Create stream
     SLOT_CUDA_CHECK(cudaStreamCreate(&stream_));
 
-    // Create event with timing disabled
+    // Create events with timing disabled
     SLOT_CUDA_CHECK(cudaEventCreateWithFlags(&ready_event_, cudaEventDisableTiming));
+    SLOT_CUDA_CHECK(cudaEventCreateWithFlags(&empty_event_, cudaEventDisableTiming));
+
+    // Record empty_event_ once up front so the very first fill never blocks.
+    // This is a trivial synchronization point before any real work.
+    SLOT_CUDA_CHECK(cudaEventRecord(empty_event_, stream_));
 }
 
 // ============================================================================
@@ -63,8 +66,12 @@ Slot::Slot(int m, int batch_size, int max_nnz_estimate)
 // ============================================================================
 
 Slot::~Slot() {
-    // Destroy CUDA resources in reverse order of creation.
-    // Tolerate null pointers (already freed).
+    // Destroy CUDA resources in reverse order. Tolerate nulls.
+
+    if (empty_event_) {
+        cudaEventDestroy(empty_event_);
+        empty_event_ = nullptr;
+    }
 
     if (ready_event_) {
         cudaEventDestroy(ready_event_);
@@ -110,88 +117,172 @@ Slot::~Slot() {
 // ============================================================================
 
 Slot::State Slot::state() const {
-    return state_.load(std::memory_order_acquire);
+    State curr = state_.load(std::memory_order_acquire);
+
+    // Lazily upgrade kFilling -> kFull by polling ready_event_.
+    if (curr == State::kFilling) {
+        cudaError_t err = cudaEventQuery(ready_event_);
+        if (err == cudaSuccess) {
+            // Event is signaled, upgrade to kFull.
+            state_.store(State::kFull, std::memory_order_release);
+            return State::kFull;
+        } else if (err == cudaErrorNotReady) {
+            // Event not yet signaled, stay in kFilling.
+            return State::kFilling;
+        } else {
+            // Some other CUDA error; just return current state and let caller handle it.
+            return State::kFilling;
+        }
+    }
+
+    return curr;
 }
 
-void Slot::mark_filling() {
-    State prior = state_.exchange(State::FILLING, std::memory_order_acq_rel);
-    assert(prior == State::FREE && "mark_filling: prior state must be FREE");
+void Slot::fill() {
+    // kEmpty -> kFilling. No assert (Batch validates before calling).
+    state_.store(State::kFilling, std::memory_order_release);
 }
 
 void Slot::mark_ready() {
-    State prior = state_.exchange(State::READY, std::memory_order_acq_rel);
-    assert(prior == State::FILLING && "mark_ready: prior state must be FILLING");
+    // Record ready_event_ on stream_. Does NOT mutate state directly.
+    SLOT_CUDA_CHECK(cudaEventRecord(ready_event_, stream_));
 }
 
-void Slot::mark_free() {
-    State prior = state_.exchange(State::FREE, std::memory_order_acq_rel);
-    assert(prior == State::READY && "mark_free: prior state must be READY");
-}
-
-// ============================================================================
-// Buffer management
-// ============================================================================
-
-void Slot::ensure_capacity(int cap_col, int cap_row, int cap_val) {
-    // Reallocate col_ptr if needed
-    if (cap_col > h_col_capacity_) {
-        if (h_col_ptr_) SLOT_CUDA_CHECK(cudaFreeHost(h_col_ptr_));
-        SLOT_CUDA_CHECK(cudaMallocHost(&h_col_ptr_, cap_col * sizeof(int32_t)));
-        h_col_capacity_ = cap_col;
-
-        if (d_col_ptr_) SLOT_CUDA_CHECK(cudaFree(d_col_ptr_));
-        SLOT_CUDA_CHECK(cudaMalloc(&d_col_ptr_, cap_col * sizeof(int32_t)));
-        d_col_capacity_ = cap_col;
-    }
-
-    // Reallocate row_idx if needed
-    if (cap_row > h_row_capacity_) {
-        if (h_row_idx_) SLOT_CUDA_CHECK(cudaFreeHost(h_row_idx_));
-        SLOT_CUDA_CHECK(cudaMallocHost(&h_row_idx_, cap_row * sizeof(int32_t)));
-        h_row_capacity_ = cap_row;
-
-        if (d_row_idx_) SLOT_CUDA_CHECK(cudaFree(d_row_idx_));
-        SLOT_CUDA_CHECK(cudaMalloc(&d_row_idx_, cap_row * sizeof(int32_t)));
-        d_row_capacity_ = cap_row;
-    }
-
-    // Reallocate values if needed
-    if (cap_val > h_val_capacity_) {
-        if (h_values_) SLOT_CUDA_CHECK(cudaFreeHost(h_values_));
-        SLOT_CUDA_CHECK(cudaMallocHost(&h_values_, cap_val * sizeof(float)));
-        h_val_capacity_ = cap_val;
-
-        if (d_values_) SLOT_CUDA_CHECK(cudaFree(d_values_));
-        SLOT_CUDA_CHECK(cudaMalloc(&d_values_, cap_val * sizeof(float)));
-        d_val_capacity_ = cap_val;
-    }
+void Slot::mark_empty(cudaStream_t consumer_stream) {
+    // Record empty_event_ on the consumer's stream, then set state_ = kEmpty.
+    SLOT_CUDA_CHECK(cudaEventRecord(empty_event_, consumer_stream));
+    state_.store(State::kEmpty, std::memory_order_release);
 }
 
 // ============================================================================
-// Buffer accessors
+// Waiting
+// ============================================================================
+
+void Slot::await_full() {
+    SLOT_CUDA_CHECK(cudaEventSynchronize(ready_event_));
+}
+
+void Slot::await_full(cudaStream_t stream) {
+    SLOT_CUDA_CHECK(cudaStreamWaitEvent(stream, ready_event_, 0));
+}
+
+void Slot::await_empty() {
+    SLOT_CUDA_CHECK(cudaEventSynchronize(empty_event_));
+}
+
+void Slot::await_empty(cudaStream_t stream) {
+    SLOT_CUDA_CHECK(cudaStreamWaitEvent(stream, empty_event_, 0));
+}
+
+// ============================================================================
+// Buffer management — growth helpers
+// ============================================================================
+
+void Slot::grow_col(int col_cap) {
+    // Synchronize before freeing: ensure consumer is done reading old device buffers.
+    SLOT_CUDA_CHECK(cudaEventSynchronize(empty_event_));
+
+    // Free and reallocate pinned col_ptr.
+    if (h_col_ptr_) {
+        SLOT_CUDA_CHECK(cudaFreeHost(h_col_ptr_));
+    }
+    SLOT_CUDA_CHECK(cudaMallocHost(&h_col_ptr_, col_cap * sizeof(int32_t)));
+
+    // Free and reallocate device col_ptr.
+    if (d_col_ptr_) {
+        SLOT_CUDA_CHECK(cudaFree(d_col_ptr_));
+    }
+    SLOT_CUDA_CHECK(cudaMalloc(&d_col_ptr_, col_cap * sizeof(int32_t)));
+
+    col_capacity_ = col_cap;
+}
+
+void Slot::grow_nnz(int nnz_cap) {
+    // Synchronize before freeing: ensure consumer is done reading old device buffers.
+    SLOT_CUDA_CHECK(cudaEventSynchronize(empty_event_));
+
+    // Free and reallocate pinned row_idx.
+    if (h_row_idx_) {
+        SLOT_CUDA_CHECK(cudaFreeHost(h_row_idx_));
+    }
+    SLOT_CUDA_CHECK(cudaMallocHost(&h_row_idx_, nnz_cap * sizeof(int32_t)));
+
+    // Free and reallocate device row_idx.
+    if (d_row_idx_) {
+        SLOT_CUDA_CHECK(cudaFree(d_row_idx_));
+    }
+    SLOT_CUDA_CHECK(cudaMalloc(&d_row_idx_, nnz_cap * sizeof(int32_t)));
+
+    // Free and reallocate pinned values.
+    if (h_values_) {
+        SLOT_CUDA_CHECK(cudaFreeHost(h_values_));
+    }
+    SLOT_CUDA_CHECK(cudaMallocHost(&h_values_, nnz_cap * sizeof(float)));
+
+    // Free and reallocate device values.
+    if (d_values_) {
+        SLOT_CUDA_CHECK(cudaFree(d_values_));
+    }
+    SLOT_CUDA_CHECK(cudaMalloc(&d_values_, nnz_cap * sizeof(float)));
+
+    nnz_capacity_ = nnz_cap;
+}
+
+void Slot::grow(int col_cap, int nnz_cap) {
+    // Check col_ptr capacity; growth is unlikely.
+    if (unlikely(col_cap > col_capacity_)) {
+        grow_col(col_cap);
+    }
+
+    // Check nnz capacity (row_idx and values); growth is unlikely.
+    if (unlikely(nnz_cap > nnz_capacity_)) {
+        grow_nnz(nnz_cap);
+    }
+}
+
+// ============================================================================
+// Capacity accessors
+// ============================================================================
+
+int Slot::col_capacity() const {
+    return col_capacity_;
+}
+
+int Slot::nnz_capacity() const {
+    return nnz_capacity_;
+}
+
+// ============================================================================
+// Buffer accessors (with debug-only write guard)
 // ============================================================================
 
 int32_t* Slot::pinned_col_ptr() const {
+    assert(state() != State::kEmpty);
     return h_col_ptr_;
 }
 
 int32_t* Slot::pinned_row_idx() const {
+    assert(state() != State::kEmpty);
     return h_row_idx_;
 }
 
 float* Slot::pinned_values() const {
+    assert(state() != State::kEmpty);
     return h_values_;
 }
 
 int32_t* Slot::device_col_ptr() const {
+    assert(state() != State::kEmpty);
     return d_col_ptr_;
 }
 
 int32_t* Slot::device_row_idx() const {
+    assert(state() != State::kEmpty);
     return d_row_idx_;
 }
 
 float* Slot::device_values() const {
+    assert(state() != State::kEmpty);
     return d_values_;
 }
 
@@ -205,4 +296,8 @@ cudaStream_t Slot::stream() const {
 
 cudaEvent_t Slot::ready_event() const {
     return ready_event_;
+}
+
+cudaEvent_t Slot::empty_event() const {
+    return empty_event_;
 }

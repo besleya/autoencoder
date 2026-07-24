@@ -101,8 +101,12 @@ Batch::Batch(Slot* slot,
         throw std::runtime_error("Batch constructor: chunk must not be null");
     }
 
+    if (slot_->state() != Slot::State::kEmpty) {
+        throw std::runtime_error("Batch: slot already has an active batch");
+    }
+
     m_ = chunk_->m;
-    slot_->mark_filling();
+    slot_->fill();
 }
 
 // Move constructor
@@ -115,7 +119,8 @@ Batch::Batch(Batch&& other) noexcept
       B_(other.B_),
       nnz_(other.nnz_),
       chunk_end_(other.chunk_end_),
-      scale_(other.scale_) {
+      scale_(other.scale_),
+      consumer_stream_(other.consumer_stream_) {
     other.slot_ = nullptr;
     other.chunk_ = nullptr;
 }
@@ -125,7 +130,7 @@ Batch& Batch::operator=(Batch&& other) noexcept {
     if (this != &other) {
         // Release current slot (if any)
         if (slot_) {
-            slot_->mark_free();
+            slot_->mark_empty(consumer_stream_);
         }
         // Transfer ownership
         slot_ = other.slot_;
@@ -137,6 +142,7 @@ Batch& Batch::operator=(Batch&& other) noexcept {
         nnz_ = other.nnz_;
         chunk_end_ = other.chunk_end_;
         scale_ = other.scale_;
+        consumer_stream_ = other.consumer_stream_;
         other.slot_ = nullptr;
         other.chunk_ = nullptr;
     }
@@ -146,15 +152,15 @@ Batch& Batch::operator=(Batch&& other) noexcept {
 // Destructor
 Batch::~Batch() {
     if (slot_) {
-        slot_->mark_free();
+        slot_->mark_empty(consumer_stream_);
     }
 }
 
 // Builds this batch's own col_ptr (prefix sum) into slot's pinned col_ptr buffer.
 // Returns total nnz.
 int Batch::layout() {
-    // Ensure slot has capacity for col_ptr (B_+1 entries); row/val sizes not yet known.
-    slot_->ensure_capacity(B_ + 1, 0, 0);
+    // Ensure slot has capacity for col_ptr (B_+1 entries) and row_idx/values sizes not yet known.
+    slot_->grow(B_ + 1, 0);
 
     // Single pass: write prefix sum directly into slot's pinned col_ptr buffer.
     int32_t* dst_col_ptr = slot_->pinned_col_ptr();
@@ -167,13 +173,17 @@ int Batch::layout() {
     const int total_nnz = dst_col_ptr[B_];
 
     // Now grow row_idx/values buffers to fit; col_ptr capacity already satisfied so it's untouched.
-    slot_->ensure_capacity(B_ + 1, total_nnz, total_nnz);
+    // Note: new API takes only 2 args (col_cap, nnz_cap) since row_idx/values share nnz capacity.
+    slot_->grow(B_ + 1, total_nnz);
 
     return total_nnz;
 }
 
 // Copies col_ptr, row_idx, values to device and records ready event.
 void Batch::to_device() {
+    // Note: An agent wanted to make the slot's stream wait for its own empty event
+    // before copying, but the slot's buffers belong to this Batch as long as they
+    // are tied together, so we assume the buffers are safe
     BATCH_CUDA_CHECK(cudaMemcpyAsync(
         slot_->device_col_ptr(),
         slot_->pinned_col_ptr(),
@@ -198,7 +208,7 @@ void Batch::to_device() {
         slot_->stream()
     ));
 
-    BATCH_CUDA_CHECK(cudaEventRecord(slot_->ready_event(), slot_->stream()));
+    slot_->mark_ready();
 }
 
 // Prepare: gather, normalize, and ship to device.
@@ -218,8 +228,6 @@ void Batch::prepare() {
                      slot_->pinned_values(), scale_);
 
     to_device();
-
-    slot_->mark_ready();
 }
 
 // Accessors
@@ -263,4 +271,8 @@ SparseView Batch::sparse_view() const {
         slot_->device_row_idx(),
         slot_->device_values()
     };
+}
+
+void Batch::set_consumer_stream(cudaStream_t stream) {
+    consumer_stream_ = stream;
 }

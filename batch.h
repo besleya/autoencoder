@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 #include <cuda_runtime.h>
+#include <stdexcept>
 #include "slot.h"
 
 // Forward declaration
@@ -51,8 +52,12 @@ public:
           bool chunk_end,
           float scale = 10000.0f);
 
-    // Destructor: marks the slot FREE if still bound (non-null).
+    // Destructor: marks the slot EMPTY if still bound (non-null).
     ~Batch();
+
+    // Sets the consumer stream (stream on which trainer reads device buffers).
+    // Call this before Batch is destroyed, so destructor can pass it to mark_empty().
+    void set_consumer_stream(cudaStream_t stream);
 
     // Move-only semantics
     Batch(Batch&& other) noexcept;
@@ -84,6 +89,7 @@ private:
     int nnz_ = 0;                      // number of nonzeros (computed in layout())
     bool chunk_end_;                   // true if last batch of chunk
     float scale_;                      // scale factor for log-normalization
+    cudaStream_t consumer_stream_ = nullptr;  // stream on which trainer reads buffers (nullptr = default stream)
 
     // Builds this batch's own col_ptr (prefix sum) into slot's pinned col_ptr buffer;
     // returns total nnz. Does NOT copy row_idx/values yet.
