@@ -15,6 +15,7 @@
 
 // Forward declarations
 class Batch;
+class Ring;
 
 // Concatenation policy for multi-file chunks.
 enum class ConcatPolicy { CONCAT_HOST, POINTER_LIST };
@@ -33,19 +34,21 @@ public:
     //   chunk_size      - number of files per chunk (>0; recommend 64)
     //   batch_size      - columns per batch (>0; recommend 512)
     //   n_slots         - number of prefetch Slots (>0; recommend 4)
-    //   rng             - PRNG for epoch shuffles (by ref)
+    //   rng             - PRNG for epoch shuffles (by value; owned copy per loader)
     //   policy          - CONCAT_HOST (default) or POINTER_LIST
     //   omp_threads     - parallel decode threads (default 16; 0 = use all available)
     //   max_nnz_estimate - max expected nnz per batch (default batch_size * 2000)
+    //   double_buffer_chunks - enable async decode of next chunk (default true)
     DataLoader(std::string species_name,
                std::vector<std::string> file_paths,
                int chunk_size,
                int batch_size,
                int n_slots,
-               std::mt19937& rng,
+               std::mt19937 rng,
                ConcatPolicy policy = ConcatPolicy::CONCAT_HOST,
                int omp_threads = 16,
-               int max_nnz_estimate = -1);
+               int max_nnz_estimate = -1,
+               bool double_buffer_chunks = true);
 
     ~DataLoader();
 
@@ -67,12 +70,25 @@ public:
     // Species name.
     const std::string& species_name() const;
 
-    // Epoch/pass counter (increments when file list wraps).
-    int pass() const;
+    // Epoch counter (increments when file list wraps).
+    int epoch() const;
 
     // ========================================================================
-    // Ring dispatcher interface
+    // Ring back-reference (called by Ring::add_loader)
     // ========================================================================
+
+    // Set the Ring reference. Called by Ring::add_loader() after registration.
+    // DataLoader uses this to access Ring::decode_pool() for submitting decode tasks.
+    void set_ring(Ring* ring);
+
+    // ========================================================================
+    // Ring dispatcher interface — blocking variant
+    // ========================================================================
+
+    // Block (via CUDA event wait) until this loader's next slot (in rotation) is empty,
+    // then atomically reserve it (FREE → FILLING). Strict rotation: always the same
+    // sequence. Blocks the calling thread (dispatcher) until THIS slot is ready.
+    Slot* reserve_slot();
 
     // Count free slots (state == FREE).
     bool has_free_slot() const;
@@ -94,35 +110,17 @@ public:
 
 private:
     // ========================================================================
-    // Private data structures (matching gpu_data_loader logic)
+    // Private data structures
     // ========================================================================
 
-    // Per-file decoded data (POINTER_LIST policy).
-    struct DecodedFile {
-        std::vector<int32_t> col_ptr;   // length n_cols+1
-        std::vector<int32_t> row_idx;   // length nnz
-        std::vector<float> values;      // length nnz
-        int n_cols = 0;                 // number of columns in this file
-        int m = 0;                      // number of rows (features)
-    };
-
-    // Unified chunk data (concatenated all files into one CSC).
-    struct ChunkDataConcat {
-        std::vector<int32_t> col_ptr;   // length total_cols+1
-        std::vector<int32_t> row_idx;   // length total_nnz
-        std::vector<float> values;      // length total_nnz
-        int n_cols = 0;                 // total columns across all files
-        int m = 0;                      // number of rows (features)
-    };
-
-    // Chunk data (union of both policies).
-    struct ChunkData {
-        ConcatPolicy policy;
-        ChunkDataConcat concat;         // used for CONCAT_HOST
-        std::vector<DecodedFile> files; // used for POINTER_LIST
-        std::vector<std::pair<int, int>> column_permutation; // (file_idx, local_col)
-        int n_cols = 0;
-        int m = 0;
+    // Unified chunk data (concatenated all files into one CSC matrix).
+    // Matches the Chunk struct in batch.h: stores uint32_t (raw from read_1pz).
+    struct Chunk {
+        int m = 0;                       // rows/features
+        int n = 0;                       // total columns across concatenated files
+        std::vector<uint32_t> col_ptr;   // length n+1, cumulative nnz offsets
+        std::vector<uint32_t> row_idx;   // length nnz, row indices
+        std::vector<uint32_t> values;    // length nnz, raw counts (from read_1pz)
     };
 
     // ========================================================================
@@ -134,13 +132,10 @@ private:
     // Must be called with chunk_mtx_ locked.
     void ensure_chunk_loaded_locked();
 
-    // Pack the next batch_size columns from the current chunk into host-side CSC.
-    // Fills col_ptr, row_idx, values vectors and sets nnz and is_chunk_end.
-    void pack_batch_host_csc(std::vector<int32_t>& col_ptr,
-                              std::vector<int32_t>& row_idx,
-                              std::vector<float>& values,
-                              int& nnz,
-                              bool& is_chunk_end);
+    // Start async decode of next chunk. Called from Batch's after_gather callback
+    // when this batch claims the chunk's last columns. Non-blocking: submits tasks
+    // to decode_pool_ and stores the future. Guarded by chunk_mtx_.
+    void start_next_chunk_decode_async();
 
     // Check if any slot is in READY state.
     bool any_slot_ready() const;
@@ -163,23 +158,34 @@ private:
     ConcatPolicy policy_;
     int omp_threads_;
     int max_nnz_estimate_;
+    bool double_buffer_chunks_;
 
-    // RNG reference (used for shuffling, not thread-safe during epochs).
-    std::mt19937& rng_;
+    // RNG owned by this loader (seeded per-loader for determinism).
+    std::mt19937 rng_;
+
+    // Ring back-reference (set by Ring::add_loader).
+    Ring* ring_ = nullptr;
 
     // Feature count (set in start()).
     std::atomic<int> m_{-1};
 
-    // Pass counter (incremented when file list wraps).
-    std::atomic<int> pass_{0};
+    // Epoch counter (incremented when file list wraps).
+    std::atomic<int> epoch_{0};
 
     // Slots and per-slot Batches.
     std::vector<std::unique_ptr<Slot>> slots_;
     std::vector<std::unique_ptr<Batch>> batch_per_slot_;
 
+    // Slot rotation indices (single-writer rule: only dispatcher writes fill_idx_,
+    // only trainer writes consume_idx_).
+    int fill_idx_ = 0;              // next slot to fill (dispatcher writes this)
+    int consume_idx_ = 0;           // next slot to consume (trainer writes this)
+
     // Chunk state (current chunk in memory, column permutation, cursor).
     std::mutex chunk_mtx_;
-    std::unique_ptr<ChunkData> current_chunk_;
+    std::shared_ptr<const Chunk> current_chunk_;
+    std::shared_future<std::shared_ptr<const Chunk>> next_chunk_future_;
+    bool next_chunk_submitted_ = false;  // guard against double-submit
     int col_cursor_ = 0;               // current column offset in current_chunk_
     int file_cursor_ = 0;              // current file index in shuffled order
     std::vector<std::string> file_order_; // shuffled file paths

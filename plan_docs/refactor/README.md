@@ -24,7 +24,10 @@ Goal: make the code clearer. Split responsibilities into narrow classes, each do
 - **Two thread pools, not one**: Ring owns a small `fill_pool_` (runs `DataLoader::fill()`, usually cheap) and a large shared `decode_pool_` (runs one task per file, only at chunk boundaries). This is how per-file parallelism is achieved without oversubscribing when multiple loaders hit a chunk boundary at once. See [ring.md](ring.md) "Two pools" for the full rationale.
 - **`BS::thread_pool`, vendored**: replaces the hand-rolled queue/mutex/condvar pool in current `ring.cu`. Needs to be added under `third_party/` and wired into the Makefile include path before the next build (not done as part of this planning pass).
 - **Deterministic slot rotation, not free/ready bookkeeping**: each `DataLoader`'s slots are filled and consumed in the exact same fixed cyclic order. This alone guarantees batch ordering and lets `reserve_free_slot_blocking()` / `take_ready_batch()` be implemented as a single `Slot::await_empty()` / `await_full()` call — no separate mutex/condvar/counters needed. See [data_loader.md](data_loader.md) "Slot rotation".
-- **Chunk double-buffering, toggleable**: `DataLoader` can optionally prefetch the next chunk's decode in the background while the current chunk is still being consumed (`double_buffer_chunks_` flag, default on). Trades ~2× chunk memory for hiding decode latency entirely.
+- **Chunk double-buffering, toggleable**: `DataLoader` can optionally prefetch the next chunk's decode in the background, triggered the instant the chunk's last `Batch` finishes reading from it (not a consumption-percentage heuristic, and never blocking that batch) (`double_buffer_chunks_` flag, default on, can disable). Trades ~2× chunk memory for hiding decode latency entirely.
+- **`Ring::add_loader()` calls `loader->set_ring(this)`**: gives each `DataLoader` a back-reference to reach `Ring::decode_pool()`, instead of threading a pool reference through every `DataLoader` constructor.
+- **Dynamic pool rebalancing**: `Ring` periodically checks `fill_pool_` idle time (via `BS::thread_pool`'s `get_tasks_running()`/`get_thread_count()`) and moves a thread to `decode_pool_` via `reset()` if idle often (with hysteresis — see [ring.md](ring.md)).
+- **Renamed** `reserve_free_slot_blocking()` → `reserve_slot()` (too long for what it does).
 
 ## Bug-fix scope
 

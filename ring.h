@@ -1,57 +1,32 @@
 // SPDX-License-Identifier: MIT
-// ring.h — Dispatcher and thread pool for strict round-robin batch scheduling.
+// ring.h — Dispatcher and thread pools for strict round-robin batch scheduling.
 
 #pragma once
 
 #include <atomic>
-#include <condition_variable>
 #include <cuda_runtime.h>
-#include <functional>
 #include <memory>
-#include <mutex>
-#include <queue>
 #include <thread>
 #include <vector>
 
+#include "BS_thread_pool.hpp"
 
 // Forward declarations
 class DataLoader;
 class Batch;
-class Slot;
 
 // ============================================================================
-// SparseBatch — public contract for one mini-batch
-// ============================================================================
-
-// A single mini-batch: sparse CSC of shape (m × B) resident on device.
-// All pointers are device-resident. The event is signaled after H2D + lognorm
-// are enqueued (GPU signals when complete). Trainer pattern:
-//   SparseBatch b = batch->sparse_view();
-//   cudaStreamWaitEvent(trainer_stream, b.ready_event, 0);
-//   net.forward(b, trainer_stream);
-//   ...training...
-//   // Batch dtor marks slot FREE
-//
-struct SparseBatch {
-    int m;                      // features (rows), same as dataset
-    int B;                      // batch size (cols)
-    int nnz;                    // nonzeros in this batch
-    const int32_t* d_col_ptr;   // device, length B+1
-    const int32_t* d_row_idx;   // device, length nnz
-    const float*   d_values;    // device, length nnz
-    cudaEvent_t    ready_event; // signaled after H2D + lognorm; owned by slot
-    bool           chunk_end;   // true on the last batch of a chunk
-};
-
-// ============================================================================
-// Ring — dispatcher and thread pool for strict round-robin batch scheduling
+// Ring — dispatcher and thread pool manager for strict round-robin prefetch
 // ============================================================================
 
 class Ring {
 public:
-    // Constructor: creates a bounded CPU thread pool of n_worker_threads workers.
-    // Empty loader list; loaders are added via add_loader() before start().
-    explicit Ring(int n_worker_threads);
+    // Constructor: creates two thread pools.
+    // fill_pool_: small pool for DataLoader::fill() tasks (default 2).
+    // decode_pool_: large pool for per-file decode tasks (default hardware_concurrency()).
+    // Empty loader list; loaders added via add_loader() before start().
+    Ring(int n_fill_workers, 
+         int n_decode_workers = std::thread::hardware_concurrency());
 
     // Destructor: calls shutdown() if not already shut down.
     ~Ring();
@@ -63,11 +38,21 @@ public:
     Ring& operator=(Ring&&) = delete;
 
     // ========================================================================
+    // Pool accessor (for DataLoaders to submit decode tasks)
+    // ========================================================================
+
+    // Returns the shared decode pool. DataLoaders use this to submit per-file
+    // decode tasks in parallel.
+    BS::thread_pool& decode_pool();
+
+    // ========================================================================
     // Loader registration (must be called before start())
     // ========================================================================
 
-    // Append a DataLoader to the round-robin cycle. Order of registration
-    // determines round-robin order. Loader must outlive Ring.
+    // Register a DataLoader for round-robin dispatch. Stores the pointer and
+    // calls loader->set_ring(this) so the loader can access decode_pool().
+    // Order of registration determines round-robin order.
+    // Loader must outlive Ring.
     void add_loader(DataLoader* loader);
 
     // ========================================================================
@@ -78,7 +63,7 @@ public:
     // Must be called exactly once.
     void start();
 
-    // Signal dispatcher and workers to exit, drain the pool, join all threads.
+    // Signal dispatcher and workers to exit, drain the pools, join all threads.
     // Idempotent. Safe to call from any thread.
     void shutdown();
 
@@ -100,21 +85,25 @@ private:
     std::vector<DataLoader*> loaders_;
     std::atomic<bool> started_{false};
     std::atomic<bool> shutting_down_{false};
-    std::atomic<bool> shut_down_complete_{false};
+
+    // Two thread pools (BS::thread_pool)
+    BS::thread_pool fill_pool_;    // small pool for fill tasks
+    BS::thread_pool decode_pool_;  // large pool for decode tasks
 
     std::thread dispatcher_thread_;
-    std::vector<std::thread> workers_;
-
-    // Thread pool task queue
-    std::mutex pool_mtx_;
-    std::condition_variable pool_cv_;
-    std::queue<std::function<void()>> task_queue_;
 
     // Round-robin dispatch state (dispatcher thread only; no synchronization needed)
     int next_dispatch_idx_ = 0;
 
     // Round-robin consume state (consumer thread only; no synchronization needed)
     int next_consume_idx_ = 0;
+
+    // Dynamic rebalancing state
+    int idle_streak_ = 0;   // consecutive cycles with idle fill_pool_ threads
+    int busy_streak_ = 0;   // consecutive cycles with full fill_pool_ AND backlog
+    static constexpr int kStreakThreshold = 5;    // consecutive observations before rebalancing
+    static constexpr int kMinFillThreads = 1;     // never shrink fill_pool_ below this
+    static constexpr int kMinDecodeThreads = 1;   // never shrink decode_pool_ below this
 
     // ========================================================================
     // Private methods
@@ -124,14 +113,7 @@ private:
     // blocking on free slots.
     void dispatcher_loop();
 
-    // Main loop of pool worker threads: dequeue and execute tasks.
-    void pool_worker_loop();
-
-    // Enqueue a task for execution by a pool worker.
-    void submit_task(std::function<void()> task);
-
-    // Helper: block (with polling) until the given loader has a free slot.
-    // Returns nullptr if shutting_down becomes true while waiting.
-    // STRICT ROTATION: never skips to another loader.
-    Slot* wait_for_free_slot(DataLoader* loader);
+    // Periodically rebalance threads from fill_pool to decode_pool if fill is idle.
+    // Called once per full dispatch cycle (after all loaders have been offered a fill).
+    void maybe_rebalance();
 };

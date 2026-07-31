@@ -41,34 +41,6 @@
 } while (0)
 
 // ============================================================================
-// Saturate cast helpers (file-scope with atomic warning flags)
-// ============================================================================
-
-static std::atomic<bool> saturate_warned_idx{false};
-static std::atomic<bool> saturate_warned_val{false};
-
-static inline int32_t saturate_cast_u32_to_i32(uint32_t v) {
-    if (v > static_cast<uint32_t>(INT32_MAX)) {
-        bool exp = false;
-        if (saturate_warned_idx.compare_exchange_strong(exp, true)) {
-            std::fprintf(stderr, "[DataLoader] WARNING: uint32 index %u > INT32_MAX; truncating.\n", v);
-        }
-        return INT32_MAX;
-    }
-    return static_cast<int32_t>(v);
-}
-
-static inline float saturate_cast_u32_to_f32(uint32_t v) {
-    if (v > (1u << 24)) {
-        bool exp = false;
-        if (saturate_warned_val.compare_exchange_strong(exp, true)) {
-            std::fprintf(stderr, "[DataLoader] WARNING: uint32 value %u > 2^24; fp32 cast loses precision.\n", v);
-        }
-    }
-    return static_cast<float>(v);
-}
-
-// ============================================================================
 // Public API: Constructor and destructor
 // ============================================================================
 
@@ -77,10 +49,11 @@ DataLoader::DataLoader(std::string species_name,
                        int chunk_size,
                        int batch_size,
                        int n_slots,
-                       std::mt19937& rng,
+                       std::mt19937 rng,
                        ConcatPolicy policy,
                        int omp_threads,
-                       int max_nnz_estimate)
+                       int max_nnz_estimate,
+                       bool double_buffer_chunks)
     : species_name_(std::move(species_name)),
       file_paths_(std::move(file_paths)),
       chunk_size_(chunk_size),
@@ -89,6 +62,7 @@ DataLoader::DataLoader(std::string species_name,
       policy_(policy),
       omp_threads_(omp_threads > 0 ? omp_threads : 16),
       max_nnz_estimate_(max_nnz_estimate),
+      double_buffer_chunks_(double_buffer_chunks),
       rng_(rng) {
     // Validate arguments
     if (file_paths_.empty()) {
@@ -134,7 +108,7 @@ void DataLoader::start() {
     slots_.resize(n_slots_);
     batch_per_slot_.resize(n_slots_);
     for (int i = 0; i < n_slots_; ++i) {
-        slots_[i] = std::make_unique<Slot>(m_, batch_size_, max_nnz_estimate_);
+        slots_[i] = std::make_unique<Slot>(batch_size_ + 1, max_nnz_estimate_);
         batch_per_slot_[i] = nullptr;
     }
 
@@ -162,8 +136,42 @@ const std::string& DataLoader::species_name() const {
     return species_name_;
 }
 
-int DataLoader::pass() const {
-    return pass_;
+int DataLoader::epoch() const {
+    return epoch_;
+}
+
+// ============================================================================
+// Ring back-reference
+// ============================================================================
+
+void DataLoader::set_ring(Ring* ring) {
+    if (!ring) {
+        throw std::runtime_error("DataLoader::set_ring: null ring pointer");
+    }
+    ring_ = ring;
+}
+
+// ============================================================================
+// Slot rotation interface (blocking)
+// ============================================================================
+
+Slot* DataLoader::reserve_slot() {
+    assert(ring_ != nullptr && "reserve_slot() called before set_ring()");
+    assert(fill_idx_ >= 0 && fill_idx_ < (int)slots_.size());
+
+    // Get the next slot in rotation
+    Slot* slot = slots_[fill_idx_].get();
+
+    // Block until this specific slot is EMPTY
+    slot->await_empty();
+
+    // Atomically transition from EMPTY -> FILLING
+    slot->fill();
+
+    // Advance to next slot in rotation
+    fill_idx_ = (fill_idx_ + 1) % (int)slots_.size();
+
+    return slot;
 }
 
 // ============================================================================
@@ -172,7 +180,7 @@ int DataLoader::pass() const {
 
 bool DataLoader::has_free_slot() const {
     for (const auto& slot : slots_) {
-        if (slot->state() == Slot::State::FREE) {
+        if (slot->state() == Slot::State::kEmpty) {
             return true;
         }
     }
@@ -182,7 +190,7 @@ bool DataLoader::has_free_slot() const {
 int DataLoader::free_slot_count() const {
     int count = 0;
     for (const auto& slot : slots_) {
-        if (slot->state() == Slot::State::FREE) {
+        if (slot->state() == Slot::State::kEmpty) {
             ++count;
         }
     }
@@ -192,7 +200,7 @@ int DataLoader::free_slot_count() const {
 int DataLoader::ready_slot_count() const {
     int count = 0;
     for (const auto& slot : slots_) {
-        if (slot->state() == Slot::State::READY) {
+        if (slot->state() == Slot::State::kFull) {
             ++count;
         }
     }
@@ -202,8 +210,8 @@ int DataLoader::ready_slot_count() const {
 Slot* DataLoader::reserve_free_slot() {
     std::lock_guard<std::mutex> lock(slot_mtx_);
     for (int i = 0; i < n_slots_; ++i) {
-        if (slots_[i]->state() == Slot::State::FREE) {
-            slots_[i]->mark_filling();
+        if (slots_[i]->state() == Slot::State::kEmpty) {
+            slots_[i]->fill();
             return slots_[i].get();
         }
     }
@@ -216,56 +224,76 @@ Slot* DataLoader::reserve_free_slot() {
 
 void DataLoader::fill(Slot* slot) {
     assert(slot != nullptr);
-    assert(slot->state() == Slot::State::FILLING);
+    assert(ring_ != nullptr && "fill() called before set_ring()");
 
-    // Find which slot index this is (for batch_per_slot_ indexing)
-    int slot_idx = -1;
-    for (int i = 0; i < n_slots_; ++i) {
-        if (slots_[i].get() == slot) {
-            slot_idx = i;
-            break;
-        }
-    }
-    assert(slot_idx >= 0);
-
-    // Ensure a chunk is loaded
-    {
-        std::lock_guard<std::mutex> lock(chunk_mtx_);
-        ensure_chunk_loaded_locked();
-    }
-
-    // Pack the next batch from the current chunk
-    std::vector<int32_t> col_ptr;
-    std::vector<int32_t> row_idx;
-    std::vector<float> values;
-    int nnz = 0;
+    // Step 1: Claim next batch's column slice and determine if last (short critical section)
+    std::shared_ptr<const Chunk> chunk_snapshot;
+    std::vector<int> column_indices;
     bool is_chunk_end = false;
 
-    pack_batch_host_csc(col_ptr, row_idx, values, nnz, is_chunk_end);
+    {
+        std::lock_guard<std::mutex> lock(chunk_mtx_);
 
-    // Construct Batch (which copies CSC data into slot's pinned buffers)
+        // Loop until we claim a full batch, skipping trailing partial batches
+        while (true) {
+            // Ensure we have a current chunk
+            if (!current_chunk_ || col_cursor_ >= current_chunk_->n) {
+                ensure_chunk_loaded_locked();
+            }
+
+            int remaining = current_chunk_->n - col_cursor_;
+
+            // Skip trailing partial batch: if fewer than batch_size columns remain,
+            // advance to end of chunk and loop to load next chunk
+            if (remaining < batch_size_) {
+                col_cursor_ = current_chunk_->n;
+                continue;  // Loop back to load next chunk
+            }
+
+            // We have >= batch_size columns remaining; claim exactly batch_size
+            chunk_snapshot = current_chunk_;
+            for (int i = 0; i < batch_size_; ++i) {
+                column_indices.push_back(col_cursor_ + i);
+            }
+            col_cursor_ += batch_size_;
+
+            // Check if this is the last full slice of this chunk
+            // (i.e., after claiming this batch, fewer than batch_size columns remain)
+            int remaining_after = current_chunk_->n - col_cursor_;
+            is_chunk_end = (remaining_after < batch_size_);
+
+            break;  // Exit loop; we have a full batch
+        }
+    }  // Release lock here
+
+    // Step 2: Construct Batch
     auto batch = std::make_unique<Batch>(
         slot,
         species_name_,
-        col_ptr.data(),
-        row_idx.data(),
-        values.data(),
-        m_,
-        batch_size_,
-        nnz,
+        chunk_snapshot,
+        column_indices,
         is_chunk_end);
 
-    // Prepare the batch (H2D transfer, log-norm kernel, event record, mark READY)
-    batch->prepare();
+    // Step 3: Gather from chunk into slot's pinned buffers
+    batch->gather();
 
-    // Store the batch for later consumption
+    // Step 4: If this is the last full slice of the chunk, kick off next chunk's decode
+    if (is_chunk_end) {
+        std::lock_guard<std::mutex> lock(chunk_mtx_);
+        start_next_chunk_decode_async();
+    }
+
+    // Step 5: Copy from pinned buffers to device
+    batch->send_to_device();
+
+    // Step 6: Store batch for consumer
     {
         std::lock_guard<std::mutex> lock(slot_mtx_);
         int slot_idx = find_slot_index(slot);
         batch_per_slot_[slot_idx] = std::move(batch);
     }
 
-    // Notify take_ready_batch() that a slot is now READY
+    // Step 7: Notify consumer
     {
         std::lock_guard<std::mutex> lock(slot_mtx_);
         slot_cv_.notify_all();
@@ -288,7 +316,7 @@ int DataLoader::find_slot_index(Slot* slot) const {
 
 bool DataLoader::any_slot_ready() const {
     for (const auto& slot : slots_) {
-        if (slot->state() == Slot::State::READY) {
+        if (slot->state() == Slot::State::kFull) {
             return true;
         }
     }
@@ -297,7 +325,7 @@ bool DataLoader::any_slot_ready() const {
 
 int DataLoader::find_ready_slot() const {
     for (int i = 0; i < n_slots_; ++i) {
-        if (slots_[i]->state() == Slot::State::READY && batch_per_slot_[i]) {
+        if (slots_[i]->state() == Slot::State::kFull && batch_per_slot_[i]) {
             return i;
         }
     }
@@ -305,53 +333,73 @@ int DataLoader::find_ready_slot() const {
 }
 
 std::unique_ptr<Batch> DataLoader::take_ready_batch() {
+    assert(consume_idx_ >= 0 && consume_idx_ < (int)slots_.size());
+
+    // Get the next slot in rotation
+    Slot* slot = slots_[consume_idx_].get();
+
+    // Block until this specific slot is READY (transitions from FILLING -> READY)
+    slot->await_full();
+
+    // Find the batch stored in this slot (should be non-null at this point)
     std::unique_lock<std::mutex> lock(slot_mtx_);
+    auto batch = std::move(batch_per_slot_[consume_idx_]);
+    batch_per_slot_[consume_idx_] = nullptr;
 
-    // Block until any slot is READY or we shut down
-    slot_cv_.wait(lock, [this]() { return any_slot_ready() || !started_; });
+    // Advance to next slot in rotation
+    consume_idx_ = (consume_idx_ + 1) % (int)slots_.size();
 
-    if (!started_) {
-        return nullptr;  // Shutdown signal
-    }
+    lock.unlock();
 
-    // Find a READY slot with a non-null Batch
-    int idx = find_ready_slot();
-    if (idx < 0) {
-        return nullptr;  // No ready batch
-    }
-
-    // Move the Batch out and return it
-    auto batch = std::move(batch_per_slot_[idx]);
-    batch_per_slot_[idx] = nullptr;
-
-    // Notify fill() workers that a slot is now free
+    // Notify fill() workers that a slot might be free now
     slot_cv_.notify_all();
 
+    // The batch's destructor will call slot->mark_empty() when consumed
     return batch;
 }
 
 // ============================================================================
-// Chunk loading and packing (private helpers)
+// Chunk loading and async decode (private helpers)
 // ============================================================================
 
 void DataLoader::ensure_chunk_loaded_locked() {
-    // If we have a current chunk with remaining columns, nothing to do
-    if (current_chunk_ && col_cursor_ < current_chunk_->n_cols) {
+    // If current chunk still has columns remaining, nothing to do
+    if (current_chunk_ && col_cursor_ < current_chunk_->n) {
         return;
     }
 
     // Need to load a new chunk
-    // Check if we've exhausted all files; if so, reshuffle and bump pass
+    auto new_chunk = std::make_shared<Chunk>();
+
+    // Handle epoch boundary: if file_cursor_ >= file_order_.size(), reshuffle and bump epoch
     if (file_cursor_ >= (int)file_order_.size()) {
         std::shuffle(file_order_.begin(), file_order_.end(), rng_);
         file_cursor_ = 0;
-        pass_++;
+        epoch_++;
     }
 
-    // Decode the next chunk_size files
+    // Determine which files to decode for this chunk
     int chunk_end = std::min(file_cursor_ + chunk_size_, (int)file_order_.size());
-    std::vector<singlet::pz::ReadResult> decoded_files;
-    decoded_files.resize(chunk_end - file_cursor_);
+    int n_files = chunk_end - file_cursor_;
+
+    // Try to get next chunk from async decode if available and double-buffering was enabled
+    if (next_chunk_future_.valid() && double_buffer_chunks_) {
+        try {
+            auto decoded = next_chunk_future_.get();
+            if (decoded) {
+                current_chunk_ = decoded;
+                col_cursor_ = 0;
+                next_chunk_submitted_ = false;
+                file_cursor_ = chunk_end;
+                return;
+            }
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "[DataLoader] Error getting next chunk: %s\n", e.what());
+        }
+    }
+
+    // Synchronous inline decode: read and decode all files for this chunk
+    std::vector<singlet::pz::ReadResult> decoded_files(n_files);
 
     bool read_error = false;
     std::string error_msg;
@@ -380,17 +428,129 @@ void DataLoader::ensure_chunk_loaded_locked() {
         std::terminate();
     }
 
-    // Build ChunkData based on policy
-    current_chunk_ = std::make_unique<ChunkData>();
-    current_chunk_->policy = policy_;
-    current_chunk_->m = m_;
+    // Compute cumulative nnz and column offsets
+    std::vector<uint32_t> nnz_off(n_files + 1, 0);
+    std::vector<uint32_t> col_off(n_files + 1, 0);
+    uint64_t total_nnz = 0;
+    int total_cols = 0;
 
-    if (policy_ == ConcatPolicy::CONCAT_HOST) {
+    for (int i = 0; i < n_files; ++i) {
+        nnz_off[i] = total_nnz;
+        col_off[i] = total_cols;
+        total_nnz += decoded_files[i].nnz;
+        total_cols += decoded_files[i].n;
+    }
+    nnz_off[n_files] = total_nnz;
+    col_off[n_files] = total_cols;
+
+    // Overflow guard: check that total_nnz fits in int32_t
+    if (total_nnz > INT32_MAX) {
+        std::fprintf(stderr, "[DataLoader] FATAL: chunk total nnz %lu exceeds INT32_MAX\n", total_nnz);
+        std::terminate();
+    }
+
+    new_chunk->m = m_;
+    new_chunk->n = total_cols;
+    new_chunk->col_ptr.resize(total_cols + 1);
+    new_chunk->row_idx.resize(total_nnz);
+    new_chunk->values.resize(total_nnz);
+
+    // Parallel concatenation: copy and rebase col_ptr, copy row_idx and values
+    #pragma omp parallel for schedule(dynamic) num_threads(omp_threads_)
+    for (int i = 0; i < n_files; ++i) {
+        const auto& r = decoded_files[i];
+        uint32_t col_base = col_off[i];
+        uint32_t nnz_base = nnz_off[i];
+
+        // Copy and rebase col_ptr (add nnz_base offset to account for concatenation)
+        for (uint32_t c = 0; c <= r.n; ++c) {
+            new_chunk->col_ptr[col_base + c] = r.indptr[c] + nnz_base;
+        }
+
+        // Copy row_idx and values
+        for (uint64_t j = 0; j < r.nnz; ++j) {
+            new_chunk->row_idx[nnz_base + j] = r.indices[j];
+            new_chunk->values[nnz_base + j] = r.data[j];
+        }
+    }
+
+    // Normalize col_ptr to be 0-based
+    uint32_t base = new_chunk->col_ptr[0];
+    for (auto& c : new_chunk->col_ptr) {
+        c -= base;
+    }
+
+    current_chunk_ = new_chunk;
+    col_cursor_ = 0;
+    file_cursor_ = chunk_end;
+    next_chunk_submitted_ = false;
+}
+
+void DataLoader::start_next_chunk_decode_async() {
+    // Called from Batch's after_gather callback when the last batch of a chunk is gathered.
+    // Submits async decode tasks to ring_->decode_pool() for the next chunk.
+    // Stores the resulting future in next_chunk_future_.
+    // Must be called with chunk_mtx_ locked.
+
+    assert(ring_ != nullptr && "start_next_chunk_decode_async() called before set_ring()");
+    assert(!next_chunk_submitted_ && "start_next_chunk_decode_async() called twice");
+
+    // Guard against double-submit
+    next_chunk_submitted_ = true;
+
+    // Determine next chunk's files
+    int next_file_cursor = file_cursor_;
+
+    // Handle epoch boundary
+    if (next_file_cursor >= (int)file_order_.size()) {
+        // This shouldn't happen if called correctly, but guard anyway
+        return;
+    }
+
+    int next_chunk_end = std::min(next_file_cursor + chunk_size_, (int)file_order_.size());
+    int n_files = next_chunk_end - next_file_cursor;
+
+    // Create a lambda to decode all files for next chunk
+    auto decode_fn = [this, next_file_cursor, next_chunk_end]() -> std::shared_ptr<const Chunk> {
+        // Read all files
+        std::vector<singlet::pz::ReadResult> decoded_files(next_chunk_end - next_file_cursor);
+
+        bool read_error = false;
+        std::string error_msg;
+
+        #pragma omp parallel for schedule(dynamic) num_threads(omp_threads_)
+        for (int i = next_file_cursor; i < next_chunk_end; ++i) {
+            int idx = i - next_file_cursor;
+            try {
+                decoded_files[idx] = singlet::pz::read_1pz(file_order_[i]);
+                if (decoded_files[idx].m != (uint32_t)m_) {
+                    throw std::runtime_error("feature count mismatch");
+                }
+            } catch (const std::exception& e) {
+                #pragma omp critical
+                {
+                    if (!read_error) {
+                        read_error = true;
+                        error_msg = std::string(file_order_[i]) + ": " + e.what();
+                    }
+                }
+            }
+        }
+
+        if (read_error) {
+            std::fprintf(stderr, "[DataLoader] FATAL in async decode: %s\n", error_msg.c_str());
+            std::terminate();
+        }
+
+        // Concatenate into Chunk
+        auto new_chunk = std::make_shared<Chunk>();
+
         // Compute offsets
-        std::vector<int> nnz_off(decoded_files.size() + 1, 0);
-        std::vector<int> col_off(decoded_files.size() + 1, 0);
-        int total_nnz = 0;
+        std::vector<uint32_t> nnz_off(decoded_files.size() + 1, 0);
+        std::vector<uint32_t> col_off(decoded_files.size() + 1, 0);
+        uint64_t total_nnz = 0;
         int total_cols = 0;
+
         for (size_t i = 0; i < decoded_files.size(); ++i) {
             nnz_off[i] = total_nnz;
             col_off[i] = total_cols;
@@ -400,180 +560,45 @@ void DataLoader::ensure_chunk_loaded_locked() {
         nnz_off[decoded_files.size()] = total_nnz;
         col_off[decoded_files.size()] = total_cols;
 
-        current_chunk_->concat.n_cols = total_cols;
-        current_chunk_->n_cols = total_cols;
+        // Overflow guard
+        if (total_nnz > INT32_MAX) {
+            std::fprintf(stderr, "[DataLoader] FATAL: chunk total nnz %lu exceeds INT32_MAX\n", total_nnz);
+            std::terminate();
+        }
 
-        // Allocate unified buffers
-        current_chunk_->concat.col_ptr.resize(total_cols + 1);
-        current_chunk_->concat.row_idx.resize(total_nnz);
-        current_chunk_->concat.values.resize(total_nnz);
+        new_chunk->m = m_;
+        new_chunk->n = total_cols;
+        new_chunk->col_ptr.resize(total_cols + 1);
+        new_chunk->row_idx.resize(total_nnz);
+        new_chunk->values.resize(total_nnz);
 
-        // Parallel copy+cast
+        // Parallel concatenation
         #pragma omp parallel for schedule(dynamic) num_threads(omp_threads_)
         for (size_t i = 0; i < decoded_files.size(); ++i) {
-            auto& r = decoded_files[i];
-            int col_base = col_off[i];
-            int nnz_base = nnz_off[i];
+            const auto& r = decoded_files[i];
+            uint32_t col_base = col_off[i];
+            uint32_t nnz_base = nnz_off[i];
 
-            // Copy and cast col_ptr
             for (uint32_t c = 0; c <= r.n; ++c) {
-                current_chunk_->concat.col_ptr[col_base + c] =
-                    saturate_cast_u32_to_i32(r.indptr[c]) + nnz_base;
+                new_chunk->col_ptr[col_base + c] = r.indptr[c] + nnz_base;
             }
 
-            // Copy and cast row_idx and values
             for (uint64_t j = 0; j < r.nnz; ++j) {
-                current_chunk_->concat.row_idx[nnz_base + j] =
-                    saturate_cast_u32_to_i32(r.indices[j]);
-                current_chunk_->concat.values[nnz_base + j] =
-                    saturate_cast_u32_to_f32(r.data[j]);
+                new_chunk->row_idx[nnz_base + j] = r.indices[j];
+                new_chunk->values[nnz_base + j] = r.data[j];
             }
         }
 
-        // Fix col_ptr base (0-based for this chunk)
-        int base = current_chunk_->concat.col_ptr[0];
-        for (int& c : current_chunk_->concat.col_ptr) {
+        // Normalize col_ptr
+        uint32_t base = new_chunk->col_ptr[0];
+        for (auto& c : new_chunk->col_ptr) {
             c -= base;
         }
 
-    } else {
-        // POINTER_LIST: store per-file decoded arrays
-        current_chunk_->files.resize(decoded_files.size());
+        return new_chunk;
+    };
 
-        #pragma omp parallel for schedule(dynamic) num_threads(omp_threads_)
-        for (size_t i = 0; i < decoded_files.size(); ++i) {
-            auto& r = decoded_files[i];
-            auto& df = current_chunk_->files[i];
-
-            df.n_cols = r.n;
-            df.m = r.m;
-            df.col_ptr.resize(r.n + 1);
-            df.row_idx.resize(r.nnz);
-            df.values.resize(r.nnz);
-
-            for (uint32_t c = 0; c <= r.n; ++c) {
-                df.col_ptr[c] = saturate_cast_u32_to_i32(r.indptr[c]);
-            }
-            for (uint64_t j = 0; j < r.nnz; ++j) {
-                df.row_idx[j] = saturate_cast_u32_to_i32(r.indices[j]);
-                df.values[j] = saturate_cast_u32_to_f32(r.data[j]);
-            }
-        }
-
-        // Compute total columns
-        int total_cols = 0;
-        for (auto& df : current_chunk_->files) {
-            total_cols += df.n_cols;
-        }
-        current_chunk_->n_cols = total_cols;
-    }
-
-    // Reset column cursor for this chunk
-    col_cursor_ = 0;
-
-    // Advance file cursor
-    file_cursor_ = chunk_end;
-
-    // For POINTER_LIST, generate and shuffle column permutation
-    if (policy_ == ConcatPolicy::POINTER_LIST) {
-        current_chunk_->column_permutation.clear();
-        for (size_t fi = 0; fi < current_chunk_->files.size(); ++fi) {
-            for (int ci = 0; ci < current_chunk_->files[fi].n_cols; ++ci) {
-                current_chunk_->column_permutation.push_back({(int)fi, ci});
-            }
-        }
-        // Shuffle columns using RNG
-        std::mt19937 col_rng(rng_());
-        std::shuffle(current_chunk_->column_permutation.begin(),
-                     current_chunk_->column_permutation.end(), col_rng);
-    }
-
-void DataLoader::pack_batch_host_csc(std::vector<int32_t>& col_ptr,
-                                      std::vector<int32_t>& row_idx,
-                                      std::vector<float>& values,
-                                      int& nnz,
-                                      bool& is_chunk_end) {
-    assert(current_chunk_ != nullptr);
-
-    // Ensure we're not past the end
-    if (col_cursor_ >= current_chunk_->n_cols) {
-        throw std::runtime_error("DataLoader: col_cursor past end of chunk (no more batches)");
-    }
-
-    col_ptr.resize(batch_size_ + 1);
-    col_ptr[0] = 0;
-    nnz = 0;
-
-    if (policy_ == ConcatPolicy::CONCAT_HOST) {
-        // Extract batch_size columns from concatenated chunk
-        for (int b = 0; b < batch_size_ && col_cursor_ + b < current_chunk_->n_cols; ++b) {
-            int global_col = col_cursor_ + b;
-            int start = current_chunk_->concat.col_ptr[global_col];
-            int end = current_chunk_->concat.col_ptr[global_col + 1];
-            int col_nnz = end - start;
-            nnz += col_nnz;
-            col_ptr[b + 1] = nnz;
-        }
-        // Pad with zeros if we reached end of chunk
-        for (int b = (current_chunk_->n_cols - col_cursor_); b < batch_size_; ++b) {
-            col_ptr[b + 1] = nnz;
-        }
-
-        // Allocate and fill row_idx and values
-        row_idx.resize(nnz);
-        values.resize(nnz);
-        int offset = 0;
-        for (int b = 0; b < batch_size_ && col_cursor_ + b < current_chunk_->n_cols; ++b) {
-            int global_col = col_cursor_ + b;
-            int start = current_chunk_->concat.col_ptr[global_col];
-            int end = current_chunk_->concat.col_ptr[global_col + 1];
-            int col_nnz = end - start;
-            std::memcpy(row_idx.data() + offset,
-                        current_chunk_->concat.row_idx.data() + start,
-                        col_nnz * sizeof(int32_t));
-            std::memcpy(values.data() + offset,
-                        current_chunk_->concat.values.data() + start,
-                        col_nnz * sizeof(float));
-            offset += col_nnz;
-        }
-
-    } else {
-        // POINTER_LIST: extract batch_size columns from per-file arrays
-        for (int b = 0; b < batch_size_ && col_cursor_ + b < current_chunk_->n_cols; ++b) {
-            auto [fi, ci] = current_chunk_->column_permutation[col_cursor_ + b];
-            auto& file = current_chunk_->files[fi];
-            int start = file.col_ptr[ci];
-            int end = file.col_ptr[ci + 1];
-            int col_nnz = end - start;
-            nnz += col_nnz;
-            col_ptr[b + 1] = nnz;
-        }
-        // Pad with zeros if we reached end
-        for (int b = (current_chunk_->n_cols - col_cursor_); b < batch_size_; ++b) {
-            col_ptr[b + 1] = nnz;
-        }
-
-        // Allocate and fill row_idx and values
-        row_idx.resize(nnz);
-        values.resize(nnz);
-        int offset = 0;
-        for (int b = 0; b < batch_size_ && col_cursor_ + b < current_chunk_->n_cols; ++b) {
-            auto [fi, ci] = current_chunk_->column_permutation[col_cursor_ + b];
-            auto& file = current_chunk_->files[fi];
-            int start = file.col_ptr[ci];
-            int end = file.col_ptr[ci + 1];
-            int col_nnz = end - start;
-            std::memcpy(row_idx.data() + offset, file.row_idx.data() + start,
-                        col_nnz * sizeof(int32_t));
-            std::memcpy(values.data() + offset, file.values.data() + start,
-                        col_nnz * sizeof(float));
-            offset += col_nnz;
-        }
-    }
-
-    // Determine chunk_end: true if this batch consumed the last columns of the chunk
-    is_chunk_end = (col_cursor_ + batch_size_ >= current_chunk_->n_cols);
-
-    // Advance column cursor for next batch
-    col_cursor_ += batch_size_;
+    // Submit the task to decode_pool and store the future
+    auto future = ring_->decode_pool().submit_task(decode_fn);
+    next_chunk_future_ = future;
 }

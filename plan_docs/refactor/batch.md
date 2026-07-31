@@ -22,6 +22,9 @@ struct Chunk {
     std::vector<uint32_t> row_idx;   // length nnz, row/gene index per nonzero
     std::vector<uint32_t> values;    // length nnz, raw widened counts (straight from read_1pz — NOT yet float, NOT yet log-normed)
 };
+// DataLoader holds this as std::shared_ptr<const Chunk> and hands Batch a copy
+// of that shared_ptr (not a raw pointer), so a chunk swap can never free data
+// a still-gathering Batch is reading. See data_loader.md's chunk-lifetime note.
 
 // SparseView — plain aggregate handed to the numeric/compute layer (Layer,
 // cuSPARSE calls). Deliberately knows nothing about species, Slot, or events,
@@ -41,7 +44,7 @@ class Batch {
 public:
     Batch(Slot* slot,
           std::string species_name,
-          const Chunk* chunk,
+          std::shared_ptr<const Chunk> chunk,  // shared ownership so a chunk swap can't free data mid-gather
           std::vector<int> column_indices,   // this batch's column positions into the chunk, length B
           bool chunk_end,
           float scale = 10000.0f);           // log-norm target scale
@@ -53,7 +56,9 @@ public:
     Batch(const Batch&) = delete;
     Batch& operator=(const Batch&) = delete;
 
-    void prepare();                          // gather+cast+CPU lognorm -> H2D -> record ready_event
+    int  gather();                           // layout + cast + CPU lognorm; chunk_ is NOT touched after this returns
+    void send_to_device();                   // H2D copy + record ready_event (async, does not block)
+    void prepare();                          // convenience: gather() then send_to_device()
 
     const std::string& species_name() const;
     bool               chunk_end() const;
@@ -67,7 +72,7 @@ public:
 
 **Constraints / contracts:**
 - Constructor is cheap: it only validates (`slot`/`chunk` non-null, throws `std::runtime_error` otherwise), stores fields, and calls `slot->mark_filling()`. It does **not** touch chunk data, allocate, or copy anything.
-- `prepare()` must be called exactly once, after construction, before any accessor other than `species_name()`/`chunk_end()`/`m()`/`B()` is meaningful (`nnz()` and `sparse_view()` are only valid after `prepare()` returns).
+- Either call `prepare()` once, or call `gather()` followed by `send_to_device()` once each, in that order — never call `send_to_device()` before `gather()`. `nnz()` and `sparse_view()` are only valid after `send_to_device()` (or `prepare()`) returns.
 - `column_indices` must all be valid positions in `[0, chunk->n)`; `Batch` does no bounds-checking on them (fail-fast is preferred over masking a `DataLoader` bug).
 - `Batch` never blocks on the GPU. `prepare()` returns as soon as the async H2D copies are queued and the event is recorded — it does not synchronize.
 - Move-only. After a move, the moved-from `Batch`'s destructor is a no-op (its `slot_`/`chunk_` are nulled).
@@ -85,12 +90,16 @@ void DataLoader::fill(Slot* slot) {
     bool is_chunk_end = advance_cursor_and_check_chunk_end(column_indices.size());
 
     auto batch = std::make_unique<Batch>(
-        slot, species_name_, &current_chunk_, std::move(column_indices), is_chunk_end);
+        slot, species_name_, current_chunk_, std::move(column_indices), is_chunk_end);
 
-    batch->prepare();                 // does ALL the work: gather, cast, CPU lognorm, H2D, event
+    batch->gather();                       // cast, CPU lognorm — chunk_ is done being read after this
+    if (is_last_slice) start_next_chunk_decode_async();   // safe now: chunk_ won't be touched again
+    batch->send_to_device();               // H2D copy + event (async, returns immediately)
     mark_slot_ready(slot, std::move(batch));
 }
 ```
+
+**Why no callback is needed:** `to_device()` only issues `cudaMemcpyAsync()` on the slot's stream and returns — it never blocks on the GPU. So there's no timing risk in calling `gather()` and `send_to_device()` as two plain sequential calls from `DataLoader::fill()`, with the next-chunk kickoff sandwiched in between. This is simpler than threading a callback through `prepare()` and was chosen for that reason.
 
 On the trainer side, `Batch` is only ever consumed through `Ring`, and only its accessors are used — the trainer never constructs or calls `prepare()` itself:
 
@@ -113,16 +122,27 @@ layer.forward(x, stream);
 
 ## Implementation
 
-### `prepare()` — top-level order
+### `gather()` / `send_to_device()` / `prepare()` — top-level order
 
 ```cpp
-void Batch::prepare() {
+int Batch::gather() {
     nnz_ = layout();                  // 1. size + build this batch's col_ptr
     gather_normalize(...);            // 2. gather + cast + CPU log-norm (fused, per column)
-    to_device();                      // 3. H2D copy + record ready_event
+    return nnz_;
+}                                      // chunk_ is guaranteed untouched from here on — see below
+
+void Batch::send_to_device() {
+    to_device();                      // 3. H2D copy + record ready_event (async, non-blocking)
+}
+
+void Batch::prepare() {
+    gather();
+    send_to_device();
 }
 ```
 CPU log-normalization **fully completes before any GPU copy is issued** — there is no GPU log-norm kernel. This is a deliberate departure from earlier versions of this design (and from the aspirational GPU-side plan in [`../singlet_lognorm.md`](../singlet_lognorm.md)): log-norm must run on CPU.
+
+**Why split into `gather()`/`send_to_device()` (for [data_loader.md](data_loader.md)'s chunk double-buffering):** `gather_normalize()` is the *only* step that reads `chunk_`; `to_device()` only touches the pinned buffers `gather_normalize()` just wrote, and it's fire-and-forget (`cudaMemcpyAsync`, no sync — confirmed by inspecting the current `to_device()` implementation). So the instant `gather()` returns is exactly when this particular `Batch` is done needing the chunk. `DataLoader::fill()` calls `gather()`, then (only for the batch that claimed the chunk's last column slice) kicks off the next chunk's decode, then calls `send_to_device()` — no callback machinery required, since `to_device()`'s asynchrony means there's no risk of the two calls racing or blocking each other.
 
 ### `layout()` — sizing pass
 

@@ -291,7 +291,7 @@ static void training_loop(
         batch.reset();
         
         // Check if primary species has finished its epochs
-        primary_pass = primary_loader->pass();
+        primary_pass = primary_loader->epoch();
     }
     
     double train_ms = ms_since(t_train_start);

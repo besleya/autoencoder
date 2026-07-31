@@ -41,13 +41,78 @@ class Ring {
 
 **Why `BS::thread_pool` over hand-rolled:** you approved vendoring it. It's a single header (no build system changes beyond an include path), gives `submit_task()` returning a `std::future`/`std::shared_future` for free, and removes the queue/mutex/condvar boilerplate the current hand-rolled pool has. Action item: vendor `BS_thread_pool.hpp` under e.g. `third_party/`, add its directory to the Makefile's include path. (Not done in this pass — no build happens locally; this is a note for whoever does the build on the GPU machine.)
 
+## Dynamic pool rebalancing (watch idle count, move threads between pools)
+
+`BS::thread_pool` supports this directly — confirmed via its docs: `get_tasks_running()`, `get_tasks_queued()`, `get_thread_count()` for monitoring, and `reset(n)` to safely resize a pool on-the-fly.
+
+**`reset(n)` semantics (confirmed from the library docs):** it waits for **all** tasks to finish — both those *currently running* and any still *waiting in the queue* — then destroys the pool and relaunches it with `n` threads. This means calling `reset()` while `fill_pool_` has a backlog of queued fill tasks will block until that whole backlog drains, not just the in-flight ones. This is why rebalancing must only happen from the dispatcher thread, between cycles, never from inside a task running on the pool being resized.
+
+**Design, per explicit correction from the user:** Ring does **not** increment/decrement pool sizes by a fixed step. Instead it watches `fill_pool_`'s idle thread count and, once that count has been consistently high (or consistently zero) for several checks, computes the target size directly and jumps to it in one `reset()` call. Each pool is independently capped at `std::thread::hardware_concurrency()` — that's a per-pool ceiling, not a combined budget across both pools (verified against the user's wording: "**Neither** thread pool should have more threads than hardware concurrency").
+
+```cpp
+// Called once per dispatch cycle, not per task — rebalancing more often than that is noise.
+void Ring::maybe_rebalance() {
+  const std::size_t hw = std::thread::hardware_concurrency();
+  const std::size_t fill_threads = fill_pool_.get_thread_count();
+  const std::size_t fill_idle = fill_threads - fill_pool_.get_tasks_running();
+
+  if (fill_idle > 0) {
+    idle_streak_++;
+    busy_streak_ = 0;
+  } else if (fill_pool_.get_tasks_queued() > 0) {
+    // fully busy AND backlog waiting — a real signal, not just "got lucky this instant"
+    busy_streak_++;
+    idle_streak_ = 0;
+  } else {
+    idle_streak_ = busy_streak_ = 0;   // fully busy but no backlog: no evidence either way
+  }
+
+  if (idle_streak_ >= kStreakThreshold && fill_threads > kMinFillThreads) {
+    // Usually idle: shrink fill_pool_ by the idle amount, grow decode_pool_ by the same,
+    // capped so decode_pool_ doesn't exceed hardware_concurrency.
+    std::size_t move = std::min(fill_idle, fill_threads - kMinFillThreads);
+    move = std::min(move, hw - decode_pool_.get_thread_count());
+    if (move > 0) {
+      fill_pool_.reset(fill_threads - move);
+      decode_pool_.reset(decode_pool_.get_thread_count() + move);
+    }
+    idle_streak_ = 0;
+  } else if (busy_streak_ >= kStreakThreshold && fill_threads < hw) {
+    // Usually fully busy with a backlog: grow fill_pool_ by stealing from decode_pool_,
+    // capped so fill_pool_ doesn't exceed hardware_concurrency and decode_pool_ keeps its floor.
+    std::size_t room = hw - fill_threads;
+    std::size_t available = decode_pool_.get_thread_count() - kMinDecodeThreads;
+    std::size_t move = std::min(room, available);
+    if (move > 0) {
+      decode_pool_.reset(decode_pool_.get_thread_count() - move);
+      fill_pool_.reset(fill_threads + move);
+    }
+    busy_streak_ = 0;
+  }
+}
+```
+
+**⚠️ Warnings — read before implementing:**
+- `reset()` **blocks the calling thread** until all of that pool's tasks — running and queued — finish. Never call it from a thread that itself needs to keep dispatching (i.e. do this from the dispatcher thread only, between round-robin cycles, never from inside a fill or decode task).
+- **Hysteresis via streak counters** (`idle_streak_`/`busy_streak_`, threshold e.g. 5 consecutive cycles) is required — a single noisy observation must not trigger a `reset()`. Reset both streaks to 0 after any rebalance, or on an ambiguous observation, so a brief blip doesn't accumulate toward a future trigger.
+- **Floors**: never shrink either pool below `kMinFillThreads` / `kMinDecodeThreads` (e.g. 1 each).
+- **Ceilings**: never grow either pool above `hardware_concurrency()` — checked independently per pool, not against the combined total (the two pools' sizes may sum to more or less than `hardware_concurrency()`; that's fine and expected as threads move between them).
+- This is a tuning nice-to-have, not a correctness requirement. If it turns out to add more complexity than value in practice, it's safe to ship fixed-size pools first and add rebalancing later — flag this to the user if it's cut for time.
+
 ## Registration
 
 ```cpp
 void add_loader(DataLoader* loader);       // Ring stores the pointer; loader must outlive Ring
 ```
 
-Order of registration = round-robin order. Register all loaders **before** `start()`.
+Order of registration = round-robin order. Register all loaders **before** `start()`. `add_loader()` also calls `loader->set_ring(this)`, giving the `DataLoader` a back-reference so it can reach `decode_pool()` and anything else it needs from `Ring` — this replaces threading a decode-pool reference through every `DataLoader` constructor:
+
+```cpp
+void Ring::add_loader(DataLoader* loader) {
+  loaders_.push_back(loader);
+  loader->set_ring(this);
+}
+```
 
 ## Scheduler thread
 
@@ -55,13 +120,14 @@ Order of registration = round-robin order. Register all loaders **before** `star
 
 ```
 for loader in loaders (round-robin, forever):
-    slot = loader.reserve_free_slot_blocking()   # blocks until the loader's *next* slot is empty
+    slot = loader.reserve_slot()   # blocks until the loader's *next* slot is empty
     fill_pool_.submit_task([loader, slot] { loader.fill(slot); })
+    maybe_rebalance()             // once per full cycle, see "Dynamic pool rebalancing" below
 ```
 
 `loader.fill(slot)` is where all real work happens: chunk load (if needed, via `decode_pool_`), Batch construction, log-norm, H2D, event record. On completion the Slot transitions filling→ready. This runs on a `fill_pool_` worker, **not** the dispatcher thread — the dispatcher must stay free to keep reserving/submitting for other loaders.
 
-**Strict rotation — never skip.** If the current loader's next slot isn't empty yet, the dispatcher **blocks** on it (see `reserve_free_slot_blocking()` in [data_loader.md](data_loader.md) — it's a single `Slot::await_empty()` call, no polling). It does not advance to the next loader. This is the opposite of the current Ring implementation, which skips empty lanes in round-robin mode — that behavior is a bug and must not be carried forward.
+**Strict rotation — never skip.** If the current loader's next slot isn't empty yet, the dispatcher **blocks** on it (see `reserve_slot()` in [data_loader.md](data_loader.md) — it's a single `Slot::await_empty()` call, no polling). It does not advance to the next loader. This is the opposite of the current Ring implementation, which skips empty lanes in round-robin mode — that behavior is a bug and must not be carried forward.
 
 **Why block on the current loader rather than skip?** Simpler; and if one loader is falling behind, throttling the others prevents unbounded queue growth.
 
@@ -85,6 +151,8 @@ Consumer signals the slot free via `Batch`'s destructor (see [batch.md](batch.md
 
 `next_dispatch_idx_` inside the dispatcher loop and `next_consume_idx_` in `next_ready_batch()` are each touched by exactly **one** thread — the dispatcher thread, and whichever thread calls `next_ready_batch()` (normally the single trainer thread) respectively. Because each index has exactly one writer, they need **no mutex or atomic** — do not add one "to be safe"; it would be dead weight and could mask a bug if a second thread ever calls `next_ready_batch()`.
 
+**Confirmed with the user:** exactly one thread (the dispatcher) calls `reserve_slot()`, and exactly one thread (the trainer) calls `next_ready_batch()`, for the lifetime of the program. If that ever changes, the single-writer assumption above must be revisited first.
+
 **Warning:** if you ever call `next_ready_batch()` from more than one thread, this invariant breaks silently (two threads could interleave and desynchronize `next_consume_idx_` from the slot rotation each `DataLoader` expects). Enforce single-caller with an assert (e.g. check trainer thread id) if this is a concern.
 
 ## Shutdown
@@ -98,7 +166,7 @@ void shutdown();
 3. Join the dispatcher thread.
 4. Slots left in `filling` state are safe: their events will fire on GPU; buffers stay alive because `DataLoader` owns them.
 
-**⚠️ Warning — shutdown during a blocking wait.** `reserve_free_slot_blocking()` and `take_ready_batch()` block on CUDA events / futures that may never resolve if the pipeline is being torn down mid-flight (e.g. a species genuinely has no more data). Plan for this explicitly: give these blocking calls a way to be interrupted (e.g. check `shutting_down_` in a loop with a bounded `cudaEventQuery` poll as the *shutdown-only* fallback, or have `Ring::shutdown()` mark all loaders "closing" so in-flight waits return a sentinel). Do not let `shutdown()` hang forever waiting on GPU work that will never come.
+**⚠️ Warning — shutdown during a blocking wait.** `reserve_slot()` and `take_ready_batch()` block on CUDA events / futures that may never resolve if the pipeline is being torn down mid-flight (e.g. a species genuinely has no more data). Plan for this explicitly: give these blocking calls a way to be interrupted (e.g. check `shutting_down_` in a loop with a bounded `cudaEventQuery` poll as the *shutdown-only* fallback, or have `Ring::shutdown()` mark all loaders "closing" so in-flight waits return a sentinel). Do not let `shutdown()` hang forever waiting on GPU work that will never come.
 
 ## Bounds and invariants
 

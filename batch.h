@@ -41,13 +41,13 @@ public:
     // Arguments:
     //   slot             - non-owning pointer to a Slot; must outlive Batch
     //   species_name     - human-readable species identifier
-    //   chunk            - non-owning pointer to source Chunk; must remain valid
+    //   chunk            - shared_ptr to source Chunk; Batch holds a copy to ensure lifetime safety
     //   column_indices   - length B, column positions into chunk to gather
     //   chunk_end        - true if this is the last batch of the chunk
     //   scale            - scale factor for log-normalization (default 10000.0f)
     Batch(Slot* slot,
           std::string species_name,
-          const Chunk* chunk,
+          std::shared_ptr<const Chunk> chunk,
           std::vector<int> column_indices,
           bool chunk_end,
           float scale = 10000.0f);
@@ -65,9 +65,14 @@ public:
     Batch(const Batch&) = delete;
     Batch& operator=(const Batch&) = delete;
 
-    // Gathers this batch's columns out of the chunk, casts types, CPU log-normalizes,
-    // ships to the GPU via slot's stream, and records slot's ready event.
-    // Called once, right after construction.
+    // Gathers this batch's columns out of the chunk, casts types, CPU log-normalizes.
+    // Chunk data is not touched after this returns. Returns total nnz.
+    int gather();
+
+    // Copies gathered data to device and records ready event.
+    void send_to_device();
+
+    // Convenience wrapper: calls gather() then send_to_device().
     void prepare();
 
     // Accessors
@@ -82,7 +87,7 @@ public:
 private:
     Slot* slot_;                       // non-owning, nullable after move
     std::string species_name_;         // human-readable species identifier
-    const Chunk* chunk_;               // non-owning, reference to source data
+    std::shared_ptr<const Chunk> chunk_;  // owns reference to source data
     std::vector<int> column_indices_;  // length B_, column positions into chunk_
     int m_ = 0;                        // number of rows (features)
     int B_ = 0;                        // number of columns (batch size)
