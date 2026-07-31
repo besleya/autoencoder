@@ -211,15 +211,14 @@ void Batch::to_device() {
     slot_->mark_ready();
 }
 
-// Gathers columns from chunk and performs log-normalization on CPU.
-// Returns total nnz. Chunk is not touched after this returns.
-int Batch::gather() {
+// Prepare: gather, normalize, and ship to device.
+void Batch::prepare(std::function<void()> after_gather) {
     if (!slot_) {
-        throw std::runtime_error("Batch::gather: batch is not bound (may have been moved)");
+        throw std::runtime_error("Batch::prepare: batch is not bound (may have been moved)");
     }
 
     if (!chunk_) {
-        throw std::runtime_error("Batch::gather: chunk is not bound");
+        throw std::runtime_error("Batch::prepare: chunk is not bound");
     }
 
     nnz_ = layout();
@@ -228,22 +227,9 @@ int Batch::gather() {
                      column_indices_, slot_->pinned_col_ptr(), slot_->pinned_row_idx(),
                      slot_->pinned_values(), scale_);
 
-    return nnz_;
-}
-
-// Copies gathered data to device and records ready event.
-void Batch::send_to_device() {
-    if (!slot_) {
-        throw std::runtime_error("Batch::send_to_device: batch is not bound (may have been moved)");
-    }
+    if (after_gather) after_gather();
 
     to_device();
-}
-
-// Convenience wrapper: gather() followed by send_to_device().
-void Batch::prepare() {
-    gather();
-    send_to_device();
 }
 
 // Accessors

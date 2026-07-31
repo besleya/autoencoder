@@ -5,6 +5,7 @@
 
 #include <string>
 #include <vector>
+#include <functional>
 #include <cuda_runtime.h>
 #include <stdexcept>
 #include "slot.h"
@@ -65,15 +66,11 @@ public:
     Batch(const Batch&) = delete;
     Batch& operator=(const Batch&) = delete;
 
-    // Gathers this batch's columns out of the chunk, casts types, CPU log-normalizes.
-    // Chunk data is not touched after this returns. Returns total nnz.
-    int gather();
-
-    // Copies gathered data to device and records ready event.
-    void send_to_device();
-
-    // Convenience wrapper: calls gather() then send_to_device().
-    void prepare();
+    // Gathers this batch's columns out of the chunk, casts types, CPU log-normalizes,
+    // ships to the GPU via slot's stream, and records slot's ready event.
+    // Called once, right after construction.
+    // after_gather: optional callback fired after gather/normalize, before H2D (when chunk reads finish)
+    void prepare(std::function<void()> after_gather = nullptr);
 
     // Accessors
     const std::string& species_name() const;
