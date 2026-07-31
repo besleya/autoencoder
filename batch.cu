@@ -212,7 +212,7 @@ void Batch::to_device() {
 }
 
 // Prepare: gather, normalize, and ship to device.
-void Batch::prepare(std::function<void()> after_gather) {
+void Batch::prepare() {
     if (!slot_) {
         throw std::runtime_error("Batch::prepare: batch is not bound (may have been moved)");
     }
@@ -226,8 +226,6 @@ void Batch::prepare(std::function<void()> after_gather) {
     gather_normalize(chunk_->col_ptr.data(), chunk_->row_idx.data(), chunk_->values.data(),
                      column_indices_, slot_->pinned_col_ptr(), slot_->pinned_row_idx(),
                      slot_->pinned_values(), scale_);
-
-    if (after_gather) after_gather();
 
     to_device();
 }

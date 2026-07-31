@@ -207,17 +207,6 @@ int DataLoader::ready_slot_count() const {
     return count;
 }
 
-Slot* DataLoader::reserve_free_slot() {
-    std::lock_guard<std::mutex> lock(slot_mtx_);
-    for (int i = 0; i < n_slots_; ++i) {
-        if (slots_[i]->state() == Slot::State::kEmpty) {
-            slots_[i]->fill();
-            return slots_[i].get();
-        }
-    }
-    return nullptr;
-}
-
 // ============================================================================
 // Batch filling: the main pool-worker entry point
 // ============================================================================
@@ -274,17 +263,14 @@ void DataLoader::fill(Slot* slot) {
         column_indices,
         is_chunk_end);
 
-    // Step 3: Gather from chunk into slot's pinned buffers
-    batch->gather();
+    // Step 3: Prepare batch (gather, normalize, copy to device)
+    batch->prepare();
 
     // Step 4: If this is the last full slice of the chunk, kick off next chunk's decode
     if (is_chunk_end) {
         std::lock_guard<std::mutex> lock(chunk_mtx_);
         start_next_chunk_decode_async();
     }
-
-    // Step 5: Copy from pinned buffers to device
-    batch->send_to_device();
 
     // Step 6: Store batch for consumer
     {
@@ -313,24 +299,6 @@ int DataLoader::find_slot_index(Slot* slot) const {
 // ============================================================================
 // Batch consumer interface
 // ============================================================================
-
-bool DataLoader::any_slot_ready() const {
-    for (const auto& slot : slots_) {
-        if (slot->state() == Slot::State::kFull) {
-            return true;
-        }
-    }
-    return false;
-}
-
-int DataLoader::find_ready_slot() const {
-    for (int i = 0; i < n_slots_; ++i) {
-        if (slots_[i]->state() == Slot::State::kFull && batch_per_slot_[i]) {
-            return i;
-        }
-    }
-    return -1;
-}
 
 std::unique_ptr<Batch> DataLoader::take_ready_batch() {
     assert(consume_idx_ >= 0 && consume_idx_ < (int)slots_.size());

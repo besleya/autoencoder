@@ -98,12 +98,19 @@ private:
     // Round-robin consume state (consumer thread only; no synchronization needed)
     int next_consume_idx_ = 0;
 
-    // Dynamic rebalancing state
-    int idle_streak_ = 0;   // consecutive cycles with idle fill_pool_ threads
-    int busy_streak_ = 0;   // consecutive cycles with full fill_pool_ AND backlog
-    static constexpr int kStreakThreshold = 5;    // consecutive observations before rebalancing
-    static constexpr int kMinFillThreads = 1;     // never shrink fill_pool_ below this
-    static constexpr int kMinDecodeThreads = 1;   // never shrink decode_pool_ below this
+    // Dynamic rebalancing state: averaging-window design
+    // Track a rolling average of fill_pool_'s idle-thread count over kWindowCycles cycles.
+    // Sample idle count each cycle, store in ring buffer. Act only when window is full.
+    static constexpr std::size_t kWindowCycles = 10;    // samples per averaging window
+    static constexpr double kShrinkAbove = 1.5;         // shrink if avg_idle > this
+    static constexpr double kGrowBelow = 0.3;           // grow if avg_idle < this
+    static constexpr double kIdleMargin = 0.5;          // margin subtracted from shrink target
+    static constexpr std::size_t kMinFillThreads = 1;   // never shrink fill_pool_ below this
+    static constexpr std::size_t kMinDecodeThreads = 1; // never shrink decode_pool_ below this
+
+    std::array<std::size_t, kWindowCycles> idle_window_{};  // ring buffer of idle-count samples
+    std::size_t idle_window_pos_ = 0;                       // current position in ring buffer
+    std::size_t idle_window_count_ = 0;                     // number of samples accumulated so far
 
     // ========================================================================
     // Private methods

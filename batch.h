@@ -69,8 +69,7 @@ public:
     // Gathers this batch's columns out of the chunk, casts types, CPU log-normalizes,
     // ships to the GPU via slot's stream, and records slot's ready event.
     // Called once, right after construction.
-    // after_gather: optional callback fired after gather/normalize, before H2D (when chunk reads finish)
-    void prepare(std::function<void()> after_gather = nullptr);
+    void prepare();
 
     // Accessors
     const std::string& species_name() const;

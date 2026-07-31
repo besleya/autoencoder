@@ -95,15 +95,12 @@ public:
     int free_slot_count() const;
     int ready_slot_count() const;
 
-    // Atomically reserve a free slot (FREE → FILLING); returns nullptr if none.
-    Slot* reserve_free_slot();
-
     // Fill a reserved slot: load chunk if needed, pack batch, construct Batch,
     // call batch->prepare(), transition slot FILLING → READY.
     // Runs on a Ring pool worker; returns immediately.
     void fill(Slot* slot);
 
-    // Block (condition_variable) until any slot is READY, then move its Batch out
+    // Block (condition_variable) until next slot in rotation is READY, then move its Batch out
     // and return it. Returns nullptr if none (only on shutdown). The Batch's
     // destructor will later flip the slot back to FREE.
     std::unique_ptr<Batch> take_ready_batch();
@@ -132,16 +129,10 @@ private:
     // Must be called with chunk_mtx_ locked.
     void ensure_chunk_loaded_locked();
 
-    // Start async decode of next chunk. Called from Batch's after_gather callback
+    // Start async decode of next chunk. Called from DataLoader::fill()
     // when this batch claims the chunk's last columns. Non-blocking: submits tasks
     // to decode_pool_ and stores the future. Guarded by chunk_mtx_.
     void start_next_chunk_decode_async();
-
-    // Check if any slot is in READY state.
-    bool any_slot_ready() const;
-
-    // Find first slot in READY state; return its index or -1.
-    int find_ready_slot() const;
 
     // Find the index of a slot in the slots_ vector; return -1 if not found.
     int find_slot_index(Slot* slot) const;

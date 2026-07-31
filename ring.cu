@@ -21,8 +21,9 @@ Ring::Ring(int n_fill_workers, int n_decode_workers)
       decode_pool_(n_decode_workers),
       next_dispatch_idx_(0),
       next_consume_idx_(0),
-      idle_streak_(0),
-      busy_streak_(0) {
+      idle_window_(),
+      idle_window_pos_(0),
+      idle_window_count_(0) {
     if (n_fill_workers <= 0) {
         throw std::runtime_error("Ring: n_fill_workers must be > 0");
     }
@@ -173,53 +174,68 @@ void Ring::dispatcher_loop() {
 // maybe_rebalance
 // ============================================================================
 
+namespace {
+// Helper: compute mean of an array of size_t values
+double compute_mean(const std::array<std::size_t, Ring::kWindowCycles>& samples) {
+    std::size_t sum = 0;
+    for (std::size_t val : samples) {
+        sum += val;
+    }
+    return static_cast<double>(sum) / Ring::kWindowCycles;
+}
+}  // anonymous namespace
+
 void Ring::maybe_rebalance() {
-    // Watch fill_pool_ idle and busy patterns; rebalance only when a streak is consistent.
-    // Called once per full dispatch cycle (never more frequent; that would be noise).
+    // Averaging-window design: track rolling average of fill_pool_'s idle-thread count
+    // over kWindowCycles cycles. Sample each cycle, act only when window is full.
 
     const std::size_t hw = std::thread::hardware_concurrency();
     const std::size_t fill_threads = fill_pool_.get_thread_count();
-    const std::size_t fill_idle = fill_threads - fill_pool_.get_tasks_running();
+    const std::size_t idle = fill_threads - fill_pool_.get_tasks_running();
 
-    // Update streak counters based on current state
-    if (fill_idle > 0) {
-        // At least one thread is idle in fill_pool_
-        idle_streak_++;
-        busy_streak_ = 0;
-    } else if (fill_pool_.get_tasks_queued() > 0) {
-        // fill_pool_ is fully busy AND there is a backlog waiting
-        // (this is the signal that we really need more threads)
-        busy_streak_++;
-        idle_streak_ = 0;
-    } else {
-        // fill_pool_ is fully busy but no backlog; ambiguous, don't count toward either
-        idle_streak_ = busy_streak_ = 0;
+    // Sample idle count and store in ring buffer
+    idle_window_[idle_window_pos_++ % kWindowCycles] = idle;
+    if (++idle_window_count_ < kWindowCycles) {
+        return;  // wait for a full window before acting
     }
+    idle_window_count_ = 0;  // reset for next window
 
-    // Shrink fill_pool_ if idle for long enough; move idle threads to decode_pool_
-    if (idle_streak_ >= kStreakThreshold && fill_threads > kMinFillThreads) {
-        std::size_t move = std::min(fill_idle, fill_threads - kMinFillThreads);
-        move = std::min(move, hw - decode_pool_.get_thread_count());
-        if (move > 0) {
-            // reset() blocks until all in-flight and queued tasks complete
-            // Safe to call here (between cycles, dispatcher has no pending work)
-            fill_pool_.reset(fill_threads - move);
-            decode_pool_.reset(decode_pool_.get_thread_count() + move);
+    // Compute mean idle count over the window
+    const double avg_idle = compute_mean(idle_window_);
+
+    // Shrink: persistent idleness
+    if (avg_idle > kShrinkAbove) {
+        // Target: shrink down toward what's actually being used, with a margin.
+        std::size_t target = std::max<std::size_t>(
+            kMinFillThreads,
+            fill_threads - static_cast<std::size_t>(avg_idle - kIdleMargin)
+        );
+        std::size_t shrink_by = fill_threads - target;
+        if (shrink_by > 0) {
+            std::size_t decode_threads = decode_pool_.get_thread_count();
+            std::size_t decode_room = hw - decode_threads;  // per-pool ceiling
+            std::size_t move = std::min(shrink_by, decode_room);  // transfer only what fits
+            fill_pool_.reset(target);
+            if (move > 0) {
+                decode_pool_.reset(decode_threads + move);
+            }
+            // Any threads in shrink_by - move are simply destroyed, not transferred.
         }
-        idle_streak_ = 0;
     }
-    // Grow fill_pool_ if busy with backlog for long enough; move threads from decode_pool_
-    else if (busy_streak_ >= kStreakThreshold && fill_threads < hw) {
+    // Grow: persistent busyness
+    else if (avg_idle < kGrowBelow && fill_threads < hw) {
+        // Pull idle capacity from decode_pool_ to boost fill_pool_.
         std::size_t room = hw - fill_threads;
-        std::size_t available = decode_pool_.get_thread_count() - kMinDecodeThreads;
+        std::size_t decode_threads = decode_pool_.get_thread_count();
+        std::size_t available = (decode_threads > kMinDecodeThreads)
+                                    ? (decode_threads - kMinDecodeThreads)
+                                    : 0;
         std::size_t move = std::min(room, available);
         if (move > 0) {
-            // reset() blocks until all in-flight and queued tasks complete
-            // Safe to call here (between cycles, dispatcher has no pending work)
-            decode_pool_.reset(decode_pool_.get_thread_count() - move);
+            decode_pool_.reset(decode_threads - move);
             fill_pool_.reset(fill_threads + move);
         }
-        busy_streak_ = 0;
     }
 }
+
 
