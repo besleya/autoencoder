@@ -227,7 +227,7 @@ void DataLoader::fill(Slot* slot) {
         while (true) {
             // Ensure we have a current chunk
             if (!current_chunk_ || col_cursor_ >= current_chunk_->n) {
-                ensure_chunk_loaded_locked();
+                advance_chunk();
             }
 
             int remaining = current_chunk_->n - col_cursor_;
@@ -269,7 +269,7 @@ void DataLoader::fill(Slot* slot) {
     // Step 4: If this is the last full slice of the chunk, kick off next chunk's decode
     if (is_chunk_end) {
         std::lock_guard<std::mutex> lock(chunk_mtx_);
-        start_next_chunk_decode_async();
+        decode_next_chunk();
     }
 
     // Step 6: Store batch for consumer
@@ -330,7 +330,7 @@ std::unique_ptr<Batch> DataLoader::take_ready_batch() {
 // Chunk loading and async decode (private helpers)
 // ============================================================================
 
-void DataLoader::ensure_chunk_loaded_locked() {
+void DataLoader::advance_chunk() {
     // If current chunk still has columns remaining, nothing to do
     if (current_chunk_ && col_cursor_ < current_chunk_->n) {
         return;
@@ -454,14 +454,14 @@ void DataLoader::ensure_chunk_loaded_locked() {
     next_chunk_submitted_ = false;
 }
 
-void DataLoader::start_next_chunk_decode_async() {
+void DataLoader::decode_next_chunk() {
     // Called from Batch's after_gather callback when the last batch of a chunk is gathered.
     // Submits async decode tasks to ring_->decode_pool() for the next chunk.
     // Stores the resulting future in next_chunk_future_.
     // Must be called with chunk_mtx_ locked.
 
-    assert(ring_ != nullptr && "start_next_chunk_decode_async() called before set_ring()");
-    assert(!next_chunk_submitted_ && "start_next_chunk_decode_async() called twice");
+    assert(ring_ != nullptr && "decode_next_chunk() called before set_ring()");
+    assert(!next_chunk_submitted_ && "decode_next_chunk() called twice");
 
     // Guard against double-submit
     next_chunk_submitted_ = true;

@@ -127,12 +127,12 @@ private:
     // Ensure a chunk is loaded into memory. If current chunk is exhausted,
     // decode the next chunk_size files, shuffle columns, reshuffle at epoch wrap.
     // Must be called with chunk_mtx_ locked.
-    void ensure_chunk_loaded_locked();
+    void advance_chunk();
 
     // Start async decode of next chunk. Called from DataLoader::fill()
     // when this batch claims the chunk's last columns. Non-blocking: submits tasks
     // to decode_pool_ and stores the future. Guarded by chunk_mtx_.
-    void start_next_chunk_decode_async();
+    void decode_next_chunk();
 
     // Find the index of a slot in the slots_ vector; return -1 if not found.
     int find_slot_index(Slot* slot) const;

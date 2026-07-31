@@ -79,7 +79,7 @@ public:
 ```cpp
 // DataLoader::fill(Slot* slot) — runs on a Ring pool worker thread
 void DataLoader::fill(Slot* slot) {
-    ensure_chunk_loaded_locked();
+    advance_chunk();
 
     std::vector<int> column_indices = next_batch_columns(batch_size_);   // slice of the shuffled index list
     bool is_chunk_end = advance_cursor_and_check_chunk_end(column_indices.size());
@@ -88,7 +88,7 @@ void DataLoader::fill(Slot* slot) {
         slot, species_name_, &current_chunk_, std::move(column_indices), is_chunk_end);
 
     batch->prepare();                 // does ALL the work: gather, cast, CPU lognorm, H2D, event
-    if (is_chunk_end) start_next_chunk_decode_async();   // ordered up AFTER prepare() returns, see data_loader.md
+    if (is_chunk_end) decode_next_chunk();   // ordered up AFTER prepare() returns, see data_loader.md
     mark_slot_ready(slot, std::move(batch));
 }
 ```
