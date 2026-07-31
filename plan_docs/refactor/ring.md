@@ -41,62 +41,65 @@ class Ring {
 
 **Why `BS::thread_pool` over hand-rolled:** you approved vendoring it. It's a single header (no build system changes beyond an include path), gives `submit_task()` returning a `std::future`/`std::shared_future` for free, and removes the queue/mutex/condvar boilerplate the current hand-rolled pool has. Action item: vendor `BS_thread_pool.hpp` under e.g. `third_party/`, add its directory to the Makefile's include path. (Not done in this pass — no build happens locally; this is a note for whoever does the build on the GPU machine.)
 
-## Dynamic pool rebalancing (watch idle count, move threads between pools)
+## Dynamic pool rebalancing (average idle over a window of cycles)
 
-`BS::thread_pool` supports this directly — confirmed via its docs: `get_tasks_running()`, `get_tasks_queued()`, `get_thread_count()` for monitoring, and `reset(n)` to safely resize a pool on-the-fly.
+**Goal:** `fill_pool_` should have as many workers as needed and no more. Ring already calls `maybe_rebalance()` once per full round-robin cycle (one pass over every registered loader) from the dispatcher loop — that's the natural periodic unit to sample on, since Ring has no visibility into `DataLoader`-level chunk/epoch boundaries, and no new plumbing is needed to define "a window" of cycles.
 
-**`reset(n)` semantics (confirmed from the library docs):** it waits for **all** tasks to finish — both those *currently running* and any still *waiting in the queue* — then destroys the pool and relaunches it with `n` threads. This means calling `reset()` while `fill_pool_` has a backlog of queued fill tasks will block until that whole backlog drains, not just the in-flight ones. This is why rebalancing must only happen from the dispatcher thread, between cycles, never from inside a task running on the pool being resized.
+**Design (v2 — replaces the earlier streak-based version):** instead of counting consecutive idle/busy cycles, track a rolling **average** of `fill_pool_`'s idle-thread count over the last `kWindowCycles` cycles (e.g. 10). Every cycle, sample `idle = fill_threads - fill_pool_.get_tasks_running()` into a small ring buffer. Once `kWindowCycles` samples have accumulated, compute the mean and act on it, then reset the window — never act on a single cycle's sample.
 
-**Design, per explicit correction from the user:** Ring does **not** increment/decrement pool sizes by a fixed step. Instead it watches `fill_pool_`'s idle thread count and, once that count has been consistently high (or consistently zero) for several checks, computes the target size directly and jumps to it in one `reset()` call. Each pool is independently capped at `std::thread::hardware_concurrency()` — that's a per-pool ceiling, not a combined budget across both pools (verified against the user's wording: "**Neither** thread pool should have more threads than hardware concurrency").
+**Why average-over-a-window instead of consecutive streaks:** a streak resets to 0 on any one cycle that breaks the pattern, so a single atypical cycle can suppress rebalancing indefinitely even though the pool is persistently over- or under-provisioned on average. A windowed mean isn't thrown off by any one sample and directly answers "how many idle threads did we actually have, on average, recently" — exactly the quantity "as many filler workers as needed and no more" is asking about.
 
 ```cpp
-// Called once per dispatch cycle, not per task — rebalancing more often than that is noise.
+// Called once per dispatch cycle.
 void Ring::maybe_rebalance() {
   const std::size_t hw = std::thread::hardware_concurrency();
   const std::size_t fill_threads = fill_pool_.get_thread_count();
-  const std::size_t fill_idle = fill_threads - fill_pool_.get_tasks_running();
+  const std::size_t idle = fill_threads - fill_pool_.get_tasks_running();
 
-  if (fill_idle > 0) {
-    idle_streak_++;
-    busy_streak_ = 0;
-  } else if (fill_pool_.get_tasks_queued() > 0) {
-    // fully busy AND backlog waiting — a real signal, not just "got lucky this instant"
-    busy_streak_++;
-    idle_streak_ = 0;
-  } else {
-    idle_streak_ = busy_streak_ = 0;   // fully busy but no backlog: no evidence either way
-  }
+  idle_window_[idle_window_pos_++ % kWindowCycles] = idle;
+  if (++idle_window_count_ < kWindowCycles) return;   // wait for a full window
+  idle_window_count_ = 0;
 
-  if (idle_streak_ >= kStreakThreshold && fill_threads > kMinFillThreads) {
-    // Usually idle: shrink fill_pool_ by the idle amount, grow decode_pool_ by the same,
-    // capped so decode_pool_ doesn't exceed hardware_concurrency.
-    std::size_t move = std::min(fill_idle, fill_threads - kMinFillThreads);
-    move = std::min(move, hw - decode_pool_.get_thread_count());
-    if (move > 0) {
-      fill_pool_.reset(fill_threads - move);
-      decode_pool_.reset(decode_pool_.get_thread_count() + move);
+  const double avg_idle = mean(idle_window_);   // over kWindowCycles samples
+
+  if (avg_idle > kShrinkAbove) {
+    // Persistently idle: shrink fill_pool_ down toward what's actually being used.
+    std::size_t target = std::max<std::size_t>(kMinFillThreads,
+        fill_threads - static_cast<std::size_t>(avg_idle - kIdleMargin));
+    std::size_t shrink_by = fill_threads - target;
+    if (shrink_by > 0) {
+      std::size_t decode_threads = decode_pool_.get_thread_count();
+      std::size_t decode_room = hw - decode_threads;        // per-pool ceiling, not a shared budget
+      std::size_t move = std::min(shrink_by, decode_room);  // transfer only what decode_pool_ can absorb
+      fill_pool_.reset(target);
+      if (move > 0) decode_pool_.reset(decode_threads + move);
+      // any shrink_by - move threads are simply destroyed, not transferred
     }
-    idle_streak_ = 0;
-  } else if (busy_streak_ >= kStreakThreshold && fill_threads < hw) {
-    // Usually fully busy with a backlog: grow fill_pool_ by stealing from decode_pool_,
-    // capped so fill_pool_ doesn't exceed hardware_concurrency and decode_pool_ keeps its floor.
+  } else if (avg_idle < kGrowBelow && fill_threads < hw) {
+    // Persistently busy: grow fill_pool_ by pulling idle capacity from decode_pool_.
     std::size_t room = hw - fill_threads;
-    std::size_t available = decode_pool_.get_thread_count() - kMinDecodeThreads;
+    std::size_t decode_threads = decode_pool_.get_thread_count();
+    std::size_t available = decode_threads > kMinDecodeThreads ? decode_threads - kMinDecodeThreads : 0;
     std::size_t move = std::min(room, available);
     if (move > 0) {
-      decode_pool_.reset(decode_pool_.get_thread_count() - move);
+      decode_pool_.reset(decode_threads - move);
       fill_pool_.reset(fill_threads + move);
     }
-    busy_streak_ = 0;
   }
 }
 ```
 
+**Parameters (tune once real numbers are available from a profiling run):**
+- `kWindowCycles` — samples per averaging window (e.g. 10). One cycle = one full pass over every registered loader.
+- `kShrinkAbove` / `kGrowBelow` — average-idle thresholds with a dead zone in between (e.g. shrink above 1.5, grow below 0.3) so a healthy in-between average doesn't oscillate every window.
+- `kIdleMargin` — small constant subtracted from the shrink target so `fill_pool_` isn't trimmed to the exact bare minimum last window happened to need, leaving slack for the next window's demand.
+- `kMinFillThreads` / `kMinDecodeThreads` — floors, unchanged from before (e.g. 1 each).
+
 **⚠️ Warnings — read before implementing:**
-- `reset()` **blocks the calling thread** until all of that pool's tasks — running and queued — finish. Never call it from a thread that itself needs to keep dispatching (i.e. do this from the dispatcher thread only, between round-robin cycles, never from inside a fill or decode task).
-- **Hysteresis via streak counters** (`idle_streak_`/`busy_streak_`, threshold e.g. 5 consecutive cycles) is required — a single noisy observation must not trigger a `reset()`. Reset both streaks to 0 after any rebalance, or on an ambiguous observation, so a brief blip doesn't accumulate toward a future trigger.
-- **Floors**: never shrink either pool below `kMinFillThreads` / `kMinDecodeThreads` (e.g. 1 each).
-- **Ceilings**: never grow either pool above `hardware_concurrency()` — checked independently per pool, not against the combined total (the two pools' sizes may sum to more or less than `hardware_concurrency()`; that's fine and expected as threads move between them).
+- `reset()` **blocks the calling thread** until all of that pool's tasks — running and queued — finish. Only ever call it from the dispatcher thread, between cycles, never from inside a fill or decode task.
+- **Floors**: never shrink either pool below `kMinFillThreads` / `kMinDecodeThreads`.
+- **Ceilings**: never grow either pool above `hardware_concurrency()` — checked independently per pool, not against the combined total.
+- **Freed threads move to `decode_pool_` only if it has room under its own `hardware_concurrency()` ceiling** — any remainder is destroyed rather than pushing `decode_pool_` over that ceiling (per explicit user direction — this is not a shared budget between the two pools).
 - This is a tuning nice-to-have, not a correctness requirement. If it turns out to add more complexity than value in practice, it's safe to ship fixed-size pools first and add rebalancing later — flag this to the user if it's cut for time.
 
 ## Registration

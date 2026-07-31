@@ -53,7 +53,7 @@ public:
     Batch(const Batch&) = delete;
     Batch& operator=(const Batch&) = delete;
 
-    void prepare(std::function<void()> after_gather = nullptr);  // gather+cast+CPU lognorm -> [callback] -> H2D -> record ready_event
+    void prepare();  // gather+cast+CPU lognorm -> H2D -> record ready_event
 
     const std::string& species_name() const;
     bool               chunk_end() const;
@@ -88,6 +88,7 @@ void DataLoader::fill(Slot* slot) {
         slot, species_name_, &current_chunk_, std::move(column_indices), is_chunk_end);
 
     batch->prepare();                 // does ALL the work: gather, cast, CPU lognorm, H2D, event
+    if (is_chunk_end) start_next_chunk_decode_async();   // ordered up AFTER prepare() returns, see data_loader.md
     mark_slot_ready(slot, std::move(batch));
 }
 ```
@@ -116,16 +117,15 @@ layer.forward(x, stream);
 ### `prepare()` — top-level order
 
 ```cpp
-void Batch::prepare(std::function<void()> after_gather) {
+void Batch::prepare() {
     nnz_ = layout();                  // 1. size + build this batch's col_ptr
     gather_normalize(...);            // 2. gather + cast + CPU log-norm (fused, per column)
-    if (after_gather) after_gather(); // 2.5. chunk_ is guaranteed untouched from here on — see below
     to_device();                      // 3. H2D copy + record ready_event
 }
 ```
 CPU log-normalization **fully completes before any GPU copy is issued** — there is no GPU log-norm kernel. This is a deliberate departure from earlier versions of this design (and from the aspirational GPU-side plan in [`../singlet_lognorm.md`](../singlet_lognorm.md)): log-norm must run on CPU.
 
-**`after_gather` (added for [data_loader.md](data_loader.md)'s chunk double-buffering):** `gather_normalize()` is the *only* step that reads `chunk_`; `to_device()` only touches the pinned buffers `gather_normalize()` just wrote. So the instant `gather_normalize()` returns is exactly when this particular `Batch` is done needing the chunk — `DataLoader` uses that moment (only for the batch that claimed the chunk's last column slice) to kick off decoding the next chunk, without delaying this batch's own H2D/ready. Default `nullptr` keeps every other call site unchanged.
+**No callback parameter (v2 — simplification).** An earlier draft threaded an `after_gather` callback through `prepare()` so `DataLoader` could kick off the next chunk's decode partway through. That's been dropped: `to_device()` is fire-and-forget (`cudaMemcpyAsync`, never blocks on the GPU), so `DataLoader` can simply call `batch->prepare()` and, once it returns, call its own next-chunk kickoff — no callback plumbing needed, and `prepare()` stays a plain no-argument call for every caller. See [data_loader.md](data_loader.md) "Ordering up the next chunk" for exactly when `DataLoader` does this.
 
 ### `layout()` — sizing pass
 
