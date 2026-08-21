@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: MIT
-#include "translator.h"
-
-#include "gpu_autoencoder.h"
-#include "layer.h"
-#include "batch.h"
 
 #include <cstdio>
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <cusparse.h>
 #include <stdexcept>
+
+#include "batch.h"
+#include "gpu_autoencoder.h"
+#include "layer.h"
+#include "translator.h"
 
 // ============================================================================
 // Error checking macros

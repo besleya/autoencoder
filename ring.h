@@ -4,11 +4,11 @@
 #pragma once
 
 #include <atomic>
-#include <cuda_runtime.h>
 #include <memory>
 #include <thread>
 #include <vector>
 
+#include <cuda_runtime.h>
 #include "BS_thread_pool.hpp"
 
 // Forward declarations

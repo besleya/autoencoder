@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: MIT
 // ring.cu — implementation of dispatcher and thread pools for strict round-robin batch scheduling.
 
-#include "ring.h"
-#include "data_loader.h"
-#include "batch.h"
-
 #include <iostream>
 #include <stdexcept>
 #include <thread>
+
+#include "batch.h"
+#include "data_loader.h"
+#include "ring.h"
 
 // ============================================================================
 // Constructor and destructor

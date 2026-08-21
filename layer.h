@@ -4,6 +4,7 @@
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <cusparse.h>
+
 #include "data_loader.h"
 
 // Forward declaration

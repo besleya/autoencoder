@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MIT
 // slot.cu — implementation of Slot (one prefetch buffer).
 
-#include "slot.h"
-
 #include <sstream>
 #include <stdexcept>
+
+#include "slot.h"
 
 // ============================================================================
 // CUDA error checking

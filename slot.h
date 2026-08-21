@@ -3,10 +3,11 @@
 
 #pragma once
 
-#include <cuda_runtime.h>
 #include <atomic>
 #include <cassert>
 #include <cstdint>
+
+#include <cuda_runtime.h>
 
 class Slot {
 public:

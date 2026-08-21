@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: MIT
 // batch.cu — Implementation of Batch class. Handles gathering, type-casting, log-norm, and H2D transfer.
 
-#include "batch.h"
-
-#include <cuda_runtime.h>
 #include <cmath>
 #include <cstring>
 #include <omp.h>
-#include <utility>
 #include <sstream>
 #include <stdexcept>
+#include <utility>
+
+#include <cuda_runtime.h>
+
+#include "batch.h"
 
 // ============================================================================
 // CUDA error checking

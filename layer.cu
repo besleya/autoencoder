@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: MIT
-#include "layer.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <random>
 
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <cusparse.h>
 #include <nvtx3/nvToolsExt.h>
+
 #include "gpu_timer.h"
-#include <cmath>
-#include <cstdio>
-#include <random>
-#include <algorithm>
+#include "layer.h"
 
 // ============================================================================
 // Error checking macros

@@ -5,14 +5,15 @@
 
 #pragma once
 
-#include <cuda_runtime.h>
+#include <algorithm>
+#include <cstdio>
+#include <iomanip>
+#include <iostream>
 #include <map>
 #include <string>
 #include <vector>
-#include <iostream>
-#include <iomanip>
-#include <algorithm>
-#include <cstdio>
+
+#include <cuda_runtime.h>
 
 // Per-section accumulator with event ring buffer
 struct TimerSection {

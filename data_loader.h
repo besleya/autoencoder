@@ -12,8 +12,8 @@
 #include <string>
 #include <vector>
 
-#include "slot.h"
 #include "batch.h"
+#include "slot.h"
 
 // Forward declarations
 class Batch;

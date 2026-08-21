@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: MIT
-#include "gpu_autoencoder.h"
 
 #include <cmath>
 #include <cstdio>
@@ -8,7 +7,10 @@
 #include <cuda_runtime.h>
 #include <cusparse.h>
 #include <nvtx3/nvToolsExt.h>
+
+#include "gpu_autoencoder.h"
 #include "gpu_timer.h"
+
 
 // ============================================================================
 // Error checking macros

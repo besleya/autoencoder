@@ -1,23 +1,23 @@
 // SPDX-License-Identifier: MIT
 // data_loader.cu — Per-species batch producer implementation.
 
-#include "data_loader.h"
-#include "batch.h"
-#include "slot.h"
-#include "ring.h"
-#include "validate_1pz.h"
-
-#include <singlet/pileup/pz_reader.h>
-#include <singlet/gpu/core/types.h>
-
 #include <algorithm>
 #include <cstring>
-#include <cuda_runtime.h>
 #include <iostream>
 #include <numeric>
 #include <omp.h>
 #include <sstream>
 #include <stdexcept>
+
+#include <cuda_runtime.h>
+#include <singlet/gpu/core/types.h>
+#include <singlet/pileup/pz_reader.h>
+
+#include "batch.h"
+#include "data_loader.h"
+#include "ring.h"
+#include "slot.h"
+#include "validate_1pz.h"
 
 // ============================================================================
 // CUDA error checking

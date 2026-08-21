@@ -1,21 +1,15 @@
 // SPDX-License-Identifier: MIT
 // GPU driver: parse CLI, load dataset via DataLoader, train with Translator over shared layers.
 
-#include "translator.h"
-#include "ring.h"
-#include "data_loader.h"
-#include "batch.h"
-#include "gpu_autoencoder.h"
-#include "gpu_timer.h"
-
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
 #include <glob.h>
-#include <iostream>
 #include <iomanip>
+#include <iostream>
+#include <map>
 #include <memory>
 #include <numeric>
 #include <random>
@@ -23,10 +17,16 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
-#include <map>
 
 #include <cuda_runtime.h>
 #include <nvtx3/nvToolsExt.h>
+
+#include "batch.h"
+#include "data_loader.h"
+#include "gpu_autoencoder.h"
+#include "gpu_timer.h"
+#include "ring.h"
+#include "translator.h"
 
 // ============================================================================
 // CUDA error checking

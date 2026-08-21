@@ -8,9 +8,10 @@
 #include <memory>
 #include <random>
 #include <vector>
+
+#include "batch.h"
 #include "data_loader.h"
 #include "layer.h"
-#include "batch.h"
 
 // Autoencoder on GPU with per-layer math delegated to the Layer class.
 // The autoencoder is responsible for:
