@@ -42,7 +42,7 @@ Ring::~Ring() {
 // Accessors
 // ============================================================================
 
-BS::thread_pool& Ring::decode_pool() {
+BS::thread_pool<>& Ring::decode_pool() {
     return decode_pool_;
 }
 

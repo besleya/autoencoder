@@ -17,6 +17,9 @@ CUDA_LIBS := -L$(CUDA_HOME)/lib64 -lcudart
 # Singlet configuration
 SINGLET_INCLUDE := -I/mnt/home/besleya/singlet/include
 
+# BS::thread_pool
+BS_THREAD_POOL_INCLUDE := -I/mnt/home/besleya/include
+
 # NVCC flags for device code compilation
 NVCCFLAGS ?= -O3 -std=c++17 -x cu -dc --gpu-architecture=sm_90 -Xcompiler "-pthread -fopenmp"
 
@@ -28,10 +31,10 @@ all: main_gpu
 
 # GPU autoencoder driver: multi-species training with shared layers
 main_gpu: main_gpu.o gpu_autoencoder.o translator.o slot.o batch.o data_loader.o ring.o layer.o validate_1pz.o main_gpu.dlink.o
-	$(CXX) -pthread -fopenmp $(LDFLAGS) main_gpu.o gpu_autoencoder.o translator.o slot.o batch.o data_loader.o ring.o layer.o validate_1pz.o main_gpu.dlink.o -o $@ -Wl,--allow-multiple-definition $(CUDA_LIBS) -lcublas -lcusparse -lnvToolsExt -lzstd
+	$(CXX) -pthread -fopenmp $(LDFLAGS) main_gpu.o gpu_autoencoder.o translator.o slot.o batch.o data_loader.o ring.o layer.o validate_1pz.o main_gpu.dlink.o -o $@ -Wl,--allow-multiple-definition $(CUDA_LIBS) -lcublas -lcusparse -ldl -lzstd
 
 main_gpu.o: main_gpu.cpp translator.h ring.h data_loader.h batch.h gpu_autoencoder.h gpu_timer.h
-	$(NVCC) -O3 -lineinfo -std=c++17 -x cu -dc --gpu-architecture=sm_90 $(CUDA_INCLUDE) $(SINGLET_INCLUDE) -c main_gpu.cpp -o $@
+	$(NVCC) -O3 -lineinfo -std=c++17 -x cu -dc --gpu-architecture=sm_90 $(CUDA_INCLUDE) $(SINGLET_INCLUDE) $(BS_THREAD_POOL_INCLUDE) -c main_gpu.cpp -o $@
 
 gpu_autoencoder.o: gpu_autoencoder.cu gpu_autoencoder.h layer.h
 	$(NVCC) -O3 -lineinfo -std=c++17 -x cu -rdc=true --gpu-architecture=sm_90 $(CUDA_INCLUDE) $(SINGLET_INCLUDE) -c gpu_autoencoder.cu -o $@
@@ -46,10 +49,10 @@ batch.o: batch.cu batch.h slot.h ring.h
 	$(NVCC) -O3 -lineinfo -std=c++17 -x cu -rdc=true --gpu-architecture=sm_90 $(CUDA_INCLUDE) $(SINGLET_INCLUDE) -c batch.cu -o $@
 
 data_loader.o: data_loader.cu data_loader.h slot.h batch.h validate_1pz.h
-	$(NVCC) -O3 -lineinfo -std=c++17 -x cu -rdc=true --gpu-architecture=sm_90 $(CUDA_INCLUDE) $(SINGLET_INCLUDE) -c data_loader.cu -o $@
+	$(NVCC) -O3 -lineinfo -std=c++17 -x cu -rdc=true --gpu-architecture=sm_90 $(CUDA_INCLUDE) $(SINGLET_INCLUDE) $(BS_THREAD_POOL_INCLUDE) -c data_loader.cu -o $@
 
 ring.o: ring.cu ring.h
-	$(NVCC) -O3 -lineinfo -std=c++17 -x cu -rdc=true --gpu-architecture=sm_90 $(CUDA_INCLUDE) $(SINGLET_INCLUDE) -c ring.cu -o ring.o
+	$(NVCC) -O3 -lineinfo -std=c++17 -x cu -rdc=true --gpu-architecture=sm_90 $(CUDA_INCLUDE) $(SINGLET_INCLUDE) $(BS_THREAD_POOL_INCLUDE) -c ring.cu -o ring.o
 
 layer.o: layer.cu layer.h
 	$(NVCC) -O3 -lineinfo -std=c++17 -x cu -rdc=true --gpu-architecture=sm_90 $(CUDA_INCLUDE) $(SINGLET_INCLUDE) -c layer.cu -o $@

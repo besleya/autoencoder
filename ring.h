@@ -43,7 +43,7 @@ public:
 
     // Returns the shared decode pool. DataLoaders use this to submit per-file
     // decode tasks in parallel.
-    BS::thread_pool& decode_pool();
+    BS::thread_pool<>& decode_pool();
 
     // ========================================================================
     // Loader registration (must be called before start())
@@ -77,6 +77,9 @@ public:
     // ready batch yet, blocks on it (never skips to another loader).
     std::unique_ptr<Batch> next_ready_batch();
 
+    static constexpr std::size_t kWindowCycles = 10;    // samples per averaging window
+    // This line was moved from the Dynamic rebalancing section below to public
+
 private:
     // ========================================================================
     // Private data
@@ -87,8 +90,8 @@ private:
     std::atomic<bool> shutting_down_{false};
 
     // Two thread pools (BS::thread_pool)
-    BS::thread_pool fill_pool_;    // small pool for fill tasks
-    BS::thread_pool decode_pool_;  // large pool for decode tasks
+    BS::thread_pool<> fill_pool_;    // small pool for fill tasks
+    BS::thread_pool<> decode_pool_;  // large pool for decode tasks
 
     std::thread dispatcher_thread_;
 
@@ -101,7 +104,6 @@ private:
     // Dynamic rebalancing state: averaging-window design
     // Track a rolling average of fill_pool_'s idle-thread count over kWindowCycles cycles.
     // Sample idle count each cycle, store in ring buffer. Act only when window is full.
-    static constexpr std::size_t kWindowCycles = 10;    // samples per averaging window
     static constexpr double kShrinkAbove = 1.5;         // shrink if avg_idle > this
     static constexpr double kGrowBelow = 0.3;           // grow if avg_idle < this
     static constexpr double kIdleMargin = 0.5;          // margin subtracted from shrink target

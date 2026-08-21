@@ -5,10 +5,10 @@
 #include "layer.h"
 #include "batch.h"
 
+#include <cstdio>
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <cusparse.h>
-#include <cstdio>
 #include <stdexcept>
 
 // ============================================================================

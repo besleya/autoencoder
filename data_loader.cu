@@ -4,14 +4,15 @@
 #include "data_loader.h"
 #include "batch.h"
 #include "slot.h"
+#include "ring.h"
 #include "validate_1pz.h"
 
 #include <singlet/pileup/pz_reader.h>
 #include <singlet/gpu/core/types.h>
 
-#include <cuda_runtime.h>
 #include <algorithm>
 #include <cstring>
+#include <cuda_runtime.h>
 #include <iostream>
 #include <numeric>
 #include <omp.h>
@@ -568,5 +569,8 @@ void DataLoader::decode_next_chunk() {
 
     // Submit the task to decode_pool and store the future
     auto future = ring_->decode_pool().submit_task(decode_fn);
-    next_chunk_future_ = future;
+    next_chunk_future_ = future.share(); // Why are we sharing this? Why 
+    // did we create a future only to exit the function without returning it?
+    // Where did the future go? Where is it?
+    // I don't know any of this. I'm just trying to make it compile.;
 }

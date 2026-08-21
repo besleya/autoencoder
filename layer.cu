@@ -216,9 +216,9 @@ Layer::~Layer() {
 
 // --- Sparse-input overloads ---
 
-const float* Layer::forward(const SparseBatch& x, cudaStream_t stream) {
+const float* Layer::forward(const SparseView& x, cudaStream_t stream) {
     if (!sparse_input_) {
-        fprintf(stderr, "Layer::forward(SparseBatch): layer is not configured for sparse input\n");
+        fprintf(stderr, "Layer::forward(SparseView): layer is not configured for sparse input\n");
         exit(EXIT_FAILURE);
     }
     _ensure_batch_buffers(x.B, /*need_grad_input=*/false);
@@ -227,9 +227,9 @@ const float* Layer::forward(const SparseBatch& x, cudaStream_t stream) {
     return d_y_;
 }
 
-void Layer::backward(const SparseBatch& x, const float* d_grad_output, cudaStream_t stream) {
+void Layer::backward(const SparseView& x, const float* d_grad_output, cudaStream_t stream) {
     if (!sparse_input_) {
-        fprintf(stderr, "Layer::backward(SparseBatch): layer is not configured for sparse input\n");
+        fprintf(stderr, "Layer::backward(SparseView): layer is not configured for sparse input\n");
         exit(EXIT_FAILURE);
     }
     _sp_backward(x, d_grad_output, stream);
@@ -379,7 +379,7 @@ void Layer::_ensure_batch_buffers(int batch_size, bool need_grad_input) {
     last_batch_size_ = batch_size;
 }
 
-void Layer::_sp_forward(const SparseBatch& x, cudaStream_t stream) {
+void Layer::_sp_forward(const SparseView& x, cudaStream_t stream) {
     nvtxRangePushA("Layer::_sp_forward");
     GpuScopedTimer timer_total("layer.sp_fwd.total", stream);
     
@@ -493,7 +493,7 @@ void Layer::_dn_forward(const float* d_in, int batch_size, cudaStream_t stream) 
     nvtxRangePop();
 }
 
-void Layer::_sp_backward(const SparseBatch& x, const float* d_grad_output, cudaStream_t stream) {
+void Layer::_sp_backward(const SparseView& x, const float* d_grad_output, cudaStream_t stream) {
     nvtxRangePushA("Layer::_sp_backward");
     GpuScopedTimer timer_total("layer.sp_bwd.total", stream);
     

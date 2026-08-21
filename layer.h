@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MIT
 #pragma once
 
-#include <cuda_runtime.h>
 #include <cublas_v2.h>
+#include <cuda_runtime.h>
 #include <cusparse.h>
-#include "gpu_data_loader.h"
+#include "data_loader.h"
 
 // Forward declaration
 struct SparseBatch;
@@ -56,13 +56,13 @@ public:
     // Forward with sparse input. Returns device pointer to output activations
     // (out_dim × batch_size, column-major). Batch size is inferred from x.B.
     // Launches kernels and ops on the provided stream.
-    const float* forward(const SparseBatch& x, cudaStream_t stream = 0);
+    const float* forward(const SparseView& x, cudaStream_t stream = 0);
 
     // Backward with sparse input. d_grad_output is device ptr to d L / d y
     // (out_dim × batch_size, column-major). Sparse layers cannot produce
     // gradient w.r.t. the input data, so no grad_input is returned.
     // Launches kernels and ops on the provided stream.
-    void backward(const SparseBatch& x, const float* d_grad_output, cudaStream_t stream = 0);
+    void backward(const SparseView& x, const float* d_grad_output, cudaStream_t stream = 0);
 
     // --- Dense-input overloads (require sparse_input() == false) ---
 
@@ -148,9 +148,9 @@ private:
 
     // Private helpers
     void _ensure_batch_buffers(int batch_size, bool need_grad_input);
-    void _sp_forward(const SparseBatch& x, cudaStream_t stream);
+    void _sp_forward(const SparseView& x, cudaStream_t stream);
     void _dn_forward(const float* d_in, int batch_size, cudaStream_t stream);
-    void _sp_backward(const SparseBatch& x, const float* d_grad_output, cudaStream_t stream);
+    void _sp_backward(const SparseView& x, const float* d_grad_output, cudaStream_t stream);
     void _dn_backward(const float* d_in, const float* d_grad_output,
                       bool compute_grad_input, cudaStream_t stream);
     void _apply_activation_forward(int batch_size, cudaStream_t stream);

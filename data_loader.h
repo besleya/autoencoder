@@ -4,14 +4,16 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
+#include <future>
 #include <memory>
 #include <mutex>
-#include <condition_variable>
 #include <random>
 #include <string>
 #include <vector>
 
 #include "slot.h"
+#include "batch.h"
 
 // Forward declarations
 class Batch;
@@ -110,15 +112,15 @@ private:
     // Private data structures
     // ========================================================================
 
-    // Unified chunk data (concatenated all files into one CSC matrix).
-    // Matches the Chunk struct in batch.h: stores uint32_t (raw from read_1pz).
-    struct Chunk {
-        int m = 0;                       // rows/features
-        int n = 0;                       // total columns across concatenated files
-        std::vector<uint32_t> col_ptr;   // length n+1, cumulative nnz offsets
-        std::vector<uint32_t> row_idx;   // length nnz, row indices
-        std::vector<uint32_t> values;    // length nnz, raw counts (from read_1pz)
-    };
+    // // Unified chunk data (concatenated all files into one CSC matrix).
+    // // Matches the Chunk struct in batch.h: stores uint32_t (raw from read_1pz).
+    // struct Chunk {
+    //     int m = 0;                       // rows/features
+    //     int n = 0;                       // total columns across concatenated files
+    //     std::vector<uint32_t> col_ptr;   // length n+1, cumulative nnz offsets
+    //     std::vector<uint32_t> row_idx;   // length nnz, row indices
+    //     std::vector<uint32_t> values;    // length nnz, raw counts (from read_1pz)
+    // };
 
     // ========================================================================
     // Private methods

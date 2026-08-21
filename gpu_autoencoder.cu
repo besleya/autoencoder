@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: MIT
 #include "gpu_autoencoder.h"
 
+#include <cmath>
+#include <cstdio>
+#include <cstring>
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <cusparse.h>
 #include <nvtx3/nvToolsExt.h>
 #include "gpu_timer.h"
-#include <cmath>
-#include <cstdio>
-#include <cstring>
 
 // ============================================================================
 // Error checking macros
@@ -263,7 +263,7 @@ void GpuAutoencoder::deallocate_buffers_() {
     initialized_buffers_ = false;
 }
 
-void GpuAutoencoder::forward(const SparseBatch& x, cudaStream_t stream) {
+void GpuAutoencoder::forward(const SparseView& x, cudaStream_t stream) {
     nvtxRangePushA("GpuAutoencoder::forward");
     GpuScopedTimer timer_total("ae.forward.total", stream);
     
@@ -293,7 +293,7 @@ void GpuAutoencoder::forward(const SparseBatch& x, cudaStream_t stream) {
     nvtxRangePop();
 }
 
-void GpuAutoencoder::backward_and_step(const SparseBatch& x, float lr, cudaStream_t stream) {
+void GpuAutoencoder::backward_and_step(const SparseView& x, float lr, cudaStream_t stream) {
     nvtxRangePushA("GpuAutoencoder::backward_and_step");
     GpuScopedTimer timer_total("ae.backward.total", stream);
     

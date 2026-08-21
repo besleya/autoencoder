@@ -3,11 +3,12 @@
 
 #pragma once
 
+#include <cuda_runtime.h>
+#include <functional>
+#include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
-#include <functional>
-#include <cuda_runtime.h>
-#include <stdexcept>
 #include "slot.h"
 
 // Forward declaration
