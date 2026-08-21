@@ -8,7 +8,7 @@
 #include <cusparse.h>
 #include <nvtx3/nvToolsExt.h>
 
-#include "gpu_autoencoder.h"
+#include "autoencoder.h"
 #include "gpu_timer.h"
 
 
@@ -97,16 +97,16 @@ __global__ void kernel_accumulate_loss(const float* d_dot,
 }
 
 // ============================================================================
-// GpuAutoencoder implementation
+// Autoencoder implementation
 // ============================================================================
 
-GpuAutoencoder::GpuAutoencoder()
+Autoencoder::Autoencoder()
     : num_l_(0), batch_size_(0), initialized_buffers_(false),
       d_grad_loss_(nullptr), d_loss_(nullptr),
       d_dot_(nullptr), d_epoch_loss_sum_(nullptr),
       cublas_handle_(nullptr), cusparse_handle_(nullptr) {}
 
-GpuAutoencoder::~GpuAutoencoder() {
+Autoencoder::~Autoencoder() {
     deallocate_buffers_();
     if (cublas_handle_) {
         cublasDestroy(cublas_handle_);
@@ -116,7 +116,7 @@ GpuAutoencoder::~GpuAutoencoder() {
     }
 }
 
-void GpuAutoencoder::init(const std::vector<int>& layer_dims,
+void Autoencoder::init(const std::vector<int>& layer_dims,
                           std::mt19937& rng) {
     dims_ = layer_dims;
     num_l_ = static_cast<int>(dims_.size()) - 1;
@@ -158,7 +158,7 @@ void GpuAutoencoder::init(const std::vector<int>& layer_dims,
     CUDA_CHECK(cudaMemset(d_epoch_loss_sum_, 0, sizeof(float)));
 }
 
-void GpuAutoencoder::init(const std::vector<int>& layer_dims,
+void Autoencoder::init(const std::vector<int>& layer_dims,
                           const std::vector<std::shared_ptr<Layer>>& layers_in,
                           std::mt19937& rng) {
     dims_ = layer_dims;
@@ -227,7 +227,7 @@ void GpuAutoencoder::init(const std::vector<int>& layer_dims,
     CUDA_CHECK(cudaMemset(d_epoch_loss_sum_, 0, sizeof(float)));
 }
 
-std::shared_ptr<Layer> GpuAutoencoder::construct_layer_(
+std::shared_ptr<Layer> Autoencoder::construct_layer_(
     int in_dim, int out_dim, Layer::Activation activation,
     bool sparse_input, unsigned long seed) {
     
@@ -235,7 +235,7 @@ std::shared_ptr<Layer> GpuAutoencoder::construct_layer_(
                                     seed, cublas_handle_, cusparse_handle_);
 }
 
-void GpuAutoencoder::allocate_buffers_() {
+void Autoencoder::allocate_buffers_() {
     if (initialized_buffers_) return;
     
     // Allocate loss gradient buffer: (dims_[num_l_] × batch_size_) column-major
@@ -245,7 +245,7 @@ void GpuAutoencoder::allocate_buffers_() {
     initialized_buffers_ = true;
 }
 
-void GpuAutoencoder::deallocate_buffers_() {
+void Autoencoder::deallocate_buffers_() {
     if (d_grad_loss_) {
         CUDA_CHECK(cudaFree(d_grad_loss_));
         d_grad_loss_ = nullptr;
@@ -265,8 +265,8 @@ void GpuAutoencoder::deallocate_buffers_() {
     initialized_buffers_ = false;
 }
 
-void GpuAutoencoder::forward(const SparseView& x, cudaStream_t stream) {
-    nvtxRangePushA("GpuAutoencoder::forward");
+void Autoencoder::forward(const SparseView& x, cudaStream_t stream) {
+    nvtxRangePushA("Autoencoder::forward");
     GpuScopedTimer timer_total("ae.forward.total", stream);
     
     // Set batch size on first forward
@@ -295,8 +295,8 @@ void GpuAutoencoder::forward(const SparseView& x, cudaStream_t stream) {
     nvtxRangePop();
 }
 
-void GpuAutoencoder::backward_and_step(const SparseView& x, float lr, cudaStream_t stream) {
-    nvtxRangePushA("GpuAutoencoder::backward_and_step");
+void Autoencoder::backward_and_step(const SparseView& x, float lr, cudaStream_t stream) {
+    nvtxRangePushA("Autoencoder::backward_and_step");
     GpuScopedTimer timer_total("ae.backward.total", stream);
     
     int d0 = dims_[0];
@@ -395,11 +395,11 @@ void GpuAutoencoder::backward_and_step(const SparseView& x, float lr, cudaStream
     nvtxRangePop();
 }
 
-void GpuAutoencoder::reset_epoch_loss() {
+void Autoencoder::reset_epoch_loss() {
     CUDA_CHECK(cudaMemset(d_epoch_loss_sum_, 0, sizeof(float)));
 }
 
-float GpuAutoencoder::read_epoch_loss(int num_batches) {
+float Autoencoder::read_epoch_loss(int num_batches) {
     float epoch_sum = 0.0f;
     CUDA_CHECK(cudaMemcpy(&epoch_sum, d_epoch_loss_sum_, sizeof(float),
                           cudaMemcpyDeviceToHost));
@@ -408,11 +408,11 @@ float GpuAutoencoder::read_epoch_loss(int num_batches) {
 
 // --- Public accessors ---
 
-int GpuAutoencoder::num_layers() const noexcept {
+int Autoencoder::num_layers() const noexcept {
     return num_l_;
 }
 
-std::shared_ptr<Layer> GpuAutoencoder::layer(int i) const {
+std::shared_ptr<Layer> Autoencoder::layer(int i) const {
     if (i < 0 || i >= num_l_) {
         fprintf(stderr, "layer(%d): index out of range [0, %d)\n", i, num_l_);
         exit(EXIT_FAILURE);
@@ -420,7 +420,7 @@ std::shared_ptr<Layer> GpuAutoencoder::layer(int i) const {
     return layers_[i];
 }
 
-const std::vector<std::shared_ptr<Layer>>& GpuAutoencoder::layers() const noexcept {
+const std::vector<std::shared_ptr<Layer>>& Autoencoder::layers() const noexcept {
     return layers_;
 }
 

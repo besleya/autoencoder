@@ -6,8 +6,8 @@
 #include <cusparse.h>
 #include <stdexcept>
 
+#include "autoencoder.h"
 #include "batch.h"
-#include "gpu_autoencoder.h"
 #include "layer.h"
 #include "translator.h"
 
@@ -223,7 +223,7 @@ void Translator::species(const std::string& name, int feature_count) {
     layer_dims.push_back(feature_count);
     
     // Construct the autoencoder with the pre-built layer stack
-    auto autoencoder = std::make_unique<GpuAutoencoder>();
+    auto autoencoder = std::make_unique<Autoencoder>();
     autoencoder->init(layer_dims, all_layers, rng_.get());
     
     // Store in the models map
@@ -231,19 +231,19 @@ void Translator::species(const std::string& name, int feature_count) {
 }
 
 void Translator::forward(const Batch& b, cudaStream_t stream) {
-    GpuAutoencoder& ae = model(b);
+    Autoencoder& ae = model(b);
     ae.forward(b.sparse_view(), stream);
 }
 
 void Translator::backward_and_step(const Batch& b, float lr, cudaStream_t stream) {
-    GpuAutoencoder& ae = model(b);
+    Autoencoder& ae = model(b);
     ae.backward_and_step(b.sparse_view(), lr, stream);
 }
 
-GpuAutoencoder& Translator::model(const std::string& name) {
+Autoencoder& Translator::model(const std::string& name) {
     return *models_.at(name);
 }
 
-GpuAutoencoder& Translator::model(const Batch& b) {
+Autoencoder& Translator::model(const Batch& b) {
     return model(b.species_name());
 }

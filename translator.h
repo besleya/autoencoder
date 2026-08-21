@@ -12,7 +12,7 @@
 
 // Forward declarations
 class Batch;
-class GpuAutoencoder;
+class Autoencoder;
 class Layer;
 
 // Translator: Master model coordinator for multi-species autoencoders with shared layers.
@@ -70,8 +70,8 @@ public:
 
     // Accessors: retrieve the autoencoder for a given species name or batch.
     // Throws std::out_of_range if the species is unknown.
-    GpuAutoencoder& model(const std::string& name);
-    GpuAutoencoder& model(const Batch& b);
+    Autoencoder& model(const std::string& name);
+    Autoencoder& model(const Batch& b);
 
 private:
     // Shared layer stacks (one copy, referenced by all species' autoencoders).
@@ -84,7 +84,7 @@ private:
     std::reference_wrapper<std::mt19937> rng_;
 
     // Per-species autoencoders.
-    std::unordered_map<std::string, std::unique_ptr<GpuAutoencoder>> models_;
+    std::unordered_map<std::string, std::unique_ptr<Autoencoder>> models_;
 
     // cublas and cusparse handles (owned by Translator, passed to Layer constructors).
     cublasHandle_t cublas_handle_;

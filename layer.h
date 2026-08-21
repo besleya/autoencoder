@@ -14,7 +14,7 @@ struct SparseBatch;
 //
 // OWNERSHIP RATIONALE:
 // This class is designed to be held via std::shared_ptr<Layer> and shared
-// across multiple GpuAutoencoder instances. The destructor releases all CUDA
+// across multiple Autoencoder instances. The destructor releases all CUDA
 // device buffers (weights, biases, activations, gradients) via cudaFree().
 // std::shared_ptr ensures the destructor runs exactly once when the last
 // reference is released, preventing double-free and resource leaks even if

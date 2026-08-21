@@ -23,7 +23,7 @@
 
 #include "batch.h"
 #include "data_loader.h"
-#include "gpu_autoencoder.h"
+#include "autoencoder.h"
 #include "gpu_timer.h"
 #include "ring.h"
 #include "translator.h"
@@ -275,7 +275,7 @@ static void training_loop(
         
         // On chunk end, report loss
         if (batch->chunk_end()) {
-            GpuAutoencoder& ae = translator.model(species_name);
+            Autoencoder& ae = translator.model(species_name);
             float loss = ae.read_epoch_loss(batches_seen[species_name]);
             std::cout << "[species=" << species_name << "] mean_loss="
                       << std::fixed << std::setprecision(9) << loss

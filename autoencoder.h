@@ -20,7 +20,7 @@
 // - Orchestrating forward/backward/update across all layers
 //
 // SHARED-LAYER TRAINING INVARIANT:
-// When a Layer is shared between two GpuAutoencoder instances during training,
+// When a Layer is shared between two Autoencoder instances during training,
 // the caller MUST complete autoencoder A's full forward → backward → update
 // sequence before starting autoencoder B's forward pass. The per-batch buffers
 // inside each shared Layer (d_z_, d_y_, d_dz_, etc.) are sized once per layer
@@ -29,7 +29,7 @@
 //
 // OWNERSHIP RATIONALE:
 // Layers are held as std::shared_ptr<Layer> so that the same Layer object can
-// be shared across multiple GpuAutoencoder instances with correct lifetime
+// be shared across multiple Autoencoder instances with correct lifetime
 // management and zero per-autoencoder ownership bookkeeping. Each Layer frees
 // its own device memory when its reference count drops to zero.
 //
@@ -37,10 +37,10 @@
 // When the caller supplies pre-constructed layers, the autoencoder validates
 // that each layer's in_dim, out_dim, and sparse_input flag match the expected
 // topology. Mismatches cause an error message to stderr and exit().
-class GpuAutoencoder {
+class Autoencoder {
 public:
-    GpuAutoencoder();
-    ~GpuAutoencoder();
+    Autoencoder();
+    ~Autoencoder();
 
     // Initialize with all-layers-owned: constructs every layer from the given
     // topology. First layer is constructed with sparse_input=true; all others
