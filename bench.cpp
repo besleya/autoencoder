@@ -23,10 +23,10 @@
 
 #include "batch.h"
 #include "data_loader.h"
-#include "autoencoder.h"
+// #include "autoencoder.h"
 #include "gpu_timer.h"
 #include "ring.h"
-#include "translator.h"
+// #include "translator.h"
 
 // ============================================================================
 // CUDA error checking
@@ -228,7 +228,7 @@ static std::vector<std::unique_ptr<DataLoader>> build_loaders(
 
 static void training_loop(
     Ring& ring,
-    Translator& translator,
+    // Translator& translator,
     const std::vector<std::unique_ptr<DataLoader>>& loaders,
     const TrainerOptions& opt)
 {
@@ -258,12 +258,12 @@ static void training_loop(
         
         // Forward pass
         nvtxRangePushA("forward");
-        translator.forward(*batch, trainer_stream);
+        // translator.forward(*batch, trainer_stream);
         nvtxRangePop();
         
         // Backward and update
         nvtxRangePushA("backward_and_step");
-        translator.backward_and_step(*batch, opt.lr, trainer_stream);
+        // translator.backward_and_step(*batch, opt.lr, trainer_stream);
         nvtxRangePop();
         
         // Sync to ensure slot buffers are safe to reuse
@@ -275,14 +275,14 @@ static void training_loop(
         
         // On chunk end, report loss
         if (batch->chunk_end()) {
-            Autoencoder& ae = translator.model(species_name);
-            float loss = ae.read_epoch_loss(batches_seen[species_name]);
-            std::cout << "[species=" << species_name << "] mean_loss="
-                      << std::fixed << std::setprecision(9) << loss
-                      << "  (chunk end, " << batches_seen[species_name] << " batches)" << std::endl;
-            ae.reset_epoch_loss();
+            // Autoencoder& ae = translator.model(species_name);
+            // float loss = ae.read_epoch_loss(batches_seen[species_name]);
+            // std::cout << "[species=" << species_name << "] mean_loss="
+            //           << std::fixed << std::setprecision(9) << loss
+            //           << "  (chunk end, " << batches_seen[species_name] << " batches)" << std::endl;
+            // ae.reset_epoch_loss();
             batches_seen[species_name] = 0;
-            losses.push_back(loss);
+            // losses.push_back(loss);
         }
         
         ++num_batches;
@@ -304,14 +304,14 @@ static void training_loop(
     ring.shutdown();
     
     // Print loss history
-    if (!losses.empty()) {
-        float scaler = 80.0f / losses[0];
-        for (float l : losses) {
-            int col = static_cast<int>(std::lround(l * scaler));
-            if (col < 0) col = 0;
-            std::cout << std::string(col, ' ') << "|  " << std::setprecision(9) << l << '\n';
-        }
-    }
+    // if (!losses.empty()) {
+    //     float scaler = 80.0f / losses[0];
+    //     for (float l : losses) {
+    //         int col = static_cast<int>(std::lround(l * scaler));
+    //         if (col < 0) col = 0;
+    //         std::cout << std::string(col, ' ') << "|  " << std::setprecision(9) << l << '\n';
+    //     }
+    // }
     
     gpu_timers().report(std::cout, "All Passes Grand Total", true);
     
@@ -352,14 +352,14 @@ int main(int argc, char** argv) {
         }
         
         // Build Translator
-        std::cout << "Building Translator..." << std::endl;
-        Translator translator(opt.shared_layers, opt.species_layers,
-                              opt.shared_dims, opt.species_dims, rng);
+        // std::cout << "Building Translator..." << std::endl;
+        // Translator translator(opt.shared_layers, opt.species_layers,
+        //                       opt.shared_dims, opt.species_dims, rng);
         
-        // Register species with translator
-        for (size_t i = 0; i < loaders.size(); ++i) {
-            translator.species(loaders[i]->species_name(), feature_counts[i]);
-        }
+        // // Register species with translator
+        // for (size_t i = 0; i < loaders.size(); ++i) {
+        //     translator.species(loaders[i]->species_name(), feature_counts[i]);
+        // }
         
         std::cout << "Model initialization: " << ms_since(t_init) << " ms" << std::endl;
         nvtxRangePop();
@@ -395,7 +395,7 @@ int main(int argc, char** argv) {
         
         // Main training loop
         std::cout << "Starting training loop..." << std::endl;
-        training_loop(ring, translator, loaders, opt);
+        training_loop(ring, /*translator,*/ loaders, opt);
         
         std::cout << "\n=== Training Complete ===" << std::endl;
         std::cout << "Done." << std::endl;
