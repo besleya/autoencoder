@@ -92,6 +92,10 @@ public:
     // sequence. Blocks the calling thread (dispatcher) until THIS slot is ready.
     Slot* reserve_slot();
 
+    // Wakes every thread blocked on one of this loader's slots so that shutdown
+    // can finish. Safe to call from any thread.
+    void abort_waits();
+
     // Count free slots (state == FREE).
     bool has_free_slot() const;
     int free_slot_count() const;
