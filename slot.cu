@@ -121,6 +121,12 @@ Slot::State Slot::state() const {
 
     // Lazily upgrade kFilling -> kFull by polling ready_event_.
     if (curr == State::kFilling) {
+        // cudaEventQuery() returns cudaSuccess for an event that was never
+        // recorded, which would promote a slot that has not been filled at all.
+        if (!ready_recorded_.load(std::memory_order_acquire)) {
+            return State::kFilling;
+        }
+
         cudaError_t err = cudaEventQuery(ready_event_);
         if (err == cudaSuccess) {
             // Event is signaled, upgrade to kFull.
@@ -138,20 +144,48 @@ Slot::State Slot::state() const {
     return curr;
 }
 
-void Slot::fill() {
-    // kEmpty -> kFilling. No assert (Batch validates before calling).
-    state_.store(State::kFilling, std::memory_order_release);
+bool Slot::try_reserve() {
+    State expected = State::kEmpty;
+    if (!state_.compare_exchange_strong(expected, State::kFilling,
+                                        std::memory_order_acq_rel,
+                                        std::memory_order_acquire)) {
+        // Somebody already owns this slot; the caller must not hand it to a
+        // fill worker.
+        return false;
+    }
+
+    // A new fill starts here, so the previous ready_event_ record no longer
+    // describes this slot's contents.
+    ready_recorded_.store(false, std::memory_order_release);
+    return true;
+}
+
+Slot::State Slot::raw_state() const {
+    return state_.load(std::memory_order_acquire);
 }
 
 void Slot::mark_ready() {
     // Record ready_event_ on stream_. Does NOT mutate state directly.
     SLOT_CUDA_CHECK(cudaEventRecord(ready_event_, stream_));
+
+    // Publish the record so state() and await_full() can tell "filled" apart
+    // from "never touched".
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        ready_recorded_.store(true, std::memory_order_release);
+    }
+    cv_.notify_all();
 }
 
 void Slot::mark_empty(cudaStream_t consumer_stream) {
     // Record empty_event_ on the consumer's stream, then set state_ = kEmpty.
     SLOT_CUDA_CHECK(cudaEventRecord(empty_event_, consumer_stream));
-    state_.store(State::kEmpty, std::memory_order_release);
+
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        state_.store(State::kEmpty, std::memory_order_release);
+    }
+    cv_.notify_all();
 }
 
 // ============================================================================
@@ -159,6 +193,21 @@ void Slot::mark_empty(cudaStream_t consumer_stream) {
 // ============================================================================
 
 void Slot::await_full() {
+    // Establish the CPU fact first: mark_ready() has run for this fill.
+    // cudaEventSynchronize() on a ready_event_ that was never recorded returns
+    // success immediately, which is how a slot holding no batch used to look
+    // ready to the trainer.
+    {
+        std::unique_lock<std::mutex> lock(mtx_);
+        cv_.wait(lock, [this] {
+            return ready_recorded_.load(std::memory_order_acquire) ||
+                   aborted_.load(std::memory_order_acquire);
+        });
+        if (aborted_.load(std::memory_order_acquire)) {
+            return;
+        }
+    }
+
     SLOT_CUDA_CHECK(cudaEventSynchronize(ready_event_));
 }
 
@@ -167,11 +216,33 @@ void Slot::await_full(cudaStream_t stream) {
 }
 
 void Slot::await_empty() {
+    // Same reasoning as await_full(): empty_event_ keeps its last record after
+    // the slot has been handed out again, so the event on its own cannot say
+    // whether the slot is free right now.
+    {
+        std::unique_lock<std::mutex> lock(mtx_);
+        cv_.wait(lock, [this] {
+            return state_.load(std::memory_order_acquire) == State::kEmpty ||
+                   aborted_.load(std::memory_order_acquire);
+        });
+        if (aborted_.load(std::memory_order_acquire)) {
+            return;
+        }
+    }
+
     SLOT_CUDA_CHECK(cudaEventSynchronize(empty_event_));
 }
 
 void Slot::await_empty(cudaStream_t stream) {
     SLOT_CUDA_CHECK(cudaStreamWaitEvent(stream, empty_event_, 0));
+}
+
+void Slot::abort_waits() {
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        aborted_.store(true, std::memory_order_release);
+    }
+    cv_.notify_all();
 }
 
 // ============================================================================

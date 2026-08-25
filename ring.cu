@@ -85,6 +85,12 @@ void Ring::shutdown() {
     // Signal dispatcher to exit
     shutting_down_.store(true);
 
+    // Wake anything parked on a slot handshake, otherwise the join below never
+    // returns.
+    for (DataLoader* loader : loaders_) {
+        loader->abort_waits();
+    }
+
     // Join dispatcher thread (it checks shutting_down_ between cycles)
     if (dispatcher_thread_.joinable()) {
         dispatcher_thread_.join();
@@ -154,8 +160,20 @@ void Ring::dispatcher_loop() {
             }
 
             // Submit fill task to fill_pool_
-            fill_pool_.submit_task([dl, slot] {
-                dl->fill(slot);
+            fill_pool_.submit_task([this, dl, slot] {
+                try {
+                    dl->fill(slot);
+                } catch (const std::exception& e) {
+                    // The future returned by submit_task() is discarded, so an
+                    // escaping exception would be swallowed and the trainer
+                    // would wait forever for a batch that is never produced.
+                    std::cerr << "[Ring] fill task failed: " << e.what()
+                              << std::endl;
+                    shutting_down_.store(true);
+                    for (DataLoader* loader : loaders_) {
+                        loader->abort_waits();
+                    }
+                }
             });
 
             next_dispatch_idx_ = (next_dispatch_idx_ + 1) % loaders_.size();
