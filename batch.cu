@@ -102,12 +102,15 @@ Batch::Batch(Slot* slot,
         throw std::runtime_error("Batch constructor: chunk must not be null");
     }
 
-    if (slot_->state() != Slot::State::kEmpty) {
-        throw std::runtime_error("Batch: slot already has an active batch");
+    // DataLoader::reserve_slot() already moved this slot kEmpty -> kFilling on
+    // the dispatcher thread, before this fill task was queued. Batch verifies
+    // that reservation; it must not perform the transition a second time. Doing
+    // both is what made every fill task throw here before any work was done.
+    if (slot_->raw_state() != Slot::State::kFilling) {
+        throw std::runtime_error("Batch: slot was not reserved by the dispatcher");
     }
 
     m_ = chunk_->m;
-    slot_->fill();
 }
 
 // Move constructor
