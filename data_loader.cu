@@ -166,13 +166,27 @@ Slot* DataLoader::reserve_slot() {
     // Block until this specific slot is EMPTY
     slot->await_empty();
 
-    // Atomically transition from EMPTY -> FILLING
-    slot->fill();
+    // Atomically transition from EMPTY -> FILLING. reserve_slot() is the single
+    // owner of this transition; Batch only verifies it.
+    if (!slot->try_reserve()) {
+        throw std::runtime_error(
+            "DataLoader::reserve_slot: slot " + std::to_string(fill_idx_) +
+            " reported empty but is not kEmpty");
+    }
 
     // Advance to next slot in rotation
     fill_idx_ = (fill_idx_ + 1) % (int)slots_.size();
 
     return slot;
+}
+
+void DataLoader::abort_waits() {
+    for (auto& slot : slots_) {
+        if (slot) {
+            slot->abort_waits();
+        }
+    }
+    slot_cv_.notify_all();
 }
 
 // ============================================================================
@@ -315,8 +329,11 @@ std::unique_ptr<Batch> DataLoader::take_ready_batch() {
     auto batch = std::move(batch_per_slot_[consume_idx_]);
     batch_per_slot_[consume_idx_] = nullptr;
 
-    // Advance to next slot in rotation
-    consume_idx_ = (consume_idx_ + 1) % (int)slots_.size();
+    // Only advance the rotation when a batch was actually taken. Advancing on a
+    // null result leaves consume_idx_ permanently out of phase with fill_idx_.
+    if (batch) {
+        consume_idx_ = (consume_idx_ + 1) % (int)slots_.size();
+    }
 
     lock.unlock();
 
